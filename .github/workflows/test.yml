@@ -1,0 +1,44 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install Python deps
+        run: |
+          uv sync
+          uv pip install -e "./core[dev]" -e "./sdks/python[dev]"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install TS deps
+        working-directory: sdks/typescript
+        run: npm install
+
+      - name: Lint (ruff + tsc)
+        run: make lint
+
+      - name: Test (Python + TS type-check)
+        # Skips smoke tests (need live infra). Unit + SDK tests only.
+        run: |
+          uv run pytest core/tests/ sdks/python/tests/ -v --ignore=core/tests/smoke_test.py
+          cd sdks/typescript && npx tsc --noEmit
