@@ -213,6 +213,7 @@ export class Aitelier {
       model: opts.model,
       systemPrompt: opts.systemPrompt,
       initialMessage: opts.initialMessage,
+      examples: opts.examples,
       mcpServers: opts.mcpServers?.map((s) => toSnake(s as any)),
       toolAllowlist: opts.toolAllowlist,
       responseFormat: opts.responseFormat,
@@ -368,6 +369,85 @@ export class Aitelier {
     if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status}`);
     const data = (await resp.json()) as { run_id: string; cancelled: boolean };
     return { runId: data.run_id, cancelled: data.cancelled };
+  }
+
+  /**
+   * Streaming agent run (SSE).
+   * Yields events `agent.delta` / `agent.tool_call` / `agent.tool_result` /
+   * `agent.done` / `agent.error`.
+   */
+  async *runAgentStream(
+    opts: RunAgentOpts,
+    reqOpts?: RequestOpts,
+  ): AsyncIterable<{ type: string; data: Record<string, unknown> }> {
+    const body = toSnake({
+      model: opts.model,
+      systemPrompt: opts.systemPrompt,
+      initialMessage: opts.initialMessage,
+      examples: opts.examples,
+      mcpServers: opts.mcpServers?.map((s) => toSnake(s as any)),
+      toolAllowlist: opts.toolAllowlist,
+      responseFormat: opts.responseFormat,
+      maxTurns: opts.maxTurns,
+      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
+      workspace: opts.workspace,
+      workspaceMode: opts.workspaceMode,
+      traceTag: opts.traceTag,
+      metadata: opts.metadata,
+    });
+    const resp = await fetch(`${this.baseUrl}/v1/agent/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    if (!resp.ok) throw new Error(`runAgentStream failed: ${resp.status}`);
+    if (!resp.body) throw new Error("No response body");
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let eventType = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (line.startsWith("event: ")) {
+          eventType = line.slice(7).trim();
+        } else if (line.startsWith("data: ") && eventType) {
+          try {
+            yield { type: eventType, data: JSON.parse(line.slice(6)) };
+          } catch {
+            // skip malformed
+          }
+          eventType = "";
+        }
+      }
+    }
+  }
+
+  // --- Agent preview ---
+
+  async agentPreview(opts: {
+    mcpServers?: unknown[];
+    toolAllowlist?: string[];
+  }): Promise<Record<string, unknown>> {
+    const body = toSnake({
+      mcpServers: opts.mcpServers,
+      toolAllowlist: opts.toolAllowlist,
+    });
+    const resp = await fetch(`${this.baseUrl}/v1/agent/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    if (!resp.ok) throw new Error(`agentPreview failed: ${resp.status}`);
+    return resp.json();
   }
 
   // --- Discovery ---

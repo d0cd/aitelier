@@ -109,6 +109,8 @@ export interface RunAgentOpts {
   model: string;
   systemPrompt?: string;
   initialMessage?: string;
+  /** Few-shot examples ({user, assistant} pairs); folded into systemPrompt server-side. */
+  examples?: Array<{ user: string; assistant: string }>;
   mcpServers?: McpServer[];
   toolAllowlist?: string[];
   responseFormat?:

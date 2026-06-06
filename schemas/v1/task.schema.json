@@ -10,6 +10,18 @@
       "type": "string",
       "description": "Task name or operation identifier"
     },
+    "examples": {
+      "type": "array",
+      "description": "Few-shot examples for agent tasks; folded into the system prompt server-side",
+      "items": {
+        "type": "object",
+        "required": ["user", "assistant"],
+        "properties": {
+          "user":      { "type": "string" },
+          "assistant": { "type": "string" }
+        }
+      }
+    },
     "kind": {
       "type": "string",
       "enum": ["complete", "embed", "agent"],

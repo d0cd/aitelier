@@ -535,6 +535,194 @@ def test_cancel_path_traversal_rejected(client):
     assert resp.status_code in (400, 404)
 
 
+# --- /v1/agent/stream ---
+
+
+def test_agent_stream_yields_delta_tool_call_then_done(client):
+    async def fake_stream(name, prompt, **kwargs):
+        yield {"type": "delta", "content": "thinking..."}
+        yield {"type": "tool_call", "server": "deepread",
+               "tool": "query_corpus", "input": {"q": "foo"}}
+        yield {"type": "tool_result", "tool": "query_corpus",
+               "output": ["doc1"], "elapsed_ms": 42}
+        yield {"type": "done", "kind": "agent", "provider": name,
+               "status": "ok", "duration_s": 0.5, "run_id": "",
+               "trace_id": "", "content": "result text",
+               "parsed": None, "usage": {}, "finish_reason": "completed",
+               "tool_calls": [], "cost_usd": None,
+               "error_type": None, "error_msg": None}
+
+    with (
+        patch("aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream),
+        patch("aitelier.server.record_trace"),
+    ):
+        resp = client.post("/v1/agent/stream", json={
+            "model": "claude-code",
+            "initial_message": "What's in the corpus?",
+        }, headers={"X-Correlation-Id": "stream-cid"})
+
+    assert resp.status_code == 200
+    body = resp.text
+    assert "event: agent.delta" in body
+    assert "thinking..." in body
+    assert "event: agent.tool_call" in body
+    assert "query_corpus" in body
+    assert "event: agent.tool_result" in body
+    assert "event: agent.done" in body
+    assert "stream-cid" in body
+
+
+def test_agent_stream_error_event_on_failure(client):
+    async def fake_stream(name, prompt, **kwargs):
+        if False:  # pragma: no cover
+            yield {}
+        raise RuntimeError("agent crashed")
+
+    with (
+        patch("aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream),
+        patch("aitelier.server.record_trace"),
+    ):
+        resp = client.post("/v1/agent/stream", json={
+            "model": "claude-code",
+            "initial_message": "boom",
+        })
+    assert resp.status_code == 200
+    body = resp.text
+    assert "event: agent.error" in body
+    assert "RuntimeError" in body
+
+
+# --- /v1/agent/preview ---
+
+
+def test_agent_preview_resolves_tools_and_finds_typos(client):
+    async def fake_query_mcp_tools(server):
+        return {
+            "name": "deepread", "transport": "http",
+            "previewable": True, "reachable": True,
+            "tools": ["deepread.query_corpus", "deepread.add_item",
+                      "deepread.fact_check"],
+        }
+
+    with patch("aitelier.server._query_mcp_tools", side_effect=fake_query_mcp_tools):
+        resp = client.post("/v1/agent/preview", json={
+            "mcp_servers": [{"name": "deepread", "transport": "http",
+                              "url": "http://localhost:3001/mcp"}],
+            "tool_allowlist": ["deepread.query_corpus",
+                                "deepread.fact_check",
+                                "deepread.misspelled_tool"],
+        })
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "deepread.query_corpus" in data["allowlist_matches"]
+    assert "deepread.misspelled_tool" in data["allowlist_misses"]
+    assert "deepread.add_item" in data["unused_tools"]
+    assert data["servers"][0]["reachable"] is True
+
+
+def test_agent_preview_handles_unreachable_server(client):
+    async def fake_query_mcp_tools(server):
+        return {"name": server["name"], "transport": "http",
+                "previewable": True, "reachable": False,
+                "reason": "ConnectError: refused"}
+
+    with patch("aitelier.server._query_mcp_tools", side_effect=fake_query_mcp_tools):
+        resp = client.post("/v1/agent/preview", json={
+            "mcp_servers": [{"name": "down", "transport": "http",
+                              "url": "http://nowhere:1/mcp"}],
+            "tool_allowlist": ["down.anything"],
+        })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["servers"][0]["reachable"] is False
+    # No tools were discovered → allowlist entry is a miss
+    assert "down.anything" in data["allowlist_misses"]
+
+
+def test_agent_preview_marks_stdio_as_not_previewable(client):
+    resp = client.post("/v1/agent/preview", json={
+        "mcp_servers": [{"name": "local", "transport": "stdio",
+                          "command": "uv", "args": ["run", "mcp"]}],
+        "tool_allowlist": [],
+    })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["servers"][0]["previewable"] is False
+    assert "stdio" in data["servers"][0]["reason"]
+
+
+def test_agent_preview_empty_inputs(client):
+    resp = client.post("/v1/agent/preview", json={})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data == {
+        "servers": [],
+        "allowlist_matches": [],
+        "allowlist_misses": [],
+        "unused_tools": [],
+    }
+
+
+def test_fold_examples_into_system_prompt():
+    from aitelier.server import _fold_examples
+    out = _fold_examples(
+        "You are a curator.",
+        [{"user": "Q1", "assistant": "A1"}, {"user": "Q2", "assistant": "A2"}],
+    )
+    assert "You are a curator." in out
+    assert "## Examples" in out
+    assert "User: Q1" in out
+    assert "Assistant: A1" in out
+    assert "User: Q2" in out
+
+
+def test_fold_examples_no_examples_passes_through():
+    from aitelier.server import _fold_examples
+    assert _fold_examples("hello", None) == "hello"
+    assert _fold_examples("hello", []) == "hello"
+    assert _fold_examples(None, None) is None
+
+
+def test_fold_examples_only_examples_no_system_prompt():
+    from aitelier.server import _fold_examples
+    out = _fold_examples(None, [{"user": "Q", "assistant": "A"}])
+    assert out.startswith("## Examples")
+    assert "User: Q" in out
+
+
+def test_agent_endpoint_folds_examples(client):
+    """POST /v1/agent should merge examples into the system_prompt sent to the runner."""
+    captured = {}
+
+    async def fake_call(name, prompt, **kwargs):
+        captured["system_prompt"] = kwargs.get("system_prompt")
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.1, "run_id": "r", "trace_id": "r",
+            "content": "ok", "parsed": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    with (
+        patch("aitelier.runner.call_agent", side_effect=fake_call),
+        patch("aitelier.runner.record_trace"),
+    ):
+        resp = client.post("/v1/agent", json={
+            "model": "claude-code",
+            "system_prompt": "You are a curator.",
+            "initial_message": "Process today's feeds.",
+            "examples": [{"user": "old item", "assistant": "yes, archive"}],
+        })
+    assert resp.status_code == 200
+    sp = captured.get("system_prompt") or ""
+    assert "You are a curator." in sp
+    assert "## Examples" in sp
+    assert "User: old item" in sp
+
+
 @pytest.mark.asyncio
 async def test_lifespan_shutdown_cancels_active_runs():
     """When the server shuts down, in-flight runs should be cancelled."""

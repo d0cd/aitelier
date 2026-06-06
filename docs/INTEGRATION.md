@@ -317,8 +317,33 @@ Aitelier returns errors in the result dict, not as HTTP errors:
 
 Your project should handle these by checking `result.status == "error"`.
 
-**Note:** Agent calls (`runAgent`) always return `cost_usd: null` — only
-`complete()` and `embed()` track cost via the LiteLLM proxy.
+## Cost tracking
+
+| Primitive | `cost_usd` | Why |
+|---|---|---|
+| `complete` | ✅ tracked | Routed through the LiteLLM proxy, which logs cost per call |
+| `embed` | ✅ tracked | Same |
+| `runAgent` / `runAgentStream` | ❌ `null` | Agent LLM calls happen *inside* the Sandbox Agent process, going directly to Anthropic/OpenAI — they bypass LiteLLM, so aitelier doesn't see them |
+
+Tokens (`usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens`)
+are captured on agent results **if** the backend surfaces them in the
+ACP `session/prompt` response. claude-code typically does; coverage of
+other backends varies.
+
+**Workarounds for per-run agent cost (none ideal yet):**
+
+1. **Route agent calls through LiteLLM.** Set `ANTHROPIC_BASE_URL` /
+   `OPENAI_BASE_URL` on the sandbox-agent process so its child CLIs send
+   to LiteLLM. Captures aggregate cost; per-run attribution would need
+   sandbox-agent to inject a `Aitelier-Run-Id` header per session,
+   which it doesn't expose today (upstream feature ask).
+2. **Estimate from tokens.** Multiply `usage` by your own price table.
+   Drifts as prices change; doesn't account for caching discounts.
+
+If you need per-run agent cost for budget alerting, file the upstream
+ask with [rivet-dev/sandbox-agent](https://github.com/rivet-dev/sandbox-agent)
+for per-session env injection. Until then, treat `cost_usd: null` on
+agent results as expected, not a bug.
 
 ## Configuration
 
@@ -363,6 +388,53 @@ await ai.cancel_run("2026-05-12T..._agent_run")   # CancelAck(run_id=..., cancel
 const { active } = await ai.listActiveRuns();
 await ai.cancelRun("2026-05-12T..._agent_run");   // { runId, cancelled: true }
 ```
+
+### `runAgentStream` — streaming agent run
+
+For chat-style UIs where the user wants to watch the agent's reasoning + tool
+calls unfold instead of staring at a spinner:
+
+```python
+async for ev in ai.run_agent_stream(model="claude-code",
+                                     initial_message="Process today's feeds.",
+                                     mcp_servers=[...], tool_allowlist=[...]):
+    if ev["type"] == "agent.delta":
+        print(ev["data"]["content"], end="", flush=True)
+    elif ev["type"] == "agent.tool_call":
+        print(f"\n[tool] {ev['data']['server']}.{ev['data']['tool']}({ev['data']['input']})")
+    elif ev["type"] == "agent.done":
+        print()  # final Result is in ev["data"]
+```
+
+```typescript
+for await (const ev of ai.runAgentStream({ model: "claude-code", initialMessage: "...", mcpServers: [...] })) {
+  if (ev.type === "agent.delta") process.stdout.write(ev.data.content as string);
+  // ev.type also covers agent.tool_call / agent.tool_result / agent.done / agent.error
+}
+```
+
+### `agentPreview` — dry-run tool resolution
+
+```python
+preview = await ai.agent_preview(
+    mcp_servers=[{"name": "deepread", "transport": "http", "url": "http://localhost:3001/mcp"}],
+    tool_allowlist=["deepread.query_corpus", "deepread.fact_check"],
+)
+# preview["allowlist_misses"]  → names in the allowlist that match no tool (likely typos)
+# preview["unused_tools"]      → tools available but excluded by the allowlist
+# preview["servers"]           → per-server reachability + the tools it advertises
+```
+
+```typescript
+const preview = await ai.agentPreview({
+  mcpServers: [{ name: "deepread", transport: "http", url: "http://localhost:3001/mcp" }],
+  toolAllowlist: ["deepread.query_corpus", "deepread.fact_check"],
+});
+```
+
+Use this when iterating on agent setups — it queries each HTTP MCP server's
+`tools/list` and shows which allowlist entries actually match. stdio MCP
+servers are marked `previewable: false` (can't query without spawning).
 
 ### `discovery` / `getSchema`
 

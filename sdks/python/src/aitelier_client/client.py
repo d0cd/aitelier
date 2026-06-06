@@ -169,6 +169,7 @@ class Aitelier:
         *,
         system_prompt: str | None = None,
         initial_message: str | None = None,
+        examples: list[dict] | None = None,
         mcp_servers: list[dict] | None = None,
         tool_allowlist: list[str] | None = None,
         response_format: dict | None = None,
@@ -180,13 +181,19 @@ class Aitelier:
         metadata: dict | None = None,
         correlation_id: str | None = None,
     ) -> Result:
-        """Run an agent with MCP tool loop."""
+        """Run an agent with MCP tool loop.
+
+        `examples` is a list of {"user": ..., "assistant": ...} pairs that
+        the server folds into the system prompt under an `## Examples` heading.
+        """
         client = self._ensure_client()
         body: dict[str, Any] = {"model": model}
         if system_prompt is not None:
             body["system_prompt"] = system_prompt
         if initial_message is not None:
             body["initial_message"] = initial_message
+        if examples is not None:
+            body["examples"] = examples
         if mcp_servers is not None:
             body["mcp_servers"] = mcp_servers
         if tool_allowlist is not None:
@@ -303,6 +310,91 @@ class Aitelier:
         resp = await client.post(f"/v1/runs/{run_id}/cancel")
         resp.raise_for_status()
         return CancelAck(**resp.json())
+
+    async def run_agent_stream(
+        self,
+        model: str,
+        *,
+        system_prompt: str | None = None,
+        initial_message: str | None = None,
+        examples: list[dict] | None = None,
+        mcp_servers: list[dict] | None = None,
+        tool_allowlist: list[str] | None = None,
+        response_format: dict | None = None,
+        max_turns: int | None = None,
+        timeout: int | None = None,
+        workspace: str | None = None,
+        workspace_mode: str = "copy",
+        trace_tag: str | None = None,
+        metadata: dict | None = None,
+        correlation_id: str | None = None,
+    ) -> AsyncIterator[dict]:
+        """Streaming agent run. Yields events with `type` (event name) and `data`.
+
+        Event types:
+          agent.delta        — incremental text chunk
+          agent.tool_call    — agent invoked an MCP tool
+          agent.tool_result  — tool returned
+          agent.done         — final aggregated Result
+          agent.error        — terminal error
+        """
+        from httpx_sse import aconnect_sse
+
+        client = self._ensure_client()
+        body: dict[str, Any] = {"model": model}
+        if system_prompt is not None:
+            body["system_prompt"] = system_prompt
+        if initial_message is not None:
+            body["initial_message"] = initial_message
+        if examples is not None:
+            body["examples"] = examples
+        if mcp_servers is not None:
+            body["mcp_servers"] = mcp_servers
+        if tool_allowlist is not None:
+            body["tool_allowlist"] = tool_allowlist
+        if response_format is not None:
+            body["response_format"] = response_format
+        if max_turns is not None:
+            body["max_turns"] = max_turns
+        if timeout is not None:
+            body["timeout"] = timeout
+        if workspace is not None:
+            body["workspace"] = workspace
+        if workspace_mode != "copy":
+            body["workspace_mode"] = workspace_mode
+        if trace_tag is not None:
+            body["trace_tag"] = trace_tag
+        if metadata is not None:
+            body["metadata"] = metadata
+
+        import json
+        async with aconnect_sse(
+            client, "POST", "/v1/agent/stream",
+            json=body, headers=self._cid_header(correlation_id),
+        ) as event_source:
+            async for sse in event_source.aiter_sse():
+                yield {"type": sse.event, "data": json.loads(sse.data)}
+
+    # --- Agent preview ---
+
+    async def agent_preview(
+        self,
+        *,
+        mcp_servers: list[dict] | None = None,
+        tool_allowlist: list[str] | None = None,
+    ) -> dict:
+        """Dry-run resolve MCP servers + allowlist. Returns per-server tool lists
+        plus allowlist matches/misses/unused, to catch typos before a real run.
+        """
+        client = self._ensure_client()
+        body: dict[str, Any] = {}
+        if mcp_servers is not None:
+            body["mcp_servers"] = mcp_servers
+        if tool_allowlist is not None:
+            body["tool_allowlist"] = tool_allowlist
+        resp = await client.post("/v1/agent/preview", json=body)
+        resp.raise_for_status()
+        return resp.json()
 
     # --- Discovery ---
 

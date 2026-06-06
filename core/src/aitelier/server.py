@@ -218,6 +218,10 @@ class RunAgentRequest(BaseModel):
     model: str
     system_prompt: str | None = None
     initial_message: str | None = None
+    examples: list[dict] | None = None
+    """Few-shot examples as a list of {user, assistant} pairs. The server
+    folds them into the system prompt under an `## Examples` heading; the
+    underlying ACP protocol has no examples primitive yet."""
     mcp_servers: list[dict] | None = None
     tool_allowlist: list[str] | None = None
     response_format: dict | None = None
@@ -235,6 +239,11 @@ class FanoutRequest(BaseModel):
     max_concurrent: int = Field(default=4, ge=1, le=16)
 
 
+class AgentPreviewRequest(BaseModel):
+    mcp_servers: list[dict] | None = None
+    tool_allowlist: list[str] | None = None
+
+
 class TracesFilter(BaseModel):
     since: str | None = None
     trace_tag: str | None = None
@@ -249,6 +258,23 @@ def _merge_correlation(metadata: dict | None, cid: str) -> dict:
     out = dict(metadata or {})
     out["correlation_id"] = cid
     return out
+
+
+def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> str | None:
+    """Server-side concat of few-shot examples into the system prompt.
+
+    Each example is a dict with `user` and `assistant` keys. Returns None
+    only if both inputs were None/empty.
+    """
+    if not examples:
+        return system_prompt
+    blocks: list[str] = []
+    for ex in examples:
+        u = ex.get("user", "") if isinstance(ex, dict) else ""
+        a = ex.get("assistant", "") if isinstance(ex, dict) else ""
+        blocks.append(f"User: {u}\nAssistant: {a}")
+    section = "## Examples\n\n" + "\n\n".join(blocks)
+    return f"{system_prompt}\n\n{section}" if system_prompt else section
 
 
 @app.post("/v1/complete")
@@ -395,12 +421,13 @@ async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
 
     cid = request.state.correlation_id
     run_id = make_run_id("agent_run")
+    system_prompt = _fold_examples(req.system_prompt, req.examples)
     task = {
         "name": "agent_run",
         "kind": "agent",
         "model": req.model,
         "prompt": req.initial_message or "",
-        "system_prompt": req.system_prompt,
+        "system_prompt": system_prompt,
         "mcp_servers": req.mcp_servers,
         "tool_allowlist": req.tool_allowlist,
         "response_format": req.response_format,
@@ -425,6 +452,159 @@ async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
 
     result["correlation_id"] = cid
     return result
+
+
+@app.post("/v1/agent/stream")
+async def run_agent_stream_endpoint(req: RunAgentRequest, request: Request):
+    """Streaming agent run via Server-Sent Events.
+
+    Mirrors /v1/complete/stream. Events:
+      agent.delta       — incremental text chunk
+      agent.tool_call   — agent invoked an MCP tool (server + tool + input)
+      agent.tool_result — MCP tool returned (tool + output + elapsed_ms)
+      agent.done        — final aggregated Result dict
+      agent.error       — terminal error
+    """
+    from aitelier.providers.sandbox_agent import call_via_sandbox_stream
+    from aitelier.runner import make_run_id
+
+    cid = request.state.correlation_id
+    run_id = make_run_id("agent_stream")
+    started_at = _now_iso()
+    system_prompt = _fold_examples(req.system_prompt, req.examples)
+
+    async def event_generator():
+        final: dict | None = None
+        try:
+            async for event in call_via_sandbox_stream(
+                req.model,
+                req.initial_message or "",
+                workspace=req.workspace,
+                system_prompt=system_prompt,
+                mcp_servers=req.mcp_servers,
+                response_format=req.response_format,
+                timeout=req.timeout or 600,
+                run_id=run_id,
+            ):
+                evt_type = event["type"]
+                event["correlation_id"] = cid
+                event["run_id"] = run_id
+                if evt_type == "done":
+                    final = {k: v for k, v in event.items() if k != "type"}
+                yield _sse_event(f"agent.{evt_type}", event)
+        except Exception as exc:
+            final = {
+                "kind": "agent",
+                "provider": req.model,
+                "status": "error",
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc),
+                "finish_reason": "error",
+            }
+            yield _sse_event("agent.error", {
+                "type": "error",
+                "error_type": type(exc).__name__,
+                "error_msg": str(exc),
+                "correlation_id": cid,
+                "run_id": run_id,
+            })
+        finally:
+            if final is not None:
+                record_trace(
+                    trace_id=run_id,
+                    started_at=started_at,
+                    result=final,
+                    system_prompt=system_prompt,
+                    trace_tag=req.trace_tag,
+                    metadata={"correlation_id": cid},
+                )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def _query_mcp_tools(server: dict) -> dict:
+    """Hit one MCP server's tools/list. Returns {name, transport, tools|reason}."""
+    name = server.get("name", "")
+    transport = server.get("transport", "http")
+    base = {"name": name, "transport": transport}
+
+    if transport != "http":
+        # stdio servers can't be previewed without spawning the process
+        return {**base, "previewable": False,
+                "reason": f"{transport} transport — preview unsupported"}
+
+    url = server.get("url")
+    if not url:
+        return {**base, "previewable": False, "reason": "no url"}
+
+    try:
+        from aitelier.providers.llm import get_shared_client
+        client = await get_shared_client()
+        resp = await client.post(
+            url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Content-Type": "application/json"},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return {**base, "previewable": True, "reachable": False,
+                    "reason": f"HTTP {resp.status_code}"}
+        data = resp.json()
+        if "error" in data:
+            err = data["error"]
+            return {**base, "previewable": True, "reachable": False,
+                    "reason": f"MCP error {err.get('code')}: {err.get('message','')}"}
+        tools = data.get("result", {}).get("tools") or []
+        # Prefix each tool name with the server name to match aitelier's
+        # allowlist convention: "server.tool"
+        tool_names = sorted(f"{name}.{t['name']}" for t in tools if t.get("name"))
+        return {**base, "previewable": True, "reachable": True, "tools": tool_names}
+    except Exception as exc:
+        return {**base, "previewable": True, "reachable": False,
+                "reason": f"{type(exc).__name__}: {exc}"}
+
+
+@app.post("/v1/agent/preview")
+async def agent_preview_endpoint(req: AgentPreviewRequest) -> dict:
+    """Dry-run resolution of MCP servers + tool_allowlist.
+
+    Queries each HTTP MCP server's tools/list and reports:
+      - per server: reachability + the tool names it advertises
+      - which allowlist entries match a discovered tool (matches)
+      - which allowlist entries match nothing (misses — likely typos)
+      - which available tools are not in the allowlist (unused)
+
+    stdio MCP servers can't be previewed without spawning the process;
+    they're returned with previewable=false.
+    """
+    servers_info = await asyncio.gather(
+        *(_query_mcp_tools(s) for s in (req.mcp_servers or []))
+    ) if req.mcp_servers else []
+
+    available: set[str] = set()
+    for s in servers_info:
+        for t in s.get("tools") or []:
+            available.add(t)
+
+    allowlist = list(req.tool_allowlist or [])
+    matches = sorted(t for t in allowlist if t in available)
+    misses = sorted(t for t in allowlist if t not in available)
+    unused = sorted(available - set(allowlist)) if allowlist else []
+
+    return {
+        "servers": servers_info,
+        "allowlist_matches": matches,
+        "allowlist_misses": misses,
+        "unused_tools": unused,
+    }
 
 
 @app.get("/v1/traces")

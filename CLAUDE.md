@@ -57,6 +57,8 @@ POST /v1/complete             — chat completion
 POST /v1/complete/stream      — chat completion via SSE (complete.delta / complete.done / complete.error)
 POST /v1/embed                — batch embeddings
 POST /v1/agent                — run agent with MCP/tool options
+POST /v1/agent/stream         — run agent via SSE (agent.delta / tool_call / tool_result / done / error)
+POST /v1/agent/preview        — dry-run resolve MCP servers + allowlist (catch typos before a real run)
 GET  /v1/traces               — query trace store
 GET  /v1/traces/{id}          — get single trace
 POST /v1/execute              — run a named task
@@ -97,7 +99,10 @@ Errors are classified via `core/src/aitelier/errors.py`:
 - Schema-driven type generation — `schemas/v1/*.schema.json` is the source of truth
 - SQLite trace store in runs/ dir (queryable by trace_tag, status, time; purged after 30 days)
 - Dicts in core, typed models in SDKs
-- Agent cost_usd is always null — only complete/embed track cost
+- Agent `cost_usd` is always `null` by design: agent LLM calls happen inside
+  the Sandbox Agent process and go directly to Anthropic/OpenAI, bypassing
+  LiteLLM. Token usage *is* captured when the backend surfaces it. See
+  `docs/INTEGRATION.md` → "Cost tracking" for workarounds.
 
 ## Conventions
 

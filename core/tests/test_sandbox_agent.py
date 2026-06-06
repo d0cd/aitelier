@@ -97,7 +97,6 @@ def test_aggregate_result_captures_tool_calls():
             "type": "toolCall",
             "name": "Read",
             "arguments": {"path": "/tmp/foo"},
-            "result": "file contents",
         }}},
     ]
     result = _aggregate_result(
@@ -108,7 +107,45 @@ def test_aggregate_result_captures_tool_calls():
         response_format=None,
     )
     assert len(result["tool_calls"]) == 1
-    assert result["tool_calls"][0]["name"] == "Read"
+    # Aligned with result.schema.json: tool_calls[].tool, not .name
+    assert result["tool_calls"][0]["tool"] == "Read"
+    assert result["tool_calls"][0]["input"] == {"path": "/tmp/foo"}
+
+
+def test_aggregate_result_extracts_usage_when_agent_surfaces_it():
+    """Agent backends that surface token usage should populate result.usage."""
+    result = _aggregate_result(
+        agent="claude-code", run_id="r1",
+        turn_result={
+            "stopReason": "completed", "content": "hi",
+            "usage": {"input_tokens": 120, "output_tokens": 45, "total_tokens": 165},
+        },
+        notifications=[],
+        elapsed=0.1,
+        response_format=None,
+    )
+    assert result["usage"] == {
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,
+    }
+
+
+def test_aggregate_result_extracts_usage_openai_flavored_keys():
+    """Some backends use OpenAI's prompt_tokens/completion_tokens."""
+    result = _aggregate_result(
+        agent="codex", run_id="r1",
+        turn_result={
+            "stopReason": "completed", "content": "hi",
+            "usage": {"prompt_tokens": 100, "completion_tokens": 30},
+        },
+        notifications=[],
+        elapsed=0.1,
+        response_format=None,
+    )
+    assert result["usage"]["input_tokens"] == 100
+    assert result["usage"]["output_tokens"] == 30
+    assert result["usage"]["total_tokens"] == 130  # auto-summed
 
 
 def test_aggregate_result_falls_back_to_turn_result_content():
@@ -162,24 +199,52 @@ def test_aggregate_result_handles_unparseable_json():
 
 
 def test_adapt_mcp_servers_http():
+    """ACP schema requires `type` discriminator and `headers` (empty list ok)."""
     out = _adapt_mcp_servers([
         {"name": "myproject", "transport": "http", "url": "http://localhost:3001/mcp"},
     ])
-    assert out == [{"name": "myproject", "transport": "http", "url": "http://localhost:3001/mcp"}]
+    assert out == [{
+        "type": "http",
+        "name": "myproject",
+        "url": "http://localhost:3001/mcp",
+        "headers": [],
+    }]
+
+
+def test_adapt_mcp_servers_http_passes_headers_through():
+    out = _adapt_mcp_servers([
+        {"name": "x", "transport": "http", "url": "http://h/",
+         "headers": [{"name": "Authorization", "value": "Bearer t"}]},
+    ])
+    assert out[0]["headers"] == [{"name": "Authorization", "value": "Bearer t"}]
 
 
 def test_adapt_mcp_servers_stdio():
+    """ACP schema requires `type`, `env` (empty list ok), preserves command + args."""
     out = _adapt_mcp_servers([
         {"name": "local", "transport": "stdio", "command": "uv", "args": ["run", "mcp"]},
     ])
-    assert out[0]["transport"] == "stdio"
-    assert out[0]["command"] == "uv"
-    assert out[0]["args"] == ["run", "mcp"]
+    assert out == [{
+        "type": "stdio",
+        "name": "local",
+        "command": "uv",
+        "args": ["run", "mcp"],
+        "env": [],
+    }]
 
 
 def test_adapt_mcp_servers_empty():
     assert _adapt_mcp_servers(None) == []
     assert _adapt_mcp_servers([]) == []
+
+
+def test_adapt_mcp_servers_uses_type_not_transport():
+    """Regression: prevent schema drift back to `transport` (ACP -32602)."""
+    out = _adapt_mcp_servers([
+        {"name": "x", "transport": "http", "url": "http://h/"},
+    ])
+    assert "transport" not in out[0]
+    assert out[0]["type"] == "http"
 
 
 # --- End-to-end mocked flow --------------------------------------------------

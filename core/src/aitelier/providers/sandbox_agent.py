@@ -302,28 +302,224 @@ async def _run_one_turn(
 
 
 # ---------------------------------------------------------------------------
+# Streaming entry point used by /v1/agent/stream
+# ---------------------------------------------------------------------------
+
+
+async def call_via_sandbox_stream(
+    name: str,
+    prompt: str,
+    *,
+    workspace: str | None = None,
+    system_prompt: str | None = None,
+    mcp_servers: list[dict] | None = None,
+    response_format: dict | None = None,
+    timeout: int = 600,  # noqa: ARG001 — outer endpoint enforces timeout
+    run_id: str = "",
+):
+    """Streaming variant of call_via_sandbox.
+
+    Yields events as they arrive from the ACP session/update notifications,
+    then a terminal `done` (or `error`) event:
+
+      {"type": "delta",       "content": "..."}
+      {"type": "tool_call",   "server": "...", "tool": "...", "input": {...}}
+      {"type": "tool_result", "tool": "...", "output": ..., "elapsed_ms": ...}
+      {"type": "done",        ... full aggregated Result dict ...}
+      {"type": "error",       "error_type": "...", "error_msg": "..."}
+    """
+    cfg = get_config().sandbox_agent
+    start = time.monotonic()
+
+    text_chunks: list[str] = []
+    tool_calls: list[dict] = []
+
+    try:
+        async with AcpClient(cfg.base_url, name, token=cfg.token) as client:
+            await client.call("initialize", {
+                "protocolVersion": _ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": True, "writeTextFile": True},
+                    "terminal": True,
+                },
+                "clientInfo": {"name": "aitelier", "version": "0.1.0"},
+            }, first=True)
+
+            session_resp = await client.call("session/new", {
+                "cwd": workspace or ".",
+                "mcpServers": _adapt_mcp_servers(mcp_servers),
+            })
+            session_id = (
+                session_resp["sessionId"]
+                if isinstance(session_resp, dict) else session_resp
+            )
+
+            client.start_stream()
+
+            if system_prompt:
+                try:
+                    await client.notify("session/set_config_option", {
+                        "sessionId": session_id,
+                        "option": "systemPrompt",
+                        "value": system_prompt,
+                    })
+                except Exception:
+                    pass
+
+            prompt_params: dict = {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": prompt}],
+            }
+            if response_format and response_format.get("type") == "json_schema":
+                prompt_params["responseFormat"] = response_format
+
+            # Run session/prompt in the background; surface notifications live.
+            prompt_task = asyncio.create_task(
+                client.call("session/prompt", prompt_params)
+            )
+
+            while not prompt_task.done():
+                note = await client.next_notification(timeout=0.25)
+                if note is None:
+                    continue
+                ev = _notification_to_event(note)
+                if ev is None:
+                    continue
+                if ev["type"] == "delta":
+                    text_chunks.append(ev["content"])
+                elif ev["type"] == "tool_call":
+                    tool_calls.append({
+                        "server": ev.get("server"),
+                        "tool": ev.get("tool"),
+                        "input": ev.get("input"),
+                    })
+                yield ev
+
+            # Final turn response
+            try:
+                turn_result = await prompt_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                yield {
+                    "type": "error",
+                    "error_type": classify_error(exc),
+                    "error_msg": str(exc),
+                }
+                return
+
+            # Drain any straggling notifications.
+            for note in await client.drain_notifications():
+                ev = _notification_to_event(note)
+                if ev is None:
+                    continue
+                if ev["type"] == "delta":
+                    text_chunks.append(ev["content"])
+                yield ev
+
+            try:
+                await client.notify("session/close", {"sessionId": session_id})
+            except Exception:
+                pass
+
+            elapsed = time.monotonic() - start
+            done = _aggregate_result(
+                agent=client.agent,
+                run_id=run_id,
+                turn_result=turn_result,
+                notifications=[],  # already drained above
+                elapsed=elapsed,
+                response_format=response_format,
+            )
+            if text_chunks:
+                done["content"] = "".join(text_chunks)
+            if tool_calls:
+                done["tool_calls"] = tool_calls
+            done["type"] = "done"
+            yield done
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        yield {
+            "type": "error",
+            "error_type": classify_error(exc),
+            "error_msg": str(exc),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Adapters / aggregation
 # ---------------------------------------------------------------------------
 
 
+def _notification_to_event(note: dict) -> dict | None:
+    """Map an ACP session/update notification to an aitelier streaming event.
+
+    Returns None when the notification doesn't carry a payload we surface.
+    """
+    params = note.get("params") or {}
+    update = params.get("update") or params
+    kind = update.get("type") or update.get("kind")
+
+    if kind in ("messageChunk", "agentMessageChunk", "text"):
+        content = update.get("content") or update.get("text")
+        if isinstance(content, str):
+            return {"type": "delta", "content": content}
+        if isinstance(content, dict):
+            text = content.get("text")
+            if text:
+                return {"type": "delta", "content": text}
+        return None
+
+    if kind in ("toolCall", "tool_call"):
+        return {
+            "type": "tool_call",
+            "server": update.get("server") or update.get("serverName"),
+            "tool": update.get("name") or update.get("toolName"),
+            "input": update.get("arguments") or update.get("input"),
+        }
+
+    if kind in ("toolResult", "tool_result"):
+        return {
+            "type": "tool_result",
+            "tool": update.get("name") or update.get("toolName"),
+            "output": update.get("result") or update.get("output"),
+            "elapsed_ms": update.get("elapsed_ms") or update.get("elapsedMs"),
+        }
+
+    return None
+
+
 def _adapt_mcp_servers(servers: list[dict] | None) -> list[dict]:
-    """Convert aitelier's MCP server shape to ACP's expected shape."""
+    """Convert aitelier's MCP server shape to ACP's wire schema.
+
+    aitelier's public API uses `transport: "http" | "stdio"`. ACP's
+    schema/schema.json (McpServerHttp / McpServerStdio) requires:
+      - `type` as the discriminator (literal const, not `transport`)
+      - `headers: [{name, value}]` required on http (empty list is valid)
+      - `env: [{name, value}]` required on stdio (empty list is valid)
+    """
     if not servers:
         return []
-    out = []
+    out: list[dict] = []
     for s in servers:
-        entry: dict[str, Any] = {"name": s["name"]}
         transport = s.get("transport", "http")
         if transport == "http":
-            entry["url"] = s.get("url", "")
-            entry["transport"] = "http"
+            out.append({
+                "type": "http",
+                "name": s["name"],
+                "url": s.get("url", ""),
+                "headers": s.get("headers", []),
+            })
         elif transport == "stdio":
-            entry["transport"] = "stdio"
-            if s.get("command"):
-                entry["command"] = s["command"]
-            if s.get("args"):
-                entry["args"] = s["args"]
-        out.append(entry)
+            out.append({
+                "type": "stdio",
+                "name": s["name"],
+                "command": s.get("command", ""),
+                "args": s.get("args", []),
+                "env": s.get("env", []),
+            })
     return out
 
 
@@ -341,29 +537,22 @@ def _aggregate_result(
     tool_calls: list[dict] = []
 
     for note in notifications:
-        params = note.get("params") or {}
-        update = params.get("update") or params
-        kind = update.get("type") or update.get("kind")
-
-        if kind in ("messageChunk", "agentMessageChunk", "text"):
-            content = update.get("content") or update.get("text")
-            if isinstance(content, str):
-                text_chunks.append(content)
-            elif isinstance(content, dict):
-                t = content.get("text")
-                if t:
-                    text_chunks.append(t)
-
-        elif kind in ("toolCall", "tool_call"):
+        ev = _notification_to_event(note)
+        if ev is None:
+            continue
+        if ev["type"] == "delta":
+            text_chunks.append(ev["content"])
+        elif ev["type"] == "tool_call":
             tool_calls.append({
-                "name": update.get("name") or update.get("toolName"),
-                "arguments": update.get("arguments") or update.get("input"),
-                "result": update.get("result") or update.get("output"),
+                "server": ev.get("server"),
+                "tool": ev.get("tool"),
+                "input": ev.get("input"),
             })
 
     content = "".join(text_chunks)
     # Final stop_reason from the turn response if present
     finish_reason = "completed"
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     if isinstance(turn_result, dict):
         finish_reason = (
             turn_result.get("stopReason")
@@ -380,6 +569,36 @@ def _aggregate_result(
                     c.get("text", "") for c in tr_content
                     if isinstance(c, dict) and c.get("type") == "text"
                 )
+        # Best-effort usage extraction. Different agent backends surface
+        # tokens under different keys; we accept either snake or camel case
+        # and the OpenAI-flavored {prompt,completion} or our own
+        # {input,output} convention.
+        raw_usage = turn_result.get("usage")
+        if isinstance(raw_usage, dict):
+            in_tok = (
+                raw_usage.get("input_tokens")
+                or raw_usage.get("inputTokens")
+                or raw_usage.get("prompt_tokens")
+                or raw_usage.get("promptTokens")
+                or 0
+            )
+            out_tok = (
+                raw_usage.get("output_tokens")
+                or raw_usage.get("outputTokens")
+                or raw_usage.get("completion_tokens")
+                or raw_usage.get("completionTokens")
+                or 0
+            )
+            tot_tok = (
+                raw_usage.get("total_tokens")
+                or raw_usage.get("totalTokens")
+                or (in_tok + out_tok)
+            )
+            usage = {
+                "input_tokens": in_tok,
+                "output_tokens": out_tok,
+                "total_tokens": tot_tok,
+            }
 
     parsed = None
     if response_format and response_format.get("type") == "json_schema" and content:
@@ -397,10 +616,10 @@ def _aggregate_result(
         "trace_id": run_id,
         "content": content,
         "parsed": parsed,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        "usage": usage,
         "finish_reason": finish_reason,
         "tool_calls": tool_calls,
-        "cost_usd": None,  # Agent cost is not tracked by aitelier (per CLAUDE.md)
+        "cost_usd": None,  # See docs/INTEGRATION.md → "Cost tracking" for why.
         "error_type": None,
         "error_msg": None,
     }
