@@ -43,6 +43,11 @@ class Store(Protocol):
                                  *, ended_at: datetime | None = None) -> None: ...
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None: ...
+    async def aggregate_runs(self, *, group_by: str = "trace_tag",
+                              since: datetime | None = None,
+                              until: datetime | None = None,
+                              trace_tag: str | None = None) -> dict: ...
+    async def purge_old_runs(self, max_age_days: int = 30) -> int: ...
 
     # Events
     async def append_event(self, event: RunEvent) -> RunEvent: ...
@@ -233,6 +238,82 @@ class PostgresStore:
                     result.get("status"), result.get("error_type"), result.get("error_msg"),
                     run_id,
                 )
+
+    _AGGREGATE_GROUP_EXPRS = {
+        "trace_tag":  "COALESCE(trace_tag, '<none>')",
+        "kind":       "COALESCE(kind, '<none>')",
+        "model":      "COALESCE(model, '<none>')",
+        "agent_id":   "COALESCE(agent_id, '<none>')",
+        "status":     "COALESCE(status, '<none>')",
+        "error_type": "COALESCE(error_type, '<none>')",
+        "day":        "to_char(started_at, 'YYYY-MM-DD')",
+    }
+
+    async def aggregate_runs(self, *, group_by: str = "trace_tag",
+                              since: datetime | None = None,
+                              until: datetime | None = None,
+                              trace_tag: str | None = None) -> dict:
+        if group_by not in self._AGGREGATE_GROUP_EXPRS:
+            raise ValueError(
+                f"group_by must be one of: "
+                f"{', '.join(sorted(self._AGGREGATE_GROUP_EXPRS))}"
+            )
+        expr = self._AGGREGATE_GROUP_EXPRS[group_by]
+        where: list[str] = []
+        params: list[Any] = []
+        if since:
+            params.append(since)
+            where.append(f"started_at >= ${len(params)}")
+        if until:
+            params.append(until)
+            where.append(f"started_at <= ${len(params)}")
+        if trace_tag:
+            params.append(trace_tag)
+            where.append(f"trace_tag = ${len(params)}")
+        where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+        group_sql = f"""
+            SELECT
+              {expr} AS key,
+              COUNT(*) AS count,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+              SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM runs{where_clause}
+            GROUP BY key
+            ORDER BY count DESC
+        """
+        total_sql = f"""
+            SELECT
+              COUNT(*) AS count,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+              SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM runs{where_clause}
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(group_sql, *params)
+            total = await conn.fetchrow(total_sql, *params)
+        return {
+            "group_by": group_by,
+            "groups": [dict(r) for r in rows],
+            "total": dict(total) if total else {
+                "count": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "error_count": 0,
+            },
+        }
+
+    async def purge_old_runs(self, max_age_days: int = 30) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM runs WHERE started_at < $1", cutoff,
+            )
+        # asyncpg returns 'DELETE N'
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
 
     # --- Events ---
 
@@ -460,6 +541,66 @@ class InMemoryStore:
         run.status = result.get("status")
         run.error_type = result.get("error_type")
         run.error_msg = result.get("error_msg")
+
+    async def aggregate_runs(self, *, group_by: str = "trace_tag",
+                              since: datetime | None = None,
+                              until: datetime | None = None,
+                              trace_tag: str | None = None) -> dict:
+        valid = {"trace_tag", "kind", "model", "agent_id",
+                  "status", "error_type", "day"}
+        if group_by not in valid:
+            raise ValueError(
+                f"group_by must be one of: {', '.join(sorted(valid))}"
+            )
+
+        def _matches(r: Run) -> bool:
+            if since and r.started_at < since:
+                return False
+            if until and r.started_at > until:
+                return False
+            if trace_tag and r.trace_tag != trace_tag:
+                return False
+            return True
+
+        def _key(r: Run) -> str:
+            if group_by == "day":
+                return r.started_at.strftime("%Y-%m-%d")
+            return getattr(r, group_by) or "<none>"
+
+        groups: dict[str, dict] = {}
+        total = {"count": 0, "total_tokens": 0,
+                  "cost_usd": 0.0, "error_count": 0}
+        for r in self._runs.values():
+            if not _matches(r):
+                continue
+            k = _key(r)
+            g = groups.setdefault(k, {
+                "key": k, "count": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "error_count": 0,
+            })
+            g["count"] += 1
+            g["total_tokens"] += r.total_tokens or 0
+            g["cost_usd"] += r.cost_usd or 0.0
+            err = 1 if r.status == "error" else 0
+            g["error_count"] += err
+            total["count"] += 1
+            total["total_tokens"] += r.total_tokens or 0
+            total["cost_usd"] += r.cost_usd or 0.0
+            total["error_count"] += err
+        return {
+            "group_by": group_by,
+            "groups": sorted(groups.values(),
+                              key=lambda g: g["count"], reverse=True),
+            "total": total,
+        }
+
+    async def purge_old_runs(self, max_age_days: int = 30) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        old = [rid for rid, r in self._runs.items() if r.started_at < cutoff]
+        for rid in old:
+            self._runs.pop(rid, None)
+            self._events.pop(rid, None)
+        return len(old)
 
     async def append_event(self, event: RunEvent) -> RunEvent:
         events = self._events.setdefault(event.run_id, [])

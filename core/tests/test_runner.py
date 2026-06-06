@@ -45,9 +45,8 @@ async def test_execute_complete_task(tmp_path):
         "model": "claude-sonnet",
     }
 
-    with (
-        patch("aitelier.runner.complete", new_callable=AsyncMock, return_value=mock_result),
-        patch("aitelier.runner.record_trace"),
+    with patch(
+        "aitelier.runner.complete", new_callable=AsyncMock, return_value=mock_result,
     ):
         result = await execute(task, base_dir=tmp_path)
 
@@ -79,9 +78,8 @@ async def test_execute_error_result(tmp_path):
         "prompt": "Hello",
     }
 
-    with (
-        patch("aitelier.runner.complete", new_callable=AsyncMock, return_value=mock_result),
-        patch("aitelier.runner.record_trace"),
+    with patch(
+        "aitelier.runner.complete", new_callable=AsyncMock, return_value=mock_result,
     ):
         result = await execute(task, base_dir=tmp_path)
 

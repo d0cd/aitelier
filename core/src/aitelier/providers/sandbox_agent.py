@@ -130,7 +130,17 @@ class AcpClient:
             resp.raise_for_status()
 
     async def _consume_sse(self) -> None:
-        """Background task: parse SSE envelopes, enqueue notifications."""
+        """Background task: parse SSE envelopes.
+
+        Three classes of envelopes can arrive:
+          - Notifications (method, no id)        → enqueue for the caller
+          - Agent → client requests (method+id)  → respond synchronously;
+            without responding, agents block waiting for the answer.
+            This is how permission requests, fs reads, and terminal calls
+            reach us per the ACP spec.
+          - Responses to our outgoing requests   → not used today
+            (synchronous POST returns them) but handled defensively.
+        """
         assert self._http is not None
         try:
             async with self._http.stream("GET", self._url(),
@@ -146,14 +156,69 @@ class AcpClient:
                         env = json.loads(payload)
                     except json.JSONDecodeError:
                         continue
-                    # We only consume notifications; responses to our requests
-                    # come back synchronously on the POST.
-                    if "method" in env and "id" not in env:
+                    has_id = "id" in env
+                    has_method = "method" in env
+                    if has_method and not has_id:
                         await self._notifications.put(env)
+                    elif has_method and has_id:
+                        # Agent is asking us for something. Auto-handle so
+                        # the agent doesn't hang.
+                        await self._respond_to_agent_request(env)
+                    # else: response to a prior request from us — ignored
+                    # for now; POST returns sync responses.
         except asyncio.CancelledError:
             raise
         except Exception:
             # Stream may close when the session ends — that's fine.
+            pass
+
+    async def _respond_to_agent_request(self, env: dict) -> None:
+        """Build a JSON-RPC response for an agent → client request.
+
+        Auto-approves permission asks (allow), rejects fs/terminal/etc. with
+        method-not-found. Without responding, agents that advertise
+        `permissions: true` (claude, codex, ...) hang on the first tool call.
+        """
+        req_id = env.get("id")
+        method = env.get("method", "")
+        params = env.get("params") or {}
+
+        result: Any = None
+        error: dict | None = None
+
+        if method == "session/request_permission":
+            # ACP outcome shape: {outcome: {outcome: "selected"|"cancelled",
+            #                                optionId: "allow"|<denied-id>}}
+            options = params.get("options") or []
+            allow_id = "allow"
+            for opt in options:
+                if isinstance(opt, dict):
+                    kind = opt.get("kind") or opt.get("optionId") or ""
+                    if "allow" in str(kind).lower():
+                        allow_id = opt.get("optionId", "allow")
+                        break
+            result = {"outcome": {"outcome": "selected", "optionId": allow_id}}
+        else:
+            # Anything else (fs.*, terminal/*, session/*) — politely refuse.
+            error = {
+                "code": -32601,
+                "message": f"client does not implement {method}",
+            }
+
+        response: dict = {"jsonrpc": "2.0", "id": req_id}
+        if error is not None:
+            response["error"] = error
+        else:
+            response["result"] = result
+
+        try:
+            assert self._http is not None
+            await self._http.post(self._url(), json=response,
+                                   headers=self._headers(),
+                                   timeout=10.0)
+        except Exception:
+            # Best-effort. If the POST fails, the agent will eventually
+            # time out on its end — same outcome as before this fix.
             pass
 
     def start_stream(self) -> None:
@@ -366,9 +431,13 @@ async def call_via_sandbox_stream(
                              timeout=timeout) as client:
             await client.call("initialize", {
                 "protocolVersion": _ACP_PROTOCOL_VERSION,
+                # Advertise only what aitelier actually services in the SSE
+                # consumer. fs/terminal handlers would need real
+                # implementations; until then say no so the agent doesn't
+                # ask and hang waiting for a response.
                 "clientCapabilities": {
-                    "fs": {"readTextFile": True, "writeTextFile": True},
-                    "terminal": True,
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False,
                 },
                 "clientInfo": {"name": "aitelier", "version": "0.1.0"},
             }, first=True)

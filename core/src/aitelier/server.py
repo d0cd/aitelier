@@ -18,7 +18,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from aitelier.traces import record_trace
+from aitelier.runs import hash_system_prompt, record_run
+from aitelier.storage import RunFilter, RunSpec, get_store
 
 logger = logging.getLogger("aitelier")
 
@@ -116,13 +117,13 @@ _install_correlation_logging()
 
 
 async def _schedule_handler(entry: dict) -> None:
-    """Run one fired schedule. Records trace + posts to webhook if set."""
+    """Run one fired schedule. runner.execute() records the run durably."""
     from aitelier.runner import execute as run_execute
     from aitelier.runner import make_run_id
 
     task = dict(entry.get("task") or {})
     run_id = make_run_id(entry.get("name", "scheduled"))
-    started_at = _now_iso()
+    # Tag the run with its triggering schedule so dashboards can group.
     meta = dict(task.get("metadata") or {})
     meta["schedule_id"] = entry["id"]
     task["metadata"] = meta
@@ -140,15 +141,6 @@ async def _schedule_handler(entry: dict) -> None:
             "error_msg": str(exc),
             "finish_reason": "error",
         }
-    try:
-        record_trace(
-            trace_id=run_id, started_at=started_at, result=result,
-            system_prompt=task.get("system_prompt"),
-            trace_tag=task.get("trace_tag"),
-            metadata={"schedule_id": entry["id"]},
-        )
-    except Exception as exc:
-        logger.warning("Failed to record schedule trace: %s", exc)
     if entry.get("webhook_url"):
         await _post_webhook(entry["webhook_url"], {
             "schedule_id": entry["id"],
@@ -163,11 +155,13 @@ async def lifespan(app: FastAPI):
     # *after* this module is imported, so the import-time tag misses them.
     _retag_uvicorn_handlers()
 
-    # Purge old traces on startup
-    from aitelier.traces import purge_traces
-    deleted = purge_traces(max_age_days=30)
+    # Open the durable store (Postgres if DATABASE_URL is set, in-memory otherwise)
+    store = await get_store()
+
+    # Purge old runs on startup
+    deleted = await store.purge_old_runs(max_age_days=30)
     if deleted:
-        logger.info("Purged %d traces older than 30 days", deleted)
+        logger.info("Purged %d runs older than 30 days", deleted)
 
     # Start the persistent schedule tick loop
     from aitelier.schedules import start_tick_loop, stop_tick_loop
@@ -211,6 +205,10 @@ async def lifespan(app: FastAPI):
     # Release the shared HTTP client pool.
     from aitelier.providers.llm import close_shared_client
     await close_shared_client()
+
+    # Close the durable store.
+    from aitelier.storage import close_store
+    await close_store()
 
 
 app = FastAPI(title="aitelier", version="0.1.0", lifespan=lifespan)
@@ -417,9 +415,13 @@ async def complete_endpoint(req: CompleteRequest, request: Request) -> dict:
 
     cid = request.state.correlation_id
     run_id = make_run_id("complete")
-    started_at = _now_iso()
-
-    result = await complete(
+    spec = RunSpec(
+        run_id=run_id, kind="complete", model=req.model,
+        trace_tag=req.trace_tag, correlation_id=cid,
+        system_prompt_hash=hash_system_prompt(req.system_prompt),
+        metadata={"correlation_id": cid},
+    )
+    result = await record_run(spec, complete(
         model=req.model,
         messages=req.messages,
         system_prompt=req.system_prompt,
@@ -429,16 +431,8 @@ async def complete_endpoint(req: CompleteRequest, request: Request) -> dict:
         timeout=req.timeout or 60,
         run_id=run_id,
         trace_tag=req.trace_tag,
-    )
+    ))
     result["correlation_id"] = cid
-    record_trace(
-        trace_id=run_id,
-        started_at=started_at,
-        result=result,
-        system_prompt=req.system_prompt,
-        trace_tag=req.trace_tag,
-        metadata={"correlation_id": cid},
-    )
     return result
 
 
@@ -456,7 +450,15 @@ async def complete_stream_endpoint(req: CompleteRequest, request: Request):
 
     cid = request.state.correlation_id
     run_id = make_run_id("complete_stream")
-    started_at = _now_iso()
+    # Persist a run row up front so dashboards can see "running" mid-stream.
+    store = await get_store()
+    await store.create_run(RunSpec(
+        run_id=run_id, kind="complete", model=req.model,
+        trace_tag=req.trace_tag, correlation_id=cid,
+        system_prompt_hash=hash_system_prompt(req.system_prompt),
+        metadata={"correlation_id": cid},
+    ))
+    await store.update_run_state(run_id, "running")
 
     async def event_generator():
         final: dict | None = None
@@ -500,14 +502,9 @@ async def complete_stream_endpoint(req: CompleteRequest, request: Request):
             })
         finally:
             if final is not None:
-                record_trace(
-                    trace_id=run_id,
-                    started_at=started_at,
-                    result=final,
-                    system_prompt=req.system_prompt,
-                    trace_tag=req.trace_tag,
-                    metadata={"correlation_id": cid},
-                )
+                state = ("failed" if final.get("status") == "error"
+                         else "completed")
+                await store.finalize_run(run_id, final, state=state)
 
     return StreamingResponse(
         event_generator(),
@@ -528,21 +525,17 @@ async def embed_endpoint(req: EmbedRequest, request: Request) -> dict:
 
     cid = request.state.correlation_id
     run_id = make_run_id("embed")
-    started_at = _now_iso()
-
-    result = await embed(
+    spec = RunSpec(
+        run_id=run_id, kind="embed", model=req.model,
+        correlation_id=cid, metadata={"correlation_id": cid},
+    )
+    result = await record_run(spec, embed(
         texts=req.texts,
         model=req.model,
         timeout=req.timeout or 30,
         run_id=run_id,
-    )
+    ))
     result["correlation_id"] = cid
-    record_trace(
-        trace_id=run_id,
-        started_at=started_at,
-        result=result,
-        metadata={"correlation_id": cid},
-    )
     return result
 
 
@@ -631,8 +624,21 @@ async def run_agent_stream_endpoint(req: RunAgentRequest, request: Request):
 
     cid = request.state.correlation_id
     run_id = make_run_id("agent_stream")
-    started_at = _now_iso()
     system_prompt = _fold_examples(req.system_prompt, req.examples)
+
+    store = await get_store()
+    await store.create_run(RunSpec(
+        run_id=run_id, kind="agent", agent_id=req.model, model=req.model,
+        trace_tag=req.trace_tag, correlation_id=cid,
+        workspace=req.workspace,
+        environment={
+            "mcp_servers": req.mcp_servers or [],
+            "tool_allowlist": req.tool_allowlist or [],
+        },
+        system_prompt_hash=hash_system_prompt(system_prompt),
+        metadata={"correlation_id": cid},
+    ))
+    await store.update_run_state(run_id, "running")
 
     async def event_generator():
         final: dict | None = None
@@ -671,14 +677,9 @@ async def run_agent_stream_endpoint(req: RunAgentRequest, request: Request):
             })
         finally:
             if final is not None:
-                record_trace(
-                    trace_id=run_id,
-                    started_at=started_at,
-                    result=final,
-                    system_prompt=system_prompt,
-                    trace_tag=req.trace_tag,
-                    metadata={"correlation_id": cid},
-                )
+                state = ("failed" if final.get("status") == "error"
+                         else "completed")
+                await store.finalize_run(run_id, final, state=state)
 
     return StreamingResponse(
         event_generator(),
@@ -768,6 +769,30 @@ async def agent_preview_endpoint(req: AgentPreviewRequest) -> dict:
     }
 
 
+def _run_to_trace_dict(run) -> dict:
+    """Convert a Run dataclass to the legacy trace-record wire shape.
+    Same fields as the SDK's TraceRecord; `trace_id` aliases `run_id`."""
+    return {
+        "trace_id": run.run_id,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "model": run.model,
+        "kind": run.kind,
+        "finish_reason": run.finish_reason,
+        "tool_call_count": run.tool_call_count,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+        "cost_usd": run.cost_usd,
+        "system_prompt_hash": run.system_prompt_hash,
+        "trace_tag": run.trace_tag,
+        "status": run.status,
+        "error_type": run.error_type,
+        "error_msg": run.error_msg,
+        "metadata": run.metadata,
+    }
+
+
 @app.get("/v1/traces")
 async def traces_endpoint(
     since: str | None = None,
@@ -775,15 +800,14 @@ async def traces_endpoint(
     status: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Query recent traces."""
-    from aitelier.traces import recent_traces
-
-    return recent_traces(
-        since=since,
-        trace_tag=trace_tag,
-        status=status,
-        limit=limit,
-    )
+    """Query recent runs (legacy `traces` shape)."""
+    store = await get_store()
+    since_dt = datetime.fromisoformat(since) if since else None
+    flt = RunFilter(trace_tag=trace_tag, since=since_dt, limit=limit)
+    runs = await store.list_runs(flt)
+    if status:
+        runs = [r for r in runs if r.status == status]
+    return [_run_to_trace_dict(r) for r in runs]
 
 
 @app.get("/v1/traces/aggregates")
@@ -793,11 +817,16 @@ async def traces_aggregates_endpoint(
     until: str | None = None,
     trace_tag: str | None = None,
 ) -> dict:
-    """Roll up trace stats. `group_by` ∈ {trace_tag, kind, model, status, error_type, day}."""
-    from aitelier.traces import aggregate_traces
+    """Roll up run stats.
+
+    `group_by` ∈ {trace_tag, kind, model, agent_id, status, error_type, day}.
+    """
+    store = await get_store()
+    since_dt = datetime.fromisoformat(since) if since else None
+    until_dt = datetime.fromisoformat(until) if until else None
     try:
-        return aggregate_traces(
-            group_by=group_by, since=since, until=until, trace_tag=trace_tag,
+        return await store.aggregate_runs(
+            group_by=group_by, since=since_dt, until=until_dt, trace_tag=trace_tag,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
@@ -805,13 +834,12 @@ async def traces_aggregates_endpoint(
 
 @app.get("/v1/traces/{trace_id}")
 async def get_trace_endpoint(trace_id: str) -> dict:
-    """Get a single trace by ID."""
-    from aitelier.traces import get_trace
-
-    trace = get_trace(trace_id)
-    if not trace:
+    """Get a single trace by ID (legacy alias for /v1/runs/{run_id})."""
+    store = await get_store()
+    run = await store.get_run(trace_id)
+    if not run:
         raise HTTPException(status_code=404, detail=f"Trace not found: {trace_id}")
-    return trace
+    return _run_to_trace_dict(run)
 
 
 # --- Task runner endpoints (fan-out, legacy) ---
@@ -1071,11 +1099,11 @@ async def _probe_litellm(cfg) -> dict:
         }
 
 
-def _probe_traces() -> dict:
-    """Live probe: trace store queryable."""
+async def _probe_traces() -> dict:
+    """Live probe: durable store queryable."""
     try:
-        from aitelier.traces import recent_traces
-        recent_traces(limit=1)
+        store = await get_store()
+        await store.list_runs(RunFilter(limit=1))
         return {"available": True}
     except Exception as exc:
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
@@ -1134,7 +1162,7 @@ _discovery_lock = asyncio.Lock()
 async def list_schedules_endpoint() -> list[dict]:
     """List persisted schedules."""
     from aitelier.schedules import list_schedules
-    return list_schedules()
+    return await list_schedules()
 
 
 @app.post("/v1/schedules")
@@ -1142,7 +1170,7 @@ async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
     """Register a recurring or one-shot scheduled task."""
     from aitelier.schedules import create_schedule
     try:
-        return create_schedule(req.model_dump(exclude_none=True))
+        return await create_schedule(req.model_dump(exclude_none=True))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
@@ -1151,7 +1179,7 @@ async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
 async def get_schedule_endpoint(schedule_id: str) -> dict:
     _validate_path_component(schedule_id, "schedule_id")
     from aitelier.schedules import get_schedule
-    entry = get_schedule(schedule_id)
+    entry = await get_schedule(schedule_id)
     if not entry:
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
     return entry
@@ -1161,7 +1189,7 @@ async def get_schedule_endpoint(schedule_id: str) -> dict:
 async def delete_schedule_endpoint(schedule_id: str) -> dict:
     _validate_path_component(schedule_id, "schedule_id")
     from aitelier.schedules import delete_schedule
-    if not delete_schedule(schedule_id):
+    if not await delete_schedule(schedule_id):
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
     return {"id": schedule_id, "deleted": True}
 
@@ -1196,7 +1224,7 @@ async def discovery() -> dict:
             _probe_litellm(cfg),
             _probe_sandbox_agent(cfg),
         )
-        traces_info = _probe_traces()
+        traces_info = await _probe_traces()
 
         litellm_ok = litellm_info["reachable"]
         sandbox_ok = sandbox_info["reachable"]

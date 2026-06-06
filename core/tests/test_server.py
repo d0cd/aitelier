@@ -176,7 +176,6 @@ def test_execute_stream(client):
 
     with (
         patch("aitelier.runner.complete", new_callable=AsyncMock, return_value=mock_result),
-        patch("aitelier.runner.record_trace"),
     ):
         resp = client.post("/v1/execute/stream", json={
             "name": "test",
@@ -398,24 +397,20 @@ def test_correlation_id_generated_when_absent(client):
 
 
 def test_correlation_id_persisted_in_trace_metadata(client):
-    captured = {}
-
-    def fake_record(**kwargs):
-        captured.update(kwargs)
-
-    with (
-        patch("aitelier.runner.complete", new_callable=AsyncMock,
-              return_value=_complete_mock()),
-        patch("aitelier.runner.record_trace", side_effect=fake_record),
-    ):
-        resp = client.post("/v1/execute",
-                           json={"name": "t", "kind": "complete", "prompt": "hi"},
-                           headers={"X-Correlation-Id": "trace-abc"})
+    """Correlation ID should land on the durable run record."""
+    with patch("aitelier.runner.complete", new_callable=AsyncMock,
+                return_value=_complete_mock()):
+        resp = client.post(
+            "/v1/execute",
+            json={"name": "t", "kind": "complete", "prompt": "hi"},
+            headers={"X-Correlation-Id": "trace-abc"},
+        )
 
     assert resp.status_code == 200
     assert resp.json()["correlation_id"] == "trace-abc"
-    meta = captured.get("metadata") or {}
-    assert meta.get("correlation_id") == "trace-abc"
+
+    runs = _runs_from_store()
+    assert any(r.correlation_id == "trace-abc" for r in runs)
 
 
 # --- Streaming /v1/complete/stream ---
@@ -473,33 +468,35 @@ def test_complete_stream_error_event_on_failure(client):
 # --- Trace recording for /v1/complete, /v1/embed, /v1/complete/stream ---
 
 
+def _runs_from_store():
+    """Synchronously fetch all runs from the conftest-provided InMemoryStore.
+
+    TestClient may hold an event loop, so reach into the store directly
+    rather than going through `get_store()` which would await.
+    """
+    from aitelier.storage._store import _store as _module_store
+    if _module_store is None:
+        return []
+    # InMemoryStore exposes ._runs as a plain dict
+    return list(_module_store._runs.values())
+
+
 def test_complete_records_trace(client):
-    captured = {}
-
-    def fake_record(**kwargs):
-        captured.update(kwargs)
-
-    with (
-        patch("aitelier.providers.llm.complete", new_callable=AsyncMock,
-              return_value=_complete_mock()),
-        patch("aitelier.server.record_trace", side_effect=fake_record),
-    ):
-        resp = client.post("/v1/complete",
-                           json={"model": "claude-sonnet",
-                                 "messages": [{"role": "user", "content": "hi"}]},
-                           headers={"X-Correlation-Id": "trace-cmpl"})
+    with patch("aitelier.providers.llm.complete", new_callable=AsyncMock,
+                return_value=_complete_mock()):
+        resp = client.post(
+            "/v1/complete",
+            json={"model": "claude-sonnet",
+                  "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Correlation-Id": "trace-cmpl"},
+        )
     assert resp.status_code == 200
-    assert captured.get("trace_id")
-    md = captured.get("metadata") or {}
-    assert md.get("correlation_id") == "trace-cmpl"
+    runs = _runs_from_store()
+    assert runs, "expected at least one run recorded"
+    assert any(r.correlation_id == "trace-cmpl" for r in runs)
 
 
 def test_embed_records_trace(client):
-    captured = {}
-
-    def fake_record(**kwargs):
-        captured.update(kwargs)
-
     mock_result = {
         "kind": "embed", "provider": "nomic-embed-text", "status": "ok",
         "duration_s": 0.2, "run_id": "", "trace_id": "",
@@ -508,24 +505,18 @@ def test_embed_records_trace(client):
         "finish_reason": "stop", "cost_usd": None,
         "error_type": None, "error_msg": None,
     }
-    with (
-        patch("aitelier.providers.llm.embed", new_callable=AsyncMock,
-              return_value=mock_result),
-        patch("aitelier.server.record_trace", side_effect=fake_record),
-    ):
-        resp = client.post("/v1/embed",
-                           json={"texts": ["hi"]},
-                           headers={"X-Correlation-Id": "trace-emb"})
+    with patch("aitelier.providers.llm.embed", new_callable=AsyncMock,
+                return_value=mock_result):
+        resp = client.post(
+            "/v1/embed", json={"texts": ["hi"]},
+            headers={"X-Correlation-Id": "trace-emb"},
+        )
     assert resp.status_code == 200
-    assert captured.get("trace_id")
+    runs = _runs_from_store()
+    assert any(r.kind == "embed" for r in runs)
 
 
 def test_complete_stream_records_trace_at_done(client):
-    captured = {}
-
-    def fake_record(**kwargs):
-        captured.update(kwargs)
-
     async def fake_stream(**kwargs):
         yield {"type": "delta", "content": "ok"}
         yield {
@@ -534,17 +525,17 @@ def test_complete_stream_records_trace_at_done(client):
             "finish_reason": "stop", "cost_usd": None, "trace_id": "", "run_id": "",
         }
 
-    with (
-        patch("aitelier.providers.llm.complete_stream", fake_stream),
-        patch("aitelier.server.record_trace", side_effect=fake_record),
-    ):
-        resp = client.post("/v1/complete/stream",
-                           json={"model": "claude-sonnet",
-                                 "messages": [{"role": "user", "content": "hi"}]},
-                           headers={"X-Correlation-Id": "trace-strm"})
+    with patch("aitelier.providers.llm.complete_stream", fake_stream):
+        resp = client.post(
+            "/v1/complete/stream",
+            json={"model": "claude-sonnet",
+                  "messages": [{"role": "user", "content": "hi"}]},
+            headers={"X-Correlation-Id": "trace-strm"},
+        )
     assert resp.status_code == 200
-    # Body fully read by TestClient before returning; record_trace ran
-    assert captured.get("trace_id")
+    runs = _runs_from_store()
+    assert any(r.correlation_id == "trace-strm" and r.kind == "complete"
+                for r in runs)
 
 
 # --- Cancellation ---
@@ -618,7 +609,6 @@ def test_agent_async_returns_run_id_immediately(client):
 
     with (
         patch("aitelier.runner.call_agent", side_effect=slow_call),
-        patch("aitelier.runner.record_trace"),
     ):
         resp = client.post("/v1/agent", json={
             "model": "claude",
@@ -636,34 +626,28 @@ def test_agent_async_returns_run_id_immediately(client):
 
 
 def test_create_and_list_schedule(client):
-    import aitelier.schedules as sch
-    sch._reset_for_tests()
-    with patch("aitelier.schedules._registry_path",
-               return_value=__import__("pathlib").Path("/tmp/aitelier-test-schedules.json")):
-        try:
-            resp = client.post("/v1/schedules", json={
-                "name": "audit-daily",
-                "task": {"name": "audit", "kind": "agent", "model": "claude"},
-                "interval_seconds": 86400,
-            })
-            assert resp.status_code == 200
-            sid = resp.json()["id"]
+    """Schedules persist via the store fixture; no file I/O needed."""
+    resp = client.post("/v1/schedules", json={
+        "name": "audit-daily",
+        "task": {"name": "audit", "kind": "agent", "model": "claude"},
+        "interval_seconds": 86400,
+    })
+    assert resp.status_code == 200
+    sid = resp.json()["id"]
 
-            resp = client.get("/v1/schedules")
-            ids = [s["id"] for s in resp.json()]
-            assert sid in ids
+    resp = client.get("/v1/schedules")
+    ids = [s["id"] for s in resp.json()]
+    assert sid in ids
 
-            resp = client.get(f"/v1/schedules/{sid}")
-            assert resp.status_code == 200
-            assert resp.json()["name"] == "audit-daily"
+    resp = client.get(f"/v1/schedules/{sid}")
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "audit-daily"
 
-            resp = client.delete(f"/v1/schedules/{sid}")
-            assert resp.status_code == 200
+    resp = client.delete(f"/v1/schedules/{sid}")
+    assert resp.status_code == 200
 
-            resp = client.get(f"/v1/schedules/{sid}")
-            assert resp.status_code == 404
-        finally:
-            sch._reset_for_tests()
+    resp = client.get(f"/v1/schedules/{sid}")
+    assert resp.status_code == 404
 
 
 def test_create_schedule_rejects_invalid(client):
@@ -692,7 +676,6 @@ def test_agent_stream_yields_delta_tool_call_then_done(client):
 
     with (
         patch("aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream),
-        patch("aitelier.server.record_trace"),
     ):
         resp = client.post("/v1/agent/stream", json={
             "model": "claude-code",
@@ -718,7 +701,6 @@ def test_agent_stream_error_event_on_failure(client):
 
     with (
         patch("aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream),
-        patch("aitelier.server.record_trace"),
     ):
         resp = client.post("/v1/agent/stream", json={
             "model": "claude-code",
@@ -846,7 +828,6 @@ def test_agent_endpoint_folds_examples(client):
 
     with (
         patch("aitelier.runner.call_agent", side_effect=fake_call),
-        patch("aitelier.runner.record_trace"),
     ):
         resp = client.post("/v1/agent", json={
             "model": "claude-code",
@@ -918,7 +899,6 @@ def test_correlation_id_in_sse_events(client):
     with (
         patch("aitelier.runner.complete", new_callable=AsyncMock,
               return_value=_complete_mock()),
-        patch("aitelier.runner.record_trace"),
     ):
         resp = client.post("/v1/execute/stream",
                            json={"name": "t", "kind": "complete", "prompt": "hi"},

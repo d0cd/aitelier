@@ -1,151 +1,119 @@
-"""Persistent scheduled task runner.
+"""Schedule-tick service. State lives in storage; tick loop lives here.
 
-File-backed registry of schedules with a background tick loop that fires them
-at the right time. Two schedule kinds:
-
-- interval: `{interval_seconds: 3600}` — runs every N seconds
-- one-shot: `{at_iso: "2026-05-12T20:00:00Z"}` — runs once at that time
-
-Each schedule carries a TaskSpec dict (any task aitelier can run) plus an
-optional webhook URL that's POSTed to on completion.
-
-Single-process: state lives in `runs/schedules.json`. Persists across restarts.
-Not safe under concurrent aitelier processes.
+The public API is async — all functions delegate to the durable store. The
+tick loop runs a background coroutine that wakes every 10s, claims due
+schedules, and dispatches a caller-supplied handler. State (next_run_at,
+last_run_at) is persisted in Postgres so schedules survive aitelier restarts.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from typing import Any
 
-from aitelier.config import get_config
+from aitelier.storage import Schedule, get_store
 
 logger = logging.getLogger("aitelier.schedules")
 
-_schedules: dict[str, dict] = {}
-_loaded = False
 _tick_task: asyncio.Task | None = None
 _TICK_SECONDS = 10.0
-
-
-def _registry_path() -> Path:
-    return Path(get_config().runs_dir) / "schedules.json"
-
-
-def _load() -> None:
-    global _schedules, _loaded
-    if _loaded:
-        return
-    path = _registry_path()
-    if path.exists():
-        try:
-            _schedules = json.loads(path.read_text())
-        except Exception as exc:
-            logger.warning("Failed to load schedules registry: %s", exc)
-            _schedules = {}
-    _loaded = True
-
-
-def _save() -> None:
-    path = _registry_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_schedules, indent=2, default=str))
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _next_run_after(now: datetime, schedule: dict) -> datetime | None:
+def _next_run_after(now: datetime, schedule: Schedule) -> datetime | None:
     """Compute when this schedule should next fire, or None if it's done."""
-    if interval := schedule.get("interval_seconds"):
-        last = schedule.get("last_run_at")
-        base = datetime.fromisoformat(last) if last else now
-        nxt = base + timedelta(seconds=int(interval))
-        # If we've slept past several intervals, skip to the next one in the future.
+    if schedule.interval_seconds:
+        base = schedule.last_run_at or now
+        nxt = base + timedelta(seconds=schedule.interval_seconds)
         while nxt < now:
-            nxt += timedelta(seconds=int(interval))
+            nxt += timedelta(seconds=schedule.interval_seconds)
         return nxt
-    if at := schedule.get("at_iso"):
-        if schedule.get("last_run_at"):
+    if schedule.at_iso:
+        if schedule.last_run_at:
             return None  # one-shot already fired
-        return datetime.fromisoformat(at.replace("Z", "+00:00") if at.endswith("Z") else at)
+        return schedule.at_iso
     return None
 
 
-def list_schedules() -> list[dict]:
-    _load()
-    return list(_schedules.values())
+async def list_schedules() -> list[dict]:
+    store = await get_store()
+    rows = await store.list_schedules()
+    return [_to_dict(s) for s in rows]
 
 
-def get_schedule(schedule_id: str) -> dict | None:
-    _load()
-    return _schedules.get(schedule_id)
+async def get_schedule(schedule_id: str) -> dict | None:
+    store = await get_store()
+    s = await store.get_schedule(schedule_id)
+    return _to_dict(s) if s else None
 
 
-def create_schedule(spec: dict) -> dict:
-    """Persist a schedule. Required keys: `task` (dict). At least one of
-    `interval_seconds` or `at_iso`. Optional: `name`, `webhook_url`.
+async def create_schedule(spec: dict) -> dict:
+    """Persist a schedule.
+
+    Required: `task`. At least one of `interval_seconds` or `at_iso`.
+    Optional: `name`, `webhook_url`.
     """
-    _load()
     if "task" not in spec:
         raise ValueError("schedule requires a `task` spec")
     if "interval_seconds" not in spec and "at_iso" not in spec:
         raise ValueError("schedule requires `interval_seconds` or `at_iso`")
 
     now = _now()
-    sid = str(uuid.uuid4())
-    entry: dict = {
-        "id": sid,
-        "created_at": now.isoformat(),
-        "name": spec.get("name", "scheduled"),
-        "task": spec["task"],
-        "webhook_url": spec.get("webhook_url"),
-        "interval_seconds": spec.get("interval_seconds"),
-        "at_iso": spec.get("at_iso"),
-        "last_run_at": None,
-    }
-    nxt = _next_run_after(now, entry)
-    entry["next_run_at"] = nxt.isoformat() if nxt else None
-    _schedules[sid] = entry
-    _save()
-    return entry
+    at_iso = spec.get("at_iso")
+    if isinstance(at_iso, str):
+        at_iso = datetime.fromisoformat(
+            at_iso.replace("Z", "+00:00") if at_iso.endswith("Z") else at_iso
+        )
+
+    schedule = Schedule(
+        id=str(uuid.uuid4()),
+        name=spec.get("name", "scheduled"),
+        task=spec["task"],
+        interval_seconds=spec.get("interval_seconds"),
+        at_iso=at_iso,
+        webhook_url=spec.get("webhook_url"),
+        next_run_at=None,
+        last_run_at=None,
+        created_at=now,
+    )
+    schedule.next_run_at = _next_run_after(now, schedule)
+
+    store = await get_store()
+    await store.create_schedule(schedule)
+    return _to_dict(schedule)
 
 
-def delete_schedule(schedule_id: str) -> bool:
-    _load()
-    if schedule_id not in _schedules:
-        return False
-    _schedules.pop(schedule_id)
-    _save()
-    return True
+async def delete_schedule(schedule_id: str) -> bool:
+    store = await get_store()
+    return await store.delete_schedule(schedule_id)
 
 
 async def _run_tick(now: datetime,
                     handler: Callable[[dict], Awaitable[None]]) -> None:
     """One tick: fire any schedules whose next_run_at <= now."""
-    for sid, entry in list(_schedules.items()):
-        nra = entry.get("next_run_at")
-        if not nra:
+    store = await get_store()
+    schedules = await store.list_schedules()
+    for s in schedules:
+        if not s.next_run_at or s.next_run_at > now:
             continue
-        try:
-            nra_dt = datetime.fromisoformat(nra)
-        except ValueError:
-            continue
-        if nra_dt > now:
-            continue
-        logger.info("Firing schedule %s (%s)", sid, entry.get("name"))
-        # Detached: don't block the tick loop on a long agent run.
-        asyncio.create_task(handler(entry))
-        entry["last_run_at"] = now.isoformat()
-        nxt = _next_run_after(now, entry)
-        entry["next_run_at"] = nxt.isoformat() if nxt else None
-    _save()
+        logger.info("Firing schedule %s (%s)", s.id, s.name)
+        asyncio.create_task(handler(_to_dict(s)))
+        nxt = _next_run_after(now, Schedule(
+            id=s.id, name=s.name, task=s.task,
+            interval_seconds=s.interval_seconds, at_iso=s.at_iso,
+            webhook_url=s.webhook_url,
+            next_run_at=s.next_run_at, last_run_at=now,
+            created_at=s.created_at,
+        ))
+        await store.update_schedule_run_times(s.id, last_run_at=now,
+                                                 next_run_at=nxt)
 
 
 async def _tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:
@@ -161,7 +129,6 @@ async def _tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:
 
 def start_tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:
     global _tick_task
-    _load()
     if _tick_task is None or _tick_task.done():
         _tick_task = asyncio.create_task(_tick_loop(handler))
 
@@ -173,10 +140,15 @@ def stop_tick_loop() -> None:
     _tick_task = None
 
 
-# --- Test helpers --------------------------------------------------------
-
-def _reset_for_tests() -> None:
-    """Clear in-memory state. Use a tmp_path for the registry in tests."""
-    global _schedules, _loaded
-    _schedules = {}
-    _loaded = False
+def _to_dict(s: Schedule) -> dict[str, Any]:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "task": s.task,
+        "interval_seconds": s.interval_seconds,
+        "at_iso": s.at_iso.isoformat() if s.at_iso else None,
+        "webhook_url": s.webhook_url,
+        "next_run_at": s.next_run_at.isoformat() if s.next_run_at else None,
+        "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }

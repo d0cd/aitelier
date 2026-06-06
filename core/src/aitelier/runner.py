@@ -9,7 +9,8 @@ from pathlib import Path
 from aitelier.config import get_config
 from aitelier.providers.agent import call_agent
 from aitelier.providers.llm import complete, embed
-from aitelier.traces import record_trace
+from aitelier.runs import hash_system_prompt, record_run
+from aitelier.storage import RunSpec
 
 
 def make_run_id(task_name: str) -> str:
@@ -35,7 +36,6 @@ async def execute(task: dict, *, base_dir: Path | None = None, run_id: str | Non
     kind = task["kind"]
     if run_id is None:
         run_id = make_run_id(task["name"])
-    started_at = datetime.now(UTC).isoformat()
 
     # For complete/embed, no run dir needed unless we want persistence
     # For agent, run dir is used for events/diffs
@@ -48,22 +48,31 @@ async def execute(task: dict, *, base_dir: Path | None = None, run_id: str | Non
     model = task.get("model") or _default_model(kind)
     timeout = task.get("timeout") or _default_timeout(kind)
 
-    result = await _dispatch(task, model=model, timeout=timeout, run_dir=run_dir, run_id=run_id)
+    metadata = task.get("metadata") or {}
+    spec = RunSpec(
+        run_id=run_id,
+        kind="complete" if kind == "llm" else kind,
+        agent_id=model if kind == "agent" else None,
+        model=model,
+        trace_tag=task.get("trace_tag"),
+        correlation_id=metadata.get("correlation_id"),
+        workspace=task.get("workspace"),
+        environment={
+            "mcp_servers": task.get("mcp_servers") or [],
+            "tool_allowlist": task.get("tool_allowlist") or [],
+        },
+        system_prompt_hash=hash_system_prompt(task.get("system_prompt")),
+        metadata=metadata,
+    )
+    result = await record_run(
+        spec,
+        _dispatch(task, model=model, timeout=timeout,
+                  run_dir=run_dir, run_id=run_id),
+    )
 
-    # Persist to run dir for agent tasks
     if run_dir:
         _persist_result(run_dir, result["provider"], result)
         _write_manifest(run_dir, task, [result])
-
-    # Record trace
-    record_trace(
-        trace_id=run_id,
-        started_at=started_at,
-        result=result,
-        system_prompt=task.get("system_prompt"),
-        trace_tag=task.get("trace_tag"),
-        metadata=task.get("metadata"),
-    )
 
     return result
 

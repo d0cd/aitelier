@@ -206,48 +206,82 @@ def _cmd_compare(args: argparse.Namespace) -> None:
 
 def _cmd_traces(args: argparse.Namespace) -> None:
     """List traces (with filters), or show one in detail when trace_id is given."""
-    from aitelier.traces import get_trace, recent_traces
+    import asyncio
+    from datetime import datetime as _dt
 
-    if args.trace_id:
-        trace = get_trace(args.trace_id)
-        if not trace:
+    from aitelier.storage import RunFilter, get_store
+
+    async def _go():
+        store = await get_store()
+        if args.trace_id:
+            run = await store.get_run(args.trace_id)
+            return ("single", run)
+        since_dt = _dt.fromisoformat(args.since) if args.since else None
+        runs = await store.list_runs(RunFilter(
+            since=since_dt, trace_tag=args.tag, limit=args.limit,
+        ))
+        if args.status:
+            runs = [r for r in runs if r.status == args.status]
+        return ("list", runs)
+
+    mode, payload = asyncio.run(_go())
+
+    if mode == "single":
+        run = payload
+        if not run:
             print(f"Trace not found: {args.trace_id}", file=sys.stderr)
             sys.exit(1)
+        trace = _run_to_dict(run)
         if args.json:
             print(json.dumps(trace, indent=2, default=str))
             return
         _print_trace_detail(trace)
         return
 
-    traces = recent_traces(
-        since=args.since,
-        trace_tag=args.tag,
-        status=args.status,
-        limit=args.limit,
-    )
-
+    runs = payload
     if args.json:
-        print(json.dumps(traces, indent=2, default=str))
+        print(json.dumps([_run_to_dict(r) for r in runs], indent=2, default=str))
         return
 
-    if not traces:
+    if not runs:
         print("No traces match.")
         return
 
-    # Compact table
     print(f"{'trace_id':<40} {'kind':<10} {'model':<18} {'status':<6} {'tokens':>8}  tag")
     print("-" * 100)
-    for t in traces:
-        total = t.get("total_tokens") or 0
-        tag = t.get("trace_tag") or ""
+    for r in runs:
+        tag = r.trace_tag or ""
         print(
-            f"{(t['trace_id'] or '')[:40]:<40} "
-            f"{(t.get('kind') or '')[:10]:<10} "
-            f"{(t.get('model') or '')[:18]:<18} "
-            f"{(t.get('status') or '')[:6]:<6} "
-            f"{total:>8}  "
+            f"{(r.run_id or '')[:40]:<40} "
+            f"{(r.kind or '')[:10]:<10} "
+            f"{(r.model or '')[:18]:<18} "
+            f"{(r.status or '')[:6]:<6} "
+            f"{(r.total_tokens or 0):>8}  "
             f"{tag}"
         )
+
+
+def _run_to_dict(run) -> dict:
+    """Run dataclass → legacy trace-shaped dict (for CLI JSON output)."""
+    return {
+        "trace_id": run.run_id,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "model": run.model,
+        "kind": run.kind,
+        "finish_reason": run.finish_reason,
+        "tool_call_count": run.tool_call_count,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+        "cost_usd": run.cost_usd,
+        "system_prompt_hash": run.system_prompt_hash,
+        "trace_tag": run.trace_tag,
+        "status": run.status,
+        "error_type": run.error_type,
+        "error_msg": run.error_msg,
+        "metadata": run.metadata,
+    }
 
 
 def _print_trace_detail(t: dict) -> None:
@@ -280,12 +314,13 @@ def _print_trace_detail(t: dict) -> None:
 
 
 def _cmd_status() -> None:
+    import asyncio
     import shutil
 
     import httpx
 
     from aitelier.config import get_config
-    from aitelier.traces import recent_traces
+    from aitelier.storage import RunFilter, get_store
 
     cfg = get_config()
 
@@ -377,13 +412,18 @@ def _cmd_status() -> None:
 
     # --- Traces ---
     print("\nTraces:")
+
+    async def _recent():
+        store = await get_store()
+        return await store.list_runs(RunFilter(limit=5))
+
     try:
-        traces = recent_traces(limit=5)
-        print(f"  {len(traces)} recent (showing last 5)")
-        for t in traces:
-            tag = f" [{t['trace_tag']}]" if t.get("trace_tag") else ""
-            print(f"    {t['trace_id']}  {t['status']}{tag}")
-        if not traces:
+        runs = asyncio.run(_recent())
+        print(f"  {len(runs)} recent (showing last 5)")
+        for r in runs:
+            tag = f" [{r.trace_tag}]" if r.trace_tag else ""
+            print(f"    {r.run_id}  {r.status or '-'}{tag}")
+        if not runs:
             print("  (none)")
     except Exception:
         print("  (no trace store)")

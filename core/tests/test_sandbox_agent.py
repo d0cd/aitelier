@@ -389,6 +389,115 @@ async def test_call_via_sandbox_returns_timeout_on_overrun():
     assert result["finish_reason"] == "timeout"
 
 
+# --- SSE: agent → client requests (permission handshake) -------------------
+
+
+@pytest.mark.asyncio
+async def test_sse_consumer_auto_approves_permission_requests():
+    """When the agent sends session/request_permission (a JSON-RPC REQUEST,
+    not a notification), the SSE consumer must POST back an 'allow' response
+    or the agent will hang forever waiting for permission to invoke a tool."""
+    fake_http = MagicMock()
+
+    # SSE delivers one permission request envelope
+    permission_req = (
+        'data: {"jsonrpc":"2.0","id":42,'
+        '"method":"session/request_permission",'
+        '"params":{"toolCall":{"name":"mcp__stub__hello"},'
+        '"options":[{"optionId":"allow","kind":"allow_once"},'
+        '{"optionId":"deny","kind":"deny"}]}}'
+    )
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            yield permission_req
+
+    fake_http.stream = MagicMock(return_value=_Stream())
+    posts: list[dict] = []
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append({"url": url, "envelope": json})
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    fake_http.post = AsyncMock(side_effect=fake_post)
+
+    async with AcpClient("http://x:2468", "claude", http_client=fake_http) as c:
+        c.start_stream()
+        # Give the consumer a chance to read + respond
+        import asyncio
+        await asyncio.sleep(0.05)
+
+    # The SSE consumer should have POSTed a response that allows the tool
+    responses = [p for p in posts if p["envelope"].get("id") == 42]
+    assert responses, "no response sent for permission request"
+    body = responses[0]["envelope"]
+    assert body["jsonrpc"] == "2.0"
+    assert body["id"] == 42
+    assert "result" in body
+    assert body["result"]["outcome"]["outcome"] == "selected"
+    assert body["result"]["outcome"]["optionId"] == "allow"
+
+
+@pytest.mark.asyncio
+async def test_sse_consumer_rejects_unsupported_agent_requests():
+    """Anything other than permission_request gets -32601 so the agent
+    can fall back instead of hanging."""
+    fake_http = MagicMock()
+    req = (
+        'data: {"jsonrpc":"2.0","id":7,'
+        '"method":"fs/read_text_file",'
+        '"params":{"sessionId":"s","path":"/etc/passwd"}}'
+    )
+
+    class _Stream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        def raise_for_status(self):
+            pass
+
+        async def aiter_lines(self):
+            yield req
+
+    fake_http.stream = MagicMock(return_value=_Stream())
+    posts: list[dict] = []
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append({"envelope": json})
+        resp = MagicMock()
+        resp.status_code = 202
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    fake_http.post = AsyncMock(side_effect=fake_post)
+
+    async with AcpClient("http://x:2468", "claude", http_client=fake_http) as c:
+        c.start_stream()
+        import asyncio
+        await asyncio.sleep(0.05)
+
+    responses = [p for p in posts if p["envelope"].get("id") == 7]
+    assert responses
+    body = responses[0]["envelope"]
+    assert "error" in body
+    assert body["error"]["code"] == -32601
+
+
 # --- HTTP-level integration: /v1/agent → call_via_sandbox -------------------
 
 
