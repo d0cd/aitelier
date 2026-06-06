@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aitelier
+      POSTGRES_PASSWORD: aitelier_local
+      POSTGRES_DB: aitelier
+    ports:
+      - "5432:5432"
+    volumes:
+      - aitelier_pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aitelier -d aitelier"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   litellm:
     image: ghcr.io/berriai/litellm:main-latest
     ports:
@@ -23,3 +40,6 @@ services:
   #   env_file: .env
   #   restart: unless-stopped
   #   Uncomment when Sandbox Agent has a published image.
+
+volumes:
+  aitelier_pg_data: {}

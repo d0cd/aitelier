@@ -75,6 +75,10 @@ fi
 # Export so the aitelier service (started later) reads the right URL.
 export SANDBOX_AGENT_BASE_URL="http://127.0.0.1:${SANDBOX_AGENT_PORT}"
 
+# Postgres for durable run state. Override via DATABASE_URL env if you're
+# running Postgres elsewhere.
+export DATABASE_URL="${DATABASE_URL:-postgresql://aitelier:aitelier_local@127.0.0.1:5432/aitelier}"
+
 # ---------------------------------------------------------------------------
 # 1. Extract credentials from CLI credential files
 # ---------------------------------------------------------------------------
@@ -172,6 +176,15 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     cd "$REPO_ROOT/docker"
     # Always run up -d — idempotent, picks up new .env if credentials changed
     docker compose up -d
+
+    echo "  Waiting for Postgres..."
+    for i in {1..30}; do
+        if docker compose exec -T postgres pg_isready -U aitelier -d aitelier >/dev/null 2>&1; then
+            echo "  ✓ Postgres ready"
+            break
+        fi
+        sleep 1
+    done
 
     if ! curl -sf -H "Authorization: Bearer sk-litellm-local" http://localhost:4000/health >/dev/null 2>&1; then
         echo "  Waiting for LiteLLM..."
