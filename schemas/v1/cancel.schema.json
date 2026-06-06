@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/cancel.schema.json",
+  "title": "CancelAck",
+  "description": "Response from POST /v1/runs/{run_id}/cancel.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "cancelled"],
+  "properties": {
+    "run_id":    { "type": "string" },
+    "cancelled": { "type": "boolean", "description": "True when the cancellation signal was delivered" }
+  }
+}

@@ -1,0 +1,14 @@
+# Sandbox provider configuration (TBD)
+# Uncomment and configure when remote sandboxes are needed.
+
+# [local]
+# mode = "subprocess"  # default for short tasks
+
+# [docker]
+# image = "agent-sandbox:latest"
+# credentials = "agent-auth export --format docker"
+
+# [remote.e2b]
+# api_key_env = "E2B_API_KEY"
+# template = "aitelier-sandbox"
+# timeout = 1800

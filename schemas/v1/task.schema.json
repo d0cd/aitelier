@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/task.schema.json",
+  "title": "TaskSpec",
+  "description": "Specification for an aitelier task",
+  "type": "object",
+  "required": ["name", "kind"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Task name or operation identifier"
+    },
+    "kind": {
+      "type": "string",
+      "enum": ["complete", "embed", "agent"],
+      "description": "Operation type: complete (chat), embed (vectors), agent (tool loop)"
+    },
+
+    "model": {
+      "type": "string",
+      "description": "Model name as known to the LiteLLM proxy"
+    },
+    "system_prompt": {
+      "type": "string",
+      "description": "System prompt for the model"
+    },
+    "messages": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["user", "assistant"] },
+          "content": { "type": "string" }
+        }
+      },
+      "description": "Conversation messages (complete/agent)"
+    },
+    "prompt": {
+      "type": "string",
+      "description": "Shorthand — single user message (converted to messages internally)"
+    },
+
+    "temperature": { "type": "number" },
+    "max_tokens": { "type": "integer" },
+    "response_format": {
+      "oneOf": [
+        { "type": "object", "properties": { "type": { "const": "text" } }, "required": ["type"] },
+        { "type": "object", "properties": { "type": { "const": "json_object" } }, "required": ["type"] },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "const": "json_schema" },
+            "schema": { "type": "object" },
+            "strict": { "type": "boolean" }
+          },
+          "required": ["type", "schema"]
+        }
+      ],
+      "description": "Response format constraint"
+    },
+
+    "texts": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Texts to embed (embed kind only)"
+    },
+
+    "mcp_servers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "transport"],
+        "properties": {
+          "name": { "type": "string" },
+          "transport": { "type": "string", "enum": ["http", "stdio"] },
+          "url": { "type": "string" },
+          "command": { "type": "string" },
+          "args": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "description": "MCP servers the agent should connect to"
+    },
+    "tool_allowlist": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Filter tools shown to model (server.tool format)"
+    },
+    "max_turns": {
+      "type": "integer",
+      "description": "Max model-tool round trips (agent only, default 25)"
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Directory the agent should operate on"
+    },
+    "workspace_mode": {
+      "type": "string",
+      "enum": ["copy", "in_place"],
+      "default": "copy"
+    },
+
+    "preferred_providers": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered list of preferred providers (for fan-out)"
+    },
+    "timeout": {
+      "type": "number",
+      "description": "Timeout in seconds"
+    },
+    "trace_tag": {
+      "type": "string",
+      "description": "Tag for finding this run in the trace store"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}

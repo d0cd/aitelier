@@ -1,0 +1,11 @@
+{
+  "description": "Health check returns status and metadata",
+  "request": {
+    "method": "GET",
+    "path": "/v1/health"
+  },
+  "expected_response": {
+    "required_fields": ["status", "version", "langfuse_connected", "timestamp"],
+    "status": "ok"
+  }
+}

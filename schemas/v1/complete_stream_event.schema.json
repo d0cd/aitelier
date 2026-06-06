@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/complete_stream_event.schema.json",
+  "title": "CompleteStreamEvent",
+  "description": "Event emitted by POST /v1/complete/stream (SSE). The SSE `event:` line carries one of complete.delta / complete.done / complete.error; the `data:` payload conforms to one of the variants below, distinguished by the `type` field.",
+  "oneOf": [
+    {
+      "title": "CompleteStreamDelta",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "content", "correlation_id"],
+      "properties": {
+        "type":           { "type": "string", "const": "delta" },
+        "content":        { "type": "string", "description": "Incremental token/text chunk" },
+        "correlation_id": { "type": "string" }
+      }
+    },
+    {
+      "title": "CompleteStreamDone",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "content", "usage", "finish_reason", "correlation_id"],
+      "properties": {
+        "type":          { "type": "string", "const": "done" },
+        "content":       { "type": "string", "description": "Full aggregated text" },
+        "usage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input_tokens":  { "type": "integer" },
+            "output_tokens": { "type": "integer" },
+            "total_tokens":  { "type": "integer" }
+          }
+        },
+        "finish_reason":  { "type": "string" },
+        "cost_usd":       { "type": ["number", "null"] },
+        "trace_id":       { "type": "string" },
+        "run_id":         { "type": "string" },
+        "correlation_id": { "type": "string" }
+      }
+    },
+    {
+      "title": "CompleteStreamError",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "error_type", "error_msg", "correlation_id"],
+      "properties": {
+        "type":           { "type": "string", "const": "error" },
+        "error_type":     { "type": "string" },
+        "error_msg":      { "type": "string" },
+        "correlation_id": { "type": "string" }
+      }
+    }
+  ]
+}

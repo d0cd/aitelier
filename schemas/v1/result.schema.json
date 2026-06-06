@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/result.schema.json",
+  "title": "Result",
+  "description": "Result of an aitelier operation",
+  "type": "object",
+  "required": ["kind", "provider", "status", "duration_s", "run_id"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "enum": ["complete", "embed", "agent"]
+    },
+    "provider": {
+      "type": "string",
+      "description": "Provider/model identifier"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["ok", "error"]
+    },
+    "duration_s": {
+      "type": "number"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "Trace ID for querying the trace store"
+    },
+
+    "content": {
+      "type": ["string", "null"],
+      "description": "Text output (complete, agent)"
+    },
+    "parsed": {
+      "description": "Parsed JSON when response_format was json_schema"
+    },
+    "usage": {
+      "type": "object",
+      "properties": {
+        "input_tokens": { "type": "integer" },
+        "output_tokens": { "type": "integer" },
+        "total_tokens": { "type": "integer" }
+      }
+    },
+    "finish_reason": {
+      "type": "string",
+      "enum": ["stop", "length", "content_filter", "tool_use", "completed", "max_turns", "timeout", "error"]
+    },
+    "cost_usd": {
+      "type": ["number", "null"]
+    },
+
+    "embeddings": {
+      "type": ["array", "null"],
+      "items": { "type": "array", "items": { "type": "number" } },
+      "description": "Embedding vectors (embed kind only)"
+    },
+    "dimensions": {
+      "type": ["integer", "null"],
+      "description": "Embedding dimensions"
+    },
+
+    "tool_calls": {
+      "type": ["array", "null"],
+      "items": {
+        "type": "object",
+        "properties": {
+          "server": { "type": "string" },
+          "tool": { "type": "string" },
+          "input": {},
+          "output": {},
+          "elapsed_ms": { "type": "number" }
+        }
+      },
+      "description": "Tool calls made during agent run"
+    },
+    "session_id": {
+      "type": ["string", "null"]
+    },
+    "files_changed": {
+      "type": ["array", "null"],
+      "items": { "type": "string" }
+    },
+
+    "error_type": {
+      "type": ["string", "null"]
+    },
+    "error_msg": {
+      "type": ["string", "null"]
+    }
+  },
+  "additionalProperties": false
+}

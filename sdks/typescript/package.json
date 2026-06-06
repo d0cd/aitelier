@@ -1,0 +1,15 @@
+{
+  "name": "aitelier",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for the aitelier service",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "clean": "rm -rf dist"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}

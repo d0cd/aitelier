@@ -1,0 +1,26 @@
+[project]
+name = "aitelier-workspace"
+version = "0.1.0"
+description = "aitelier monorepo workspace"
+requires-python = ">=3.11"
+
+[tool.uv.workspace]
+members = ["core", "sdks/python"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["core/tests", "sdks/python/tests", "tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "datamodel-code-generator>=0.25",
+]

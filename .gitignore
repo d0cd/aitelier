@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+*.egg
+
+# Node
+node_modules/
+.pnpm-store/
+
+# aitelier
+runs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+docker/.env
+!*.example
+
+# Generated (tracked separately)
+# sdks/python/src/aitelier_client/_generated/
+# sdks/typescript/src/_generated/

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/active_runs.schema.json",
+  "title": "ActiveRuns",
+  "description": "Response from GET /v1/runs/active.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["active"],
+  "properties": {
+    "active": {
+      "type": "array",
+      "description": "Run IDs currently in-flight in this server process",
+      "items": { "type": "string" }
+    }
+  }
+}

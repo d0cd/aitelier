@@ -1,0 +1,23 @@
+[project]
+name = "aitelier-client"
+version = "0.1.0"
+description = "Python SDK for the aitelier service"
+requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.27.0",
+    "httpx-sse>=0.4.0",
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/aitelier_client"]

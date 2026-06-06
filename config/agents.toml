@@ -1,0 +1,18 @@
+# agent-auth configuration
+# See agent-auth docs for full options.
+
+[providers.anthropic]
+auth_method = "oauth"     # "oauth" for Max plan, "api_key" for direct
+# api_key via ANTHROPIC_API_KEY env var
+
+[providers.openai]
+auth_method = "api_key"
+# api_key via OPENAI_API_KEY env var
+
+[agents.claude-code]
+command = "claude"
+args = ["--print", "--dangerously-skip-permissions"]
+
+[agents.codex]
+command = "codex"
+args = ["--quiet", "--approval-mode", "full-auto"]

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/discovery.schema.json",
+  "title": "Discovery",
+  "description": "Capability + endpoint inventory + live dependency probes returned by GET /v1/discovery.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "service", "version", "api_version", "timestamp",
+    "endpoints", "capabilities", "dependencies", "schemas", "known_limitations"
+  ],
+  "properties": {
+    "service": { "type": "string", "const": "aitelier" },
+    "version": { "type": "string", "description": "Semantic version of the aitelier core" },
+    "api_version": { "type": "string", "description": "Major API version (e.g. v1)" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "endpoints": {
+      "type": "array",
+      "description": "HTTP endpoint inventory, derived from the live FastAPI routes",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["method", "path"],
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"]
+          },
+          "path": { "type": "string" }
+        }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Each capability is true iff its dependencies were reachable at probe time",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["available"],
+        "properties": {
+          "available": { "type": "boolean" },
+          "reason":    { "type": "string", "description": "Set when available is false" }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "properties": {
+        "litellm": {
+          "type": "object",
+          "required": ["reachable", "base_url"],
+          "properties": {
+            "reachable": { "type": "boolean" },
+            "base_url":  { "type": "string" },
+            "models":    { "type": "array", "items": { "type": "string" } },
+            "reason":    { "type": "string" }
+          }
+        },
+        "sandbox_agent": {
+          "type": "object",
+          "required": ["reachable", "base_url"],
+          "properties": {
+            "reachable": { "type": "boolean" },
+            "base_url":  { "type": "string" },
+            "agents":    { "type": "array", "items": { "type": "string" } },
+            "reason":    { "type": "string" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "type": "object",
+      "description": "Map of schema name → fetch URL",
+      "additionalProperties": { "type": "string" }
+    },
+    "known_limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    }
+  }
+}
