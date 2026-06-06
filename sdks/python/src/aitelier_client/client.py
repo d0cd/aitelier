@@ -31,20 +31,31 @@ class Aitelier:
         timeout: float = 600,
         *,
         default_correlation_id: str | None = None,
+        api_key: str | None = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._client: httpx.AsyncClient | None = None
         self._default_cid = default_correlation_id
+        self._api_key = api_key
 
     def _cid_header(self, correlation_id: str | None) -> dict[str, str]:
+        """Per-request override for correlation_id. Auth header is set once
+        on the underlying client so every request carries it."""
         cid = correlation_id or self._default_cid
         return {"X-Correlation-Id": cid} if cid else {}
+
+    def _default_headers(self) -> dict[str, str]:
+        h: dict[str, str] = {}
+        if self._api_key:
+            h["Authorization"] = f"Bearer {self._api_key}"
+        return h
 
     async def __aenter__(self) -> Aitelier:
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(self._timeout, connect=10),
+            headers=self._default_headers(),
         )
         return self
 
@@ -58,6 +69,7 @@ class Aitelier:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=httpx.Timeout(self._timeout, connect=10),
+                headers=self._default_headers(),
             )
         return self._client
 
@@ -288,6 +300,27 @@ class Aitelier:
     async def health(self) -> dict:
         client = self._ensure_client()
         resp = await client.get("/v1/health")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def aggregate_traces(
+        self,
+        *,
+        group_by: str = "trace_tag",
+        since: str | None = None,
+        until: str | None = None,
+        trace_tag: str | None = None,
+    ) -> dict:
+        """Roll up trace stats by trace_tag / kind / model / status / error_type / day."""
+        client = self._ensure_client()
+        params: dict[str, Any] = {"group_by": group_by}
+        if since:
+            params["since"] = since
+        if until:
+            params["until"] = until
+        if trace_tag:
+            params["trace_tag"] = trace_tag
+        resp = await client.get("/v1/traces/aggregates", params=params)
         resp.raise_for_status()
         return resp.json()
 

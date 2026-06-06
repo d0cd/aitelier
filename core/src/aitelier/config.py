@@ -29,6 +29,9 @@ class SandboxAgentConfig:
 class ServiceConfig:
     host: str = "127.0.0.1"
     port: int = 7777
+    api_key: str | None = None
+    """If set, every /v1/* endpoint (except /v1/health) requires
+    Authorization: Bearer <api_key>. Unset = localhost-trust mode."""
 
 
 @dataclass
@@ -75,6 +78,7 @@ def load_config(path: Path | None = None) -> Config:
         service=ServiceConfig(
             host=raw.get("service", {}).get("host", ServiceConfig.host),
             port=raw.get("service", {}).get("port", ServiceConfig.port),
+            api_key=raw.get("service", {}).get("api_key", ServiceConfig.api_key),
         ),
         runs_dir=raw.get("runs_dir", "runs"),
     )
@@ -94,6 +98,8 @@ def load_config(path: Path | None = None) -> Config:
         cfg.service.port = int(v)
     if v := os.environ.get("AITELIER_RUNS_DIR"):
         cfg.runs_dir = v
+    if v := os.environ.get("AITELIER_API_KEY"):
+        cfg.service.api_key = v
 
     return cfg
 

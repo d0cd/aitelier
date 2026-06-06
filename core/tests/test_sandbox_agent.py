@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aitelier.providers.sandbox_agent import (
@@ -52,6 +52,38 @@ async def test_call_raises_on_jsonrpc_error():
             await c.call("nonexistent", {}, first=True)
 
     assert exc_info.value.code == -32601
+
+
+@pytest.mark.asyncio
+async def test_client_threads_per_request_timeout():
+    """AcpClient should construct its httpx client with the requested timeout,
+    not the old hardcoded 60s — real agentic runs take minutes."""
+    import httpx as _httpx
+    captured = {}
+
+    real_init = _httpx.AsyncClient.__init__
+
+    def spying_init(self, *args, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return real_init(self, *args, **kwargs)
+
+    with patch.object(_httpx.AsyncClient, "__init__", spying_init):
+        async with AcpClient("http://x:2468", "claude-code", timeout=300.0):
+            pass
+
+    t = captured["timeout"]
+    # httpx.Timeout exposes .read for the read-timeout component
+    assert t.read == 300.0 or t == 300.0
+
+
+def test_error_result_includes_url_and_elapsed():
+    from aitelier.providers.sandbox_agent import _error_result
+    r = _error_result("claude", "r1", Exception(""), 60.5,
+                       base_url="http://localhost:2468")
+    assert "url=http://localhost:2468" in r["error_msg"]
+    assert "elapsed=60.5s" in r["error_msg"]
+    # Even when str(exc) is empty, error_msg is non-empty
+    assert r["error_msg"]
 
 
 @pytest.mark.asyncio

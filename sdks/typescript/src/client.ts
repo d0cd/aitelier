@@ -89,6 +89,8 @@ export interface AtelierOptions {
   timeout?: number;
   /** Optional default X-Correlation-Id sent with every request. */
   defaultCorrelationId?: string;
+  /** API key for hosted-mode aitelier (sent as Authorization: Bearer …). */
+  apiKey?: string;
 }
 
 /** Per-call request options (transport-level, not schema). */
@@ -101,6 +103,7 @@ export class Aitelier {
   private baseUrl: string;
   private timeout: number;
   private defaultCorrelationId: string | undefined;
+  private apiKey: string | undefined;
 
   constructor(options: AtelierOptions = {}) {
     this.baseUrl = (options.baseUrl ?? "http://localhost:7777").replace(
@@ -109,11 +112,20 @@ export class Aitelier {
     );
     this.timeout = options.timeout ?? 600_000;
     this.defaultCorrelationId = options.defaultCorrelationId;
+    this.apiKey = options.apiKey;
   }
 
   private cidHeader(correlationId: string | undefined): Record<string, string> {
     const cid = correlationId ?? this.defaultCorrelationId;
-    return cid ? { "X-Correlation-Id": cid } : {};
+    const headers: Record<string, string> = {};
+    if (cid) headers["X-Correlation-Id"] = cid;
+    if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
+    return headers;
+  }
+
+  /** Auth header for endpoints that don't go through cidHeader (GET methods). */
+  private authHeader(): Record<string, string> {
+    return this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {};
   }
 
   // --- Primitives (deepread contract) ---
@@ -248,6 +260,7 @@ export class Aitelier {
 
     const url = `${this.baseUrl}/v1/traces${params.toString() ? "?" + params : ""}`;
     const resp = await fetch(url, {
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`recentTraces failed: ${resp.status}`);
@@ -331,6 +344,7 @@ export class Aitelier {
 
   async getRun(runId: string): Promise<Record<string, unknown>> {
     const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}`, {
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`getRun failed: ${resp.status}`);
@@ -350,10 +364,31 @@ export class Aitelier {
     };
   }
 
+  async aggregateTraces(opts: {
+    groupBy?: "trace_tag" | "kind" | "model" | "status" | "error_type" | "day";
+    since?: string;
+    until?: string;
+    traceTag?: string;
+  } = {}): Promise<Record<string, unknown>> {
+    const params = new URLSearchParams();
+    if (opts.groupBy) params.set("group_by", opts.groupBy);
+    if (opts.since) params.set("since", opts.since);
+    if (opts.until) params.set("until", opts.until);
+    if (opts.traceTag) params.set("trace_tag", opts.traceTag);
+    const url = `${this.baseUrl}/v1/traces/aggregates${params.toString() ? "?" + params : ""}`;
+    const resp = await fetch(url, {
+      headers: this.authHeader(),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    if (!resp.ok) throw new Error(`aggregateTraces failed: ${resp.status}`);
+    return resp.json();
+  }
+
   // --- Cancellation ---
 
   async listActiveRuns(): Promise<ActiveRuns> {
     const resp = await fetch(`${this.baseUrl}/v1/runs/active`, {
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`listActiveRuns failed: ${resp.status}`);
@@ -364,6 +399,7 @@ export class Aitelier {
   async cancelRun(runId: string): Promise<CancelAck> {
     const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/cancel`, {
       method: "POST",
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status}`);
@@ -454,6 +490,7 @@ export class Aitelier {
 
   async discovery(): Promise<Discovery> {
     const resp = await fetch(`${this.baseUrl}/v1/discovery`, {
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`discovery failed: ${resp.status}`);
@@ -488,6 +525,7 @@ export class Aitelier {
 
   async getSchema(name: string): Promise<Record<string, unknown>> {
     const resp = await fetch(`${this.baseUrl}/v1/schemas/${name}`, {
+      headers: this.authHeader(),
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`getSchema failed: ${resp.status}`);

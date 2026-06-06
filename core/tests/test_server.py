@@ -25,6 +25,69 @@ def _clear_discovery_cache():
     _discovery_cache["at"] = 0.0
 
 
+# --- Auth middleware (hosted-mode) ---
+
+
+def test_auth_disabled_by_default(client):
+    """When service.api_key is unset, /v1/health and others are public."""
+    resp = client.get("/v1/health")
+    assert resp.status_code == 200
+
+
+def test_auth_health_always_public(client):
+    """Even with api_key set, /v1/health is exempt for liveness probes."""
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        resp = client.get("/v1/health")
+        assert resp.status_code == 200
+    finally:
+        cfg.service.api_key = None
+
+
+def test_auth_blocks_without_bearer(client):
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        resp = client.get("/v1/discovery")
+        assert resp.status_code == 401
+    finally:
+        cfg.service.api_key = None
+
+
+def test_auth_allows_correct_bearer(client):
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        with (
+            patch("aitelier.server._probe_litellm", new_callable=AsyncMock,
+                  return_value=_ok_litellm()),
+            patch("aitelier.server._probe_sandbox_agent", new_callable=AsyncMock,
+                  return_value=_ok_sandbox()),
+            patch("aitelier.server._probe_traces", return_value={"available": True}),
+        ):
+            resp = client.get("/v1/discovery",
+                              headers={"Authorization": "Bearer secret-key"})
+        assert resp.status_code == 200
+    finally:
+        cfg.service.api_key = None
+
+
+def test_auth_rejects_wrong_bearer(client):
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        resp = client.get("/v1/discovery",
+                          headers={"Authorization": "Bearer wrong-key"})
+        assert resp.status_code == 401
+    finally:
+        cfg.service.api_key = None
+
+
 def test_health(client):
     resp = client.get("/v1/health")
     assert resp.status_code == 200
@@ -533,6 +596,81 @@ def test_cancel_running_task(client):
 def test_cancel_path_traversal_rejected(client):
     resp = client.post("/v1/runs/..%2F..%2Fetc/cancel")
     assert resp.status_code in (400, 404)
+
+
+# --- /v1/agent async mode ---
+
+
+def test_agent_async_returns_run_id_immediately(client):
+    """mode=async returns {run_id, status:'accepted'} without blocking."""
+    async def slow_call(name, prompt, **kwargs):
+        import asyncio
+        await asyncio.sleep(0.05)
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.05, "run_id": kwargs.get("run_id", ""),
+            "trace_id": kwargs.get("run_id", ""),
+            "content": "done", "parsed": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    with (
+        patch("aitelier.runner.call_agent", side_effect=slow_call),
+        patch("aitelier.runner.record_trace"),
+    ):
+        resp = client.post("/v1/agent", json={
+            "model": "claude",
+            "initial_message": "hi",
+            "mode": "async",
+        })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "accepted"
+    assert data["run_id"]
+    assert data["webhook_url"] is None
+
+
+# --- /v1/schedules ---
+
+
+def test_create_and_list_schedule(client):
+    import aitelier.schedules as sch
+    sch._reset_for_tests()
+    with patch("aitelier.schedules._registry_path",
+               return_value=__import__("pathlib").Path("/tmp/aitelier-test-schedules.json")):
+        try:
+            resp = client.post("/v1/schedules", json={
+                "name": "audit-daily",
+                "task": {"name": "audit", "kind": "agent", "model": "claude"},
+                "interval_seconds": 86400,
+            })
+            assert resp.status_code == 200
+            sid = resp.json()["id"]
+
+            resp = client.get("/v1/schedules")
+            ids = [s["id"] for s in resp.json()]
+            assert sid in ids
+
+            resp = client.get(f"/v1/schedules/{sid}")
+            assert resp.status_code == 200
+            assert resp.json()["name"] == "audit-daily"
+
+            resp = client.delete(f"/v1/schedules/{sid}")
+            assert resp.status_code == 200
+
+            resp = client.get(f"/v1/schedules/{sid}")
+            assert resp.status_code == 404
+        finally:
+            sch._reset_for_tests()
+
+
+def test_create_schedule_rejects_invalid(client):
+    """Missing task field → 400."""
+    resp = client.post("/v1/schedules", json={"interval_seconds": 60})
+    # Pydantic will 422 for missing required field
+    assert resp.status_code in (400, 422)
 
 
 # --- /v1/agent/stream ---

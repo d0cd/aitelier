@@ -66,7 +66,11 @@ def record_trace(
     trace_tag: str | None = None,
     metadata: dict | None = None,
 ) -> None:
-    """Record a trace from a result dict."""
+    """Record a trace from a result dict.
+
+    Tool calls (when present in the result) are merged into the metadata JSON
+    so post-hoc analysis can answer "what did the agent actually do?"
+    """
     conn = _connect()
     try:
         usage = result.get("usage") or {}
@@ -75,6 +79,10 @@ def record_trace(
             hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
             if system_prompt else None
         )
+
+        merged_metadata = dict(metadata or {})
+        if tool_calls:
+            merged_metadata["tool_calls"] = tool_calls
 
         conn.execute("""
             INSERT OR REPLACE INTO traces
@@ -100,7 +108,7 @@ def record_trace(
             result.get("status"),
             result.get("error_type"),
             result.get("error_msg"),
-            json.dumps(metadata) if metadata else None,
+            json.dumps(merged_metadata) if merged_metadata else None,
         ))
         conn.commit()
     finally:
@@ -147,6 +155,88 @@ def get_trace(trace_id: str) -> dict | None:
             "SELECT * FROM traces WHERE trace_id = ?", (trace_id,)
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+_GROUPBY_COLUMNS = {
+    "trace_tag":   "COALESCE(trace_tag, '<none>')",
+    "kind":        "COALESCE(kind, '<none>')",
+    "model":       "COALESCE(model, '<none>')",
+    "status":      "COALESCE(status, '<none>')",
+    "error_type":  "COALESCE(error_type, '<none>')",
+    # SQLite stores ISO-8601 timestamps; substr(0..10) is the YYYY-MM-DD date.
+    "day":         "substr(started_at, 1, 10)",
+}
+
+
+def aggregate_traces(
+    *,
+    group_by: str = "trace_tag",
+    since: str | None = None,
+    until: str | None = None,
+    trace_tag: str | None = None,
+) -> dict:
+    """Roll up trace stats by a column (trace_tag/kind/model/status/error_type/day).
+
+    Returns {"groups": [{key, count, total_tokens, cost_usd, error_count}, ...],
+             "total": {...}}.
+    """
+    if group_by not in _GROUPBY_COLUMNS:
+        raise ValueError(
+            f"group_by must be one of: {', '.join(sorted(_GROUPBY_COLUMNS))}"
+        )
+    expr = _GROUPBY_COLUMNS[group_by]
+
+    where: list[str] = []
+    params: list = []
+    if since:
+        where.append("started_at >= ?")
+        params.append(since)
+    if until:
+        where.append("started_at <= ?")
+        params.append(until)
+    if trace_tag:
+        where.append("trace_tag = ?")
+        params.append(trace_tag)
+    where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            f"""
+            SELECT
+              {expr} AS key,
+              COUNT(*) AS count,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+              SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM traces{where_clause}
+            GROUP BY key
+            ORDER BY count DESC
+            """,
+            params,
+        ).fetchall()
+
+        total = conn.execute(
+            f"""
+            SELECT
+              COUNT(*) AS count,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+              SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error_count
+            FROM traces{where_clause}
+            """,
+            params,
+        ).fetchone()
+
+        return {
+            "group_by": group_by,
+            "groups": [dict(r) for r in rows],
+            "total": dict(total) if total else {
+                "count": 0, "total_tokens": 0, "cost_usd": 0.0, "error_count": 0,
+            },
+        }
     finally:
         conn.close()
 

@@ -43,7 +43,7 @@ make test                 # runs all tests (unit + smoke)
   `scripts/start.sh` installs the Rust binary on first run
 
 Available models (via LiteLLM): `local`, `claude-sonnet`, `claude-haiku`, `nomic-embed-text`
-Available agent backends (via Sandbox Agent): `claude-code`, `codex`, `opencode`, `cursor`, `amp`, `pi`
+Available agent backends (via Sandbox Agent): `claude`, `codex`, `opencode`, `cursor`, `amp`, `pi` (live list at `GET /v1/discovery → dependencies.sandbox_agent.agents`)
 
 ## Configuration
 

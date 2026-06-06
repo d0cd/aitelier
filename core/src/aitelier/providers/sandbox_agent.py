@@ -27,6 +27,7 @@ import httpx
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error
+from aitelier.observability import end_agent_trace, trace_agent_call
 
 # ACP protocol version we advertise on initialize. Sandbox Agent currently
 # tracks Zed's ACP spec; bump when the upstream stabilizes 1.0.
@@ -54,11 +55,14 @@ class AcpClient:
         but kept for completeness when Sandbox Agent moves to async responses)
     """
 
-    def __init__(self, base_url: str, agent: str, *, token: str | None = None,
+    def __init__(self, base_url: str, agent: str, *,
+                 token: str | None = None,
+                 timeout: float = 600.0,
                  http_client: httpx.AsyncClient | None = None):
         self.base_url = base_url.rstrip("/")
         self.agent = agent
         self.token = token
+        self.timeout = timeout
         self.server_id = str(uuid.uuid4())
         self._ids = itertools.count(1)
         self._notifications: asyncio.Queue[dict] = asyncio.Queue()
@@ -80,7 +84,9 @@ class AcpClient:
 
     async def __aenter__(self) -> AcpClient:
         if self._http is None:
-            self._http = httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
+            self._http = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout, connect=10),
+            )
         return self
 
     async def __aexit__(self, *exc):
@@ -206,9 +212,19 @@ async def call_via_sandbox(
     cfg = get_config().sandbox_agent
     start = time.monotonic()
 
+    # Open a Langfuse generation if observability is configured.
+    # No-op when LANGFUSE_PUBLIC_KEY is unset.
+    _trace, _gen = trace_agent_call(
+        task_name=trace_tag or "agent",
+        agent_name=name,
+        prompt=prompt,
+        run_id=run_id,
+    )
+
     try:
-        async with AcpClient(cfg.base_url, name, token=cfg.token) as client:
-            return await asyncio.wait_for(
+        async with AcpClient(cfg.base_url, name, token=cfg.token,
+                             timeout=timeout) as client:
+            result = await asyncio.wait_for(
                 _run_one_turn(
                     client,
                     prompt=prompt,
@@ -222,9 +238,13 @@ async def call_via_sandbox(
                 timeout=timeout,
             )
     except TimeoutError:
-        return _timeout_result(name, run_id, time.monotonic() - start)
+        result = _timeout_result(name, run_id, time.monotonic() - start)
     except Exception as exc:
-        return _error_result(name, run_id, exc, time.monotonic() - start)
+        result = _error_result(name, run_id, exc, time.monotonic() - start,
+                               base_url=cfg.base_url)
+
+    end_agent_trace(_gen, result.get("content") or "", None, run_id)
+    return result
 
 
 async def _run_one_turn(
@@ -334,8 +354,16 @@ async def call_via_sandbox_stream(
     text_chunks: list[str] = []
     tool_calls: list[dict] = []
 
+    _trace, _gen = trace_agent_call(
+        task_name="agent",
+        agent_name=name,
+        prompt=prompt,
+        run_id=run_id,
+    )
+
     try:
-        async with AcpClient(cfg.base_url, name, token=cfg.token) as client:
+        async with AcpClient(cfg.base_url, name, token=cfg.token,
+                             timeout=timeout) as client:
             await client.call("initialize", {
                 "protocolVersion": _ACP_PROTOCOL_VERSION,
                 "clientCapabilities": {
@@ -436,11 +464,14 @@ async def call_via_sandbox_stream(
             if tool_calls:
                 done["tool_calls"] = tool_calls
             done["type"] = "done"
+            end_agent_trace(_gen, done.get("content") or "", None, run_id)
             yield done
 
     except asyncio.CancelledError:
+        end_agent_trace(_gen, "".join(text_chunks), None, run_id)
         raise
     except Exception as exc:
+        end_agent_trace(_gen, str(exc), None, run_id)
         yield {
             "type": "error",
             "error_type": classify_error(exc),
@@ -644,7 +675,21 @@ def _timeout_result(agent: str, run_id: str, elapsed: float) -> dict:
     }
 
 
-def _error_result(agent: str, run_id: str, exc: Exception, elapsed: float) -> dict:
+def _error_result(
+    agent: str, run_id: str, exc: Exception, elapsed: float,
+    *, base_url: str | None = None,
+) -> dict:
+    """Build an error result dict with a descriptive message.
+
+    Some httpx exceptions (notably ReadTimeout) have an empty str(exc).
+    We always include the URL + elapsed time in the message so consumers
+    can tell *what* timed out without digging through logs.
+    """
+    msg = str(exc) or type(exc).__name__
+    parts = [msg]
+    if base_url:
+        parts.append(f"url={base_url}")
+    parts.append(f"elapsed={elapsed:.1f}s")
     return {
         "kind": "agent",
         "provider": agent,
@@ -659,5 +704,5 @@ def _error_result(agent: str, run_id: str, exc: Exception, elapsed: float) -> di
         "tool_calls": [],
         "cost_usd": None,
         "error_type": classify_error(exc),
-        "error_msg": str(exc),
+        "error_msg": " | ".join(parts),
     }

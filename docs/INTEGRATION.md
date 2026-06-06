@@ -31,6 +31,26 @@ Sandbox Agent port can be overridden: `./scripts/start.sh --sandbox-agent-port 3
 or via `SANDBOX_AGENT_PORT` env. If 2468 is taken, a free port is picked dynamically
 and exported as `SANDBOX_AGENT_BASE_URL` for the aitelier service to pick up.
 
+### Remote sandbox-agent (closed-laptop tolerance)
+
+Sandbox Agent can run on a remote host instead of locally — useful when you
+want long agent runs to survive your laptop going to sleep. Point aitelier at
+the remote URL by setting two env vars before `make start`:
+
+```bash
+export SANDBOX_AGENT_BASE_URL="https://your-sandbox-host.example.com"
+export SANDBOX_TOKEN="<your token>"   # from `niteshift auth` / E2B / Daytona / Modal
+make start
+```
+
+`scripts/start.sh` detects a non-local `SANDBOX_AGENT_BASE_URL` and skips the
+local binary install. Health-checks the remote, then aitelier reads the URL
+from its env at boot. Agent runs go remote; LiteLLM + traces stay local.
+
+Tested against the Rust binary running on the same host. Public hosted
+backends (E2B, Daytona, Modal, Vercel Sandboxes) require their respective
+provisioning steps — see Sandbox Agent's docs for installing on each.
+
 Or use SDK mode (import directly, no HTTP service needed):
 
 ```python
@@ -157,7 +177,7 @@ This is the key primitive. Aitelier delegates to an external coding agent
 ```python
 POST http://localhost:7777/v1/agent
 {
-  "model": "claude-code",
+  "model": "claude",
   "system_prompt": "You are a curator agent for a reading list app...",
   "initial_message": "Process today's feeds and produce an inbox.",
   "mcp_servers": [
@@ -187,7 +207,7 @@ POST http://localhost:7777/v1/agent
 # Response
 {
   "kind": "agent",
-  "provider": "claude-code",
+  "provider": "claude",
   "status": "ok",
   "content": "{\"items\": [...], \"summary\": \"...\"}",
   "parsed": {"items": [...], "summary": "..."},
@@ -218,7 +238,7 @@ GET http://localhost:7777/v1/traces?trace_tag=curator-daily-2026-05-07&limit=10
   "trace_id": "2026-05-07T10-00-00_agent_run",
   "started_at": "2026-05-07T10:00:00Z",
   "ended_at": "2026-05-07T10:02:30Z",
-  "model": "claude-code",
+  "model": "claude",
   "kind": "agent",
   "finish_reason": "completed",
   "tool_call_count": 5,
@@ -253,7 +273,7 @@ These are the model names to use (routed by the LiteLLM proxy):
 | `local` | Qwen3 8B via Ollama | Free (local) |
 | `nomic-embed-text` | Nomic embeddings 768d | Free (local) |
 
-For agent calls, use agent names: `claude-code`, `codex`.
+For agent calls, use agent names from `GET /v1/discovery → dependencies.sandbox_agent.agents` (currently: `claude`, `codex`, plus whatever other backends sandbox-agent advertises).
 
 ### Alias stability
 
@@ -276,20 +296,62 @@ env scoping, and event normalization across all backends.
 
 | Name | Notes |
 |---|---|
-| `claude-code` | Anthropic Claude Code via ACP |
+| `claude` | Anthropic Claude Code via ACP |
 | `codex` | OpenAI Codex CLI via ACP |
 | `opencode` | OpenCode via ACP |
 | `cursor` | Cursor's agent via ACP |
 | `amp` | Amp via ACP |
 | `pi` | Pi via ACP |
 
-`GET /v1/discovery` reports which agent backends the local Sandbox Agent actually
-advertises.
+Agent names are exactly what Sandbox Agent advertises — call `GET /v1/discovery`
+to see the live list (`dependencies.sandbox_agent.agents`). Don't assume a
+name; query it.
 
 ## Security model
 
-Agents run isolated by Sandbox Agent (filesystem scope, env scoping, no aitelier-side
-secrets). The aitelier service itself trusts its caller; bind only to `127.0.0.1`.
+Two modes:
+
+**Localhost-trust (default).** aitelier binds to `127.0.0.1`, no auth on any
+endpoint. Anyone who can reach the port can call any endpoint. Fine for a
+laptop-only personal runtime; do not bind to a public interface in this mode.
+
+**Hosted mode** — set `service.api_key` in `aitelier.toml` *or*
+`AITELIER_API_KEY` env. Every `/v1/*` endpoint (except `/v1/health`, kept
+public for liveness probes) requires `Authorization: Bearer <api_key>`.
+SDKs accept `api_key` / `apiKey` in the constructor and send the header
+automatically:
+
+```python
+async with Aitelier(base_url="https://aitelier.your-host.example.com",
+                    api_key="<your-key>") as ai: ...
+```
+
+```typescript
+const ai = new Aitelier({ baseUrl: "https://aitelier.your-host.example.com",
+                          apiKey: "<your-key>" });
+```
+
+Always combine hosted mode with TLS termination (e.g., Caddy/Traefik in
+front of the container) — Bearer over plain HTTP is unsafe.
+
+Agents themselves run isolated by Sandbox Agent: file system scope, env
+scoping, no aitelier-side secrets leak in.
+
+### Container / Dockerfile
+
+`docker/Dockerfile` builds a minimal image running just the FastAPI
+service. Point it at remote LiteLLM and Sandbox Agent via env:
+
+```bash
+docker build -f docker/Dockerfile -t aitelier:latest .
+docker run -p 7777:7777 \
+    -e AITELIER_HOST=0.0.0.0 \
+    -e AITELIER_API_KEY=<your-key> \
+    -e LITELLM_BASE_URL=http://litellm:4000 \
+    -e SANDBOX_AGENT_BASE_URL=http://sandbox-agent:2468 \
+    -v aitelier-runs:/app/runs \
+    aitelier:latest
+```
 
 ## Error handling
 
@@ -395,7 +457,7 @@ For chat-style UIs where the user wants to watch the agent's reasoning + tool
 calls unfold instead of staring at a spinner:
 
 ```python
-async for ev in ai.run_agent_stream(model="claude-code",
+async for ev in ai.run_agent_stream(model="claude",
                                      initial_message="Process today's feeds.",
                                      mcp_servers=[...], tool_allowlist=[...]):
     if ev["type"] == "agent.delta":
@@ -407,7 +469,7 @@ async for ev in ai.run_agent_stream(model="claude-code",
 ```
 
 ```typescript
-for await (const ev of ai.runAgentStream({ model: "claude-code", initialMessage: "...", mcpServers: [...] })) {
+for await (const ev of ai.runAgentStream({ model: "claude", initialMessage: "...", mcpServers: [...] })) {
   if (ev.type === "agent.delta") process.stdout.write(ev.data.content as string);
   // ev.type also covers agent.tool_call / agent.tool_result / agent.done / agent.error
 }

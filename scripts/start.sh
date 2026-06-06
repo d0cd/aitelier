@@ -193,9 +193,30 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
 
     # -----------------------------------------------------------------------
     # Sandbox Agent — Rivet's coding-agent runtime (claude-code, codex, ...)
+    #
+    # Remote mode: if SANDBOX_AGENT_BASE_URL is already set to a non-local URL,
+    # skip the local binary install. Closed-laptop tolerance: aitelier on
+    # your machine, agent runs in the cloud (E2B, Daytona, Modal, etc.).
     # -----------------------------------------------------------------------
     echo ""
-    echo "=== Starting Sandbox Agent ==="
+    echo "=== Sandbox Agent ==="
+
+    REMOTE_SANDBOX_URL="${SANDBOX_AGENT_BASE_URL:-}"
+    if [ -n "$REMOTE_SANDBOX_URL" ] && [[ "$REMOTE_SANDBOX_URL" != *"localhost"* ]] \
+       && [[ "$REMOTE_SANDBOX_URL" != *"127.0.0.1"* ]]; then
+        echo "  Remote: $REMOTE_SANDBOX_URL (skipping local install)"
+        auth_header=()
+        if [ -n "${SANDBOX_TOKEN:-}" ]; then
+            auth_header=("-H" "Authorization: Bearer $SANDBOX_TOKEN")
+        fi
+        if curl -sf "${auth_header[@]}" "$REMOTE_SANDBOX_URL/v1/agents" >/dev/null 2>&1; then
+            echo "  ✓ remote sandbox-agent reachable"
+        else
+            echo "  ✗ remote sandbox-agent unreachable at $REMOTE_SANDBOX_URL"
+            echo "    Check SANDBOX_TOKEN and that the host is up."
+        fi
+    else
+        echo "=== Starting Sandbox Agent (local) ==="
 
     mkdir -p "$REPO_ROOT/runs"
 
@@ -247,6 +268,7 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
             echo "  ✗ sandbox-agent not responding after 20s — check $SANDBOX_AGENT_LOG"
         fi
     fi
+    fi  # end: local-vs-remote sandbox-agent branch
 fi
 
 # ---------------------------------------------------------------------------
@@ -278,5 +300,5 @@ fi
 echo ""
 echo "=== Ready ==="
 echo "  LiteLLM proxy:    http://localhost:4000"
-echo "  Sandbox Agent:    http://localhost:${SANDBOX_AGENT_PORT}"
+echo "  Sandbox Agent:    ${SANDBOX_AGENT_BASE_URL:-http://localhost:${SANDBOX_AGENT_PORT}}"
 echo "  aitelier service: http://localhost:7777"

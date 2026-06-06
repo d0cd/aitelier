@@ -38,6 +38,27 @@ _AITELIER_LOG_FORMAT = (
 # Use %(message)s — getMessage() folds the args in before formatting.
 
 
+class _JsonFormatter(logging.Formatter):
+    """One-line-per-record JSON formatter for AITELIER_LOG_FORMAT=json.
+
+    Aggregator-friendly (Loki, Datadog, etc.). Includes correlation_id from
+    the contextvar that the LogRecord factory stamped onto every record.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json as _json
+        payload = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
+            "level": record.levelname,
+            "correlation_id": getattr(record, "correlation_id", "-"),
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return _json.dumps(payload, default=str)
+
+
 def _install_correlation_logging() -> None:
     """Install a LogRecord factory that stamps every record with the current
     request's correlation_id, then align uvicorn's handler formatters so
@@ -62,23 +83,78 @@ def _install_correlation_logging() -> None:
     root = logging.getLogger()
     if not root.handlers:
         h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter(_AITELIER_LOG_FORMAT))
+        h.setFormatter(_active_formatter())
         root.addHandler(h)
         root.setLevel(logging.INFO)
 
     _retag_uvicorn_handlers()
 
 
+def _active_formatter() -> logging.Formatter:
+    """Pick the formatter once based on AITELIER_LOG_FORMAT.
+
+    `json` → one-line JSON per record (aggregator-friendly).
+    anything else → human-readable with [correlation_id] prefix.
+    """
+    import os
+    if os.environ.get("AITELIER_LOG_FORMAT", "").lower() == "json":
+        return _JsonFormatter()
+    return logging.Formatter(_AITELIER_LOG_FORMAT)
+
+
 def _retag_uvicorn_handlers() -> None:
     """Override the formatters on uvicorn's loggers so access + error lines
     carry the same correlation_id prefix as aitelier's logs."""
+    fmt = _active_formatter()
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(name)
         for h in lg.handlers:
-            h.setFormatter(logging.Formatter(_AITELIER_LOG_FORMAT))
+            h.setFormatter(fmt)
 
 
 _install_correlation_logging()
+
+
+async def _schedule_handler(entry: dict) -> None:
+    """Run one fired schedule. Records trace + posts to webhook if set."""
+    from aitelier.runner import execute as run_execute
+    from aitelier.runner import make_run_id
+
+    task = dict(entry.get("task") or {})
+    run_id = make_run_id(entry.get("name", "scheduled"))
+    started_at = _now_iso()
+    meta = dict(task.get("metadata") or {})
+    meta["schedule_id"] = entry["id"]
+    task["metadata"] = meta
+    try:
+        result = await run_execute(task, run_id=run_id)
+    except Exception as exc:
+        logger.warning("Scheduled run %s failed: %s", run_id, exc)
+        result = {
+            "kind": task.get("kind", "agent"),
+            "provider": task.get("model", ""),
+            "status": "error",
+            "run_id": run_id,
+            "trace_id": run_id,
+            "error_type": type(exc).__name__,
+            "error_msg": str(exc),
+            "finish_reason": "error",
+        }
+    try:
+        record_trace(
+            trace_id=run_id, started_at=started_at, result=result,
+            system_prompt=task.get("system_prompt"),
+            trace_tag=task.get("trace_tag"),
+            metadata={"schedule_id": entry["id"]},
+        )
+    except Exception as exc:
+        logger.warning("Failed to record schedule trace: %s", exc)
+    if entry.get("webhook_url"):
+        await _post_webhook(entry["webhook_url"], {
+            "schedule_id": entry["id"],
+            "run_id": run_id,
+            "result": result,
+        })
 
 
 @asynccontextmanager
@@ -92,6 +168,10 @@ async def lifespan(app: FastAPI):
     deleted = purge_traces(max_age_days=30)
     if deleted:
         logger.info("Purged %d traces older than 30 days", deleted)
+
+    # Start the persistent schedule tick loop
+    from aitelier.schedules import start_tick_loop, stop_tick_loop
+    start_tick_loop(_schedule_handler)
 
     # Health check LiteLLM proxy
     from aitelier.config import get_config
@@ -125,12 +205,42 @@ async def lifespan(app: FastAPI):
         except TimeoutError:
             logger.warning("Some runs did not cleanly cancel within 2s")
 
+    # Stop the schedule tick loop.
+    stop_tick_loop()
+
     # Release the shared HTTP client pool.
     from aitelier.providers.llm import close_shared_client
     await close_shared_client()
 
 
 app = FastAPI(title="aitelier", version="0.1.0", lifespan=lifespan)
+
+
+_AUTH_EXEMPT_PATHS = {"/v1/health"}
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Gate every /v1/* endpoint on Authorization: Bearer <api_key> *if*
+    service.api_key is configured. When unset (default), no auth is enforced
+    — preserves the localhost-trust model.
+
+    /v1/health is always public so liveness probes (k8s, load balancers)
+    can hit it without a token.
+    """
+    from fastapi.responses import JSONResponse
+
+    from aitelier.config import get_config
+
+    if request.url.path not in _AUTH_EXEMPT_PATHS:
+        configured = get_config().service.api_key
+        if configured:
+            auth = request.headers.get("Authorization") or ""
+            if not auth.startswith("Bearer ") or auth[7:] != configured:
+                return JSONResponse(
+                    {"detail": "Unauthorized"}, status_code=401,
+                )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -231,6 +341,8 @@ class RunAgentRequest(BaseModel):
     workspace_mode: str = "copy"
     trace_tag: str | None = None
     metadata: dict[str, Any] | None = None
+    mode: str = "sync"   # "sync" (block + return result) | "async" (return run_id, webhook on done)
+    webhook_url: str | None = None
 
 
 class FanoutRequest(BaseModel):
@@ -242,6 +354,14 @@ class FanoutRequest(BaseModel):
 class AgentPreviewRequest(BaseModel):
     mcp_servers: list[dict] | None = None
     tool_allowlist: list[str] | None = None
+
+
+class ScheduleRequest(BaseModel):
+    name: str = "scheduled"
+    task: dict  # TaskSpec dict; validated downstream by the runner
+    interval_seconds: int | None = None
+    at_iso: str | None = None
+    webhook_url: str | None = None
 
 
 class TracesFilter(BaseModel):
@@ -258,6 +378,18 @@ def _merge_correlation(metadata: dict | None, cid: str) -> dict:
     out = dict(metadata or {})
     out["correlation_id"] = cid
     return out
+
+
+async def _post_webhook(url: str, payload: dict) -> None:
+    """Best-effort POST to a consumer-supplied webhook URL. Never raises."""
+    try:
+        from aitelier.providers.llm import get_shared_client
+        client = await get_shared_client()
+        resp = await client.post(url, json=payload, timeout=10)
+        if resp.status_code >= 400:
+            logger.warning("Webhook %s returned %s", url, resp.status_code)
+    except Exception as exc:
+        logger.warning("Webhook POST to %s failed: %s", url, exc)
 
 
 def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> str | None:
@@ -439,6 +571,35 @@ async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
         "metadata": _merge_correlation(req.metadata, cid),
     }
 
+    # --- Async mode: return run_id immediately, fire webhook on done ---
+    if req.mode == "async":
+        webhook_url = req.webhook_url
+
+        async def _run_and_callback() -> None:
+            run_task = asyncio.create_task(execute(task, run_id=run_id))
+            _active_runs[run_id] = run_task
+            try:
+                result = await run_task
+            except asyncio.CancelledError:
+                if not run_task.cancelled():
+                    run_task.cancel()
+                result = _cancelled_result(run_id, "agent")
+            finally:
+                _active_runs.pop(run_id, None)
+            result["correlation_id"] = cid
+            if webhook_url:
+                await _post_webhook(webhook_url, result)
+
+        asyncio.create_task(_run_and_callback())
+        return {
+            "run_id": run_id,
+            "trace_id": run_id,
+            "status": "accepted",
+            "correlation_id": cid,
+            "webhook_url": webhook_url,
+        }
+
+    # --- Sync mode (default): block until done ---
     run_task = asyncio.create_task(execute(task, run_id=run_id))
     _active_runs[run_id] = run_task
     try:
@@ -623,6 +784,23 @@ async def traces_endpoint(
         status=status,
         limit=limit,
     )
+
+
+@app.get("/v1/traces/aggregates")
+async def traces_aggregates_endpoint(
+    group_by: str = "trace_tag",
+    since: str | None = None,
+    until: str | None = None,
+    trace_tag: str | None = None,
+) -> dict:
+    """Roll up trace stats. `group_by` ∈ {trace_tag, kind, model, status, error_type, day}."""
+    from aitelier.traces import aggregate_traces
+    try:
+        return aggregate_traces(
+            group_by=group_by, since=since, until=until, trace_tag=trace_tag,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
 @app.get("/v1/traces/{trace_id}")
@@ -950,6 +1128,42 @@ async def _probe_sandbox_agent(cfg) -> dict:
 _DISCOVERY_TTL_SECONDS = 5.0
 _discovery_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _discovery_lock = asyncio.Lock()
+
+
+@app.get("/v1/schedules")
+async def list_schedules_endpoint() -> list[dict]:
+    """List persisted schedules."""
+    from aitelier.schedules import list_schedules
+    return list_schedules()
+
+
+@app.post("/v1/schedules")
+async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
+    """Register a recurring or one-shot scheduled task."""
+    from aitelier.schedules import create_schedule
+    try:
+        return create_schedule(req.model_dump(exclude_none=True))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+
+
+@app.get("/v1/schedules/{schedule_id}")
+async def get_schedule_endpoint(schedule_id: str) -> dict:
+    _validate_path_component(schedule_id, "schedule_id")
+    from aitelier.schedules import get_schedule
+    entry = get_schedule(schedule_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
+    return entry
+
+
+@app.delete("/v1/schedules/{schedule_id}")
+async def delete_schedule_endpoint(schedule_id: str) -> dict:
+    _validate_path_component(schedule_id, "schedule_id")
+    from aitelier.schedules import delete_schedule
+    if not delete_schedule(schedule_id):
+        raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
+    return {"id": schedule_id, "deleted": True}
 
 
 @app.get("/v1/discovery")
