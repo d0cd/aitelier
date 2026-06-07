@@ -21,6 +21,16 @@ ENV_FILE="$REPO_ROOT/docker/.env"
 SANDBOX_AGENT_PID_FILE="$REPO_ROOT/runs/.sandbox-agent.pid"
 SANDBOX_AGENT_LOG="$REPO_ROOT/runs/.sandbox-agent.log"
 
+# Detect "ollama" positional arg early so AITELIER_OLLAMA_PROFILE is set
+# before credential extraction (the embedded Python block reads it to
+# pick the OLLAMA_BASE_URL written into docker/.env).
+for _arg in "$@"; do
+    if [ "$_arg" = "ollama" ]; then
+        export AITELIER_OLLAMA_PROFILE=1
+        break
+    fi
+done
+
 # Sandbox Agent port resolution (in order):
 #   1. --sandbox-agent-port <N> CLI flag
 #   2. SANDBOX_AGENT_PORT env var
@@ -147,6 +157,15 @@ else:
 # --- Write .env ---
 lines.append("LITELLM_MASTER_KEY=sk-litellm-local")
 
+# Ollama API base. Default to the host install via host.docker.internal;
+# `make start ollama` (or AITELIER_OLLAMA_PROFILE=1) flips this to the
+# in-compose service.
+import os as _os
+if _os.environ.get("AITELIER_OLLAMA_PROFILE") == "1":
+    lines.append("OLLAMA_BASE_URL=http://ollama:11434")
+else:
+    lines.append("OLLAMA_BASE_URL=http://host.docker.internal:11434")
+
 Path(env_file).write_text("\n".join(lines) + "\n")
 # Restrict permissions — tokens are sensitive
 Path(env_file).chmod(0o600)
@@ -169,13 +188,23 @@ echo "  Written to docker/.env (mode 600)"
 
 MODE="${1:-full}"
 
+# "ollama" positional arg activates the containerized-Ollama profile.
+# Compose only starts services in active profiles, so default `make start`
+# leaves Ollama OFF (use host install).
+COMPOSE_PROFILE_ARGS=()
+if [ "$MODE" = "ollama" ] || [ "${AITELIER_OLLAMA_PROFILE:-}" = "1" ]; then
+    export AITELIER_OLLAMA_PROFILE=1
+    COMPOSE_PROFILE_ARGS+=("--profile" "ollama")
+    MODE="full"  # ollama is a flavor of full, not a separate mode
+fi
+
 if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     echo ""
     echo "=== Starting infrastructure ==="
 
     cd "$REPO_ROOT/docker"
     # Always run up -d — idempotent, picks up new .env if credentials changed
-    docker compose up -d
+    docker compose "${COMPOSE_PROFILE_ARGS[@]}" up -d
 
     echo "  Waiting for Postgres..."
     for i in {1..30}; do

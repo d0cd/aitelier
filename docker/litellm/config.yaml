@@ -2,12 +2,18 @@ model_list:
   - model_name: "local"
     litellm_params:
       model: "ollama/qwen3:8b"
-      api_base: "http://host.docker.internal:11434"
+      # OLLAMA_BASE_URL is injected by docker compose: defaults to the host
+      # install (host.docker.internal:11434) but switches to the in-compose
+      # service (`http://ollama:11434`) when the `ollama` profile is active.
+      api_base: "os.environ/OLLAMA_BASE_URL"
 
   - model_name: "nomic-embed-text"
     litellm_params:
       model: "ollama/nomic-embed-text"
-      api_base: "http://host.docker.internal:11434"
+      # OLLAMA_BASE_URL is injected by docker compose: defaults to the host
+      # install (host.docker.internal:11434) but switches to the in-compose
+      # service (`http://ollama:11434`) when the `ollama` profile is active.
+      api_base: "os.environ/OLLAMA_BASE_URL"
       drop_params: true
 
   - model_name: "claude-sonnet"
@@ -36,7 +42,10 @@ model_list:
   - model_name: "ollama/*"
     litellm_params:
       model: "ollama/*"
-      api_base: "http://host.docker.internal:11434"
+      # OLLAMA_BASE_URL is injected by docker compose: defaults to the host
+      # install (host.docker.internal:11434) but switches to the in-compose
+      # service (`http://ollama:11434`) when the `ollama` profile is active.
+      api_base: "os.environ/OLLAMA_BASE_URL"
 
 general_settings:
   master_key: "os.environ/LITELLM_MASTER_KEY"

@@ -31,6 +31,26 @@ Sandbox Agent port can be overridden: `./scripts/start.sh --sandbox-agent-port 3
 or via `SANDBOX_AGENT_PORT` env. If 2468 is taken, a free port is picked dynamically
 and exported as `SANDBOX_AGENT_BASE_URL` for the aitelier service to pick up.
 
+### Ollama: host install or containerized?
+
+Default `make start` assumes **Ollama on the host** (`brew install ollama`,
+`ollama serve`). LiteLLM reaches it via `host.docker.internal:11434`. This
+is what you want on macOS — Docker Desktop has no GPU/Metal passthrough
+(see Docker's docs), so containerized Ollama on Mac is CPU-only and
+~10× slower.
+
+To run a containerized Ollama instead (Linux + GPU, or reproducibility):
+
+```bash
+make start ollama       # equivalently: AITELIER_OLLAMA_PROFILE=1 make start
+```
+
+This brings up the `ollama` compose profile, sets `OLLAMA_BASE_URL`
+inside the LiteLLM container to `http://ollama:11434`, and stores models
+in the `aitelier_ollama_models` named volume. For NVIDIA passthrough on
+Linux, uncomment the `deploy.resources` block in `docker/docker-compose.yml`
+and install `nvidia-container-toolkit`.
+
 ### Remote sandbox-agent (closed-laptop tolerance)
 
 Sandbox Agent can run on a remote host instead of locally — useful when you
