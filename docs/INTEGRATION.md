@@ -33,23 +33,25 @@ and exported as `SANDBOX_AGENT_BASE_URL` for the aitelier service to pick up.
 
 ### Ollama: host install or containerized?
 
-Default `make start` assumes **Ollama on the host** (`brew install ollama`,
-`ollama serve`). LiteLLM reaches it via `host.docker.internal:11434`. This
-is what you want on macOS — Docker Desktop has no GPU/Metal passthrough
-(see Docker's docs), so containerized Ollama on Mac is CPU-only and
-~10× slower.
+Set the choice in `aitelier.toml` — it's the single source of truth:
 
-To run a containerized Ollama instead (Linux + GPU, or reproducibility):
-
-```bash
-make start ollama       # equivalently: AITELIER_OLLAMA_PROFILE=1 make start
+```toml
+[ollama]
+mode = "host"     # macOS default: brew install ollama, ollama serve
+# mode = "docker" # Linux + NVIDIA, or reproducible containerized
 ```
 
-This brings up the `ollama` compose profile, sets `OLLAMA_BASE_URL`
-inside the LiteLLM container to `http://ollama:11434`, and stores models
-in the `aitelier_ollama_models` named volume. For NVIDIA passthrough on
-Linux, uncomment the `deploy.resources` block in `docker/docker-compose.yml`
-and install `nvidia-container-toolkit`.
+- **host** — LiteLLM reaches host Ollama at `host.docker.internal:11434`.
+  Recommended on macOS. Docker Desktop has no GPU/Metal passthrough, so
+  containerized Ollama on Mac would be CPU-only and ~10× slower.
+- **docker** — brings up the `ollama` compose profile, sets
+  `OLLAMA_BASE_URL=http://ollama:11434` for LiteLLM, stores models in the
+  `aitelier_ollama_models` named volume. For NVIDIA passthrough on Linux,
+  uncomment the `deploy.resources` block in `docker/docker-compose.yml`
+  and install `nvidia-container-toolkit`.
+
+`make start ollama` is still accepted for backwards compat (forces docker
+mode for that run) but settling it in `aitelier.toml` is the cleaner pattern.
 
 ### Remote sandbox-agent (closed-laptop tolerance)
 

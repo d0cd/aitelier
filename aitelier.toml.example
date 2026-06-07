@@ -16,6 +16,13 @@ api_key = "sk-litellm-local"
 base_url = "http://localhost:2468"
 # token = "..."  # optional; defaults to --no-token for local
 
+[ollama]
+# Where Ollama runs. "host" assumes `ollama serve` is running on your machine
+# (recommended on macOS — Docker has no GPU/Metal passthrough). "docker"
+# starts a containerized Ollama via the compose `ollama` profile.
+mode = "host"   # "host" | "docker"
+# base_url = "http://my-ollama:11434"   # optional override; otherwise derived from mode
+
 [service]
 host = "127.0.0.1"
 port = 7777

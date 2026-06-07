@@ -35,10 +35,29 @@ class ServiceConfig:
 
 
 @dataclass
+class OllamaConfig:
+    mode: str = "host"
+    """Where Ollama runs:
+      - "host":   `brew install ollama` / `ollama serve` on the dev machine.
+                  LiteLLM reaches it at host.docker.internal:11434. The
+                  Mac default — needed for Metal/MPS GPU access.
+      - "docker": containerized Ollama as a compose service (profile=ollama).
+                  CPU-only on Mac (no GPU passthrough). Linux+NVIDIA needs
+                  the deploy.resources block uncommented in compose.
+    """
+    base_url: str | None = None
+    """Override the resolved API base. Defaults follow `mode`:
+       host   → http://host.docker.internal:11434
+       docker → http://ollama:11434
+    """
+
+
+@dataclass
 class Config:
     litellm: LiteLLMConfig = field(default_factory=LiteLLMConfig)
     sandbox_agent: SandboxAgentConfig = field(default_factory=SandboxAgentConfig)
     service: ServiceConfig = field(default_factory=ServiceConfig)
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
     runs_dir: str = "runs"
 
 
@@ -79,6 +98,10 @@ def load_config(path: Path | None = None) -> Config:
             host=raw.get("service", {}).get("host", ServiceConfig.host),
             port=raw.get("service", {}).get("port", ServiceConfig.port),
             api_key=raw.get("service", {}).get("api_key", ServiceConfig.api_key),
+        ),
+        ollama=OllamaConfig(
+            mode=raw.get("ollama", {}).get("mode", OllamaConfig.mode),
+            base_url=raw.get("ollama", {}).get("base_url", OllamaConfig.base_url),
         ),
         runs_dir=raw.get("runs_dir", "runs"),
     )

@@ -21,15 +21,35 @@ ENV_FILE="$REPO_ROOT/docker/.env"
 SANDBOX_AGENT_PID_FILE="$REPO_ROOT/runs/.sandbox-agent.pid"
 SANDBOX_AGENT_LOG="$REPO_ROOT/runs/.sandbox-agent.log"
 
-# Detect "ollama" positional arg early so AITELIER_OLLAMA_PROFILE is set
-# before credential extraction (the embedded Python block reads it to
-# pick the OLLAMA_BASE_URL written into docker/.env).
+# Ollama mode: aitelier.toml [ollama] mode = "host" | "docker" is the
+# canonical source. Legacy: `make start ollama` positional arg still
+# forces docker mode for backwards compat.
 for _arg in "$@"; do
     if [ "$_arg" = "ollama" ]; then
         export AITELIER_OLLAMA_PROFILE=1
         break
     fi
 done
+
+# Read aitelier.toml — if it says ollama.mode = "docker", flip the profile.
+# Uses uv-run Python to read TOML (no jq/yq dep).
+if [ -z "${AITELIER_OLLAMA_PROFILE:-}" ]; then
+    OLLAMA_MODE="$(uv run python -c '
+import sys, tomllib
+from pathlib import Path
+for p in [Path("aitelier.toml"), Path.home()/".config"/"aitelier"/"config.toml"]:
+    if p.exists():
+        try:
+            print(tomllib.loads(p.read_text()).get("ollama", {}).get("mode", "host"))
+            sys.exit(0)
+        except Exception:
+            pass
+print("host")
+' 2>/dev/null || echo "host")"
+    if [ "$OLLAMA_MODE" = "docker" ]; then
+        export AITELIER_OLLAMA_PROFILE=1
+    fi
+fi
 
 # Sandbox Agent port resolution (in order):
 #   1. --sandbox-agent-port <N> CLI flag
