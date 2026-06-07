@@ -179,6 +179,7 @@ class Aitelier:
         self,
         model: str,
         *,
+        agent_model: str | None = None,
         system_prompt: str | None = None,
         initial_message: str | None = None,
         examples: list[dict] | None = None,
@@ -197,9 +198,14 @@ class Aitelier:
 
         `examples` is a list of {"user": ..., "assistant": ...} pairs that
         the server folds into the system prompt under an `## Examples` heading.
+
+        `agent_model` overrides the LLM the agent uses internally (e.g.
+        claude-opus-4-7); leave None to use the backend's default.
         """
         client = self._ensure_client()
         body: dict[str, Any] = {"model": model}
+        if agent_model is not None:
+            body["agent_model"] = agent_model
         if system_prompt is not None:
             body["system_prompt"] = system_prompt
         if initial_message is not None:
@@ -348,6 +354,7 @@ class Aitelier:
         self,
         model: str,
         *,
+        agent_model: str | None = None,
         system_prompt: str | None = None,
         initial_message: str | None = None,
         examples: list[dict] | None = None,
@@ -375,6 +382,8 @@ class Aitelier:
 
         client = self._ensure_client()
         body: dict[str, Any] = {"model": model}
+        if agent_model is not None:
+            body["agent_model"] = agent_model
         if system_prompt is not None:
             body["system_prompt"] = system_prompt
         if initial_message is not None:
@@ -426,6 +435,22 @@ class Aitelier:
         if tool_allowlist is not None:
             body["tool_allowlist"] = tool_allowlist
         resp = await client.post("/v1/agent/preview", json=body)
+        resp.raise_for_status()
+        return resp.json()
+
+    # --- Model + agent discovery ---
+
+    async def litellm_models(self) -> list[dict]:
+        """All LiteLLM-known models (aliases + wildcard providers)."""
+        client = self._ensure_client()
+        resp = await client.get("/v1/litellm/models")
+        resp.raise_for_status()
+        return resp.json()
+
+    async def sandbox_agent_info(self, agent: str) -> dict:
+        """Capability info for one Sandbox Agent backend (models, perms, MCP)."""
+        client = self._ensure_client()
+        resp = await client.get(f"/v1/sandbox/agents/{agent}")
         resp.raise_for_status()
         return resp.json()
 

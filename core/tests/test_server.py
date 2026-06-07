@@ -541,6 +541,77 @@ def test_complete_stream_records_trace_at_done(client):
 # --- Cancellation ---
 
 
+# --- Model selection: passthrough + listing ---
+
+
+def test_litellm_models_proxy(client):
+    """GET /v1/litellm/models forwards to LiteLLM's /v1/models."""
+    from unittest.mock import MagicMock
+
+    fake_client = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json = MagicMock(return_value={
+        "data": [
+            {"id": "claude-sonnet"},
+            {"id": "anthropic/claude-opus-4-7"},
+        ],
+    })
+    fake_client.get = AsyncMock(return_value=fake_resp)
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client",
+                side_effect=fake_get_shared):
+        resp = client.get("/v1/litellm/models")
+    assert resp.status_code == 200
+    ids = {m["id"] for m in resp.json()}
+    assert "claude-sonnet" in ids
+    assert "anthropic/claude-opus-4-7" in ids
+
+
+def test_sandbox_agent_info_proxy(client):
+    """GET /v1/sandbox/agents/{agent} forwards to Sandbox Agent."""
+    from unittest.mock import MagicMock
+
+    fake_client = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.json = MagicMock(return_value={
+        "id": "claude", "permissions": True,
+        "models": ["claude-opus-4-7", "claude-sonnet-4-6"],
+    })
+    fake_client.get = AsyncMock(return_value=fake_resp)
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client",
+                side_effect=fake_get_shared):
+        resp = client.get("/v1/sandbox/agents/claude")
+    assert resp.status_code == 200
+    assert "claude-opus-4-7" in resp.json()["models"]
+
+
+def test_sandbox_agent_info_unknown_agent(client):
+    from unittest.mock import MagicMock
+
+    fake_client = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.status_code = 404
+    fake_resp.text = "not found"
+    fake_client.get = AsyncMock(return_value=fake_resp)
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client",
+                side_effect=fake_get_shared):
+        resp = client.get("/v1/sandbox/agents/nonexistent")
+    assert resp.status_code == 404
+
+
 # --- /v1/runs (read API) ---
 
 

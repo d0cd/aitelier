@@ -324,6 +324,12 @@ class EmbedRequest(BaseModel):
 
 class RunAgentRequest(BaseModel):
     model: str
+    """Agent backend name (claude, codex, opencode, ...) — what Sandbox
+    Agent advertises in /v1/agents. NOT the underlying LLM version."""
+    agent_model: str | None = None
+    """Override the LLM the agent uses internally (e.g. claude-opus-4-20250514,
+    gpt-4o-2024-08-06). Sent as session/set_config_option name=model. Best-
+    effort: not all backends accept the same config key."""
     system_prompt: str | None = None
     initial_message: str | None = None
     examples: list[dict] | None = None
@@ -551,6 +557,7 @@ async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
         "name": "agent_run",
         "kind": "agent",
         "model": req.model,
+        "agent_model": req.agent_model,
         "prompt": req.initial_message or "",
         "system_prompt": system_prompt,
         "mcp_servers": req.mcp_servers,
@@ -1322,6 +1329,68 @@ async def delete_schedule_endpoint(schedule_id: str) -> dict:
     if not await delete_schedule(schedule_id):
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
     return {"id": schedule_id, "deleted": True}
+
+
+@app.get("/v1/litellm/models")
+async def list_litellm_models() -> list[dict]:
+    """List every model LiteLLM knows about (aliases + wildcard providers).
+
+    Useful for consumers to discover what they can pass as the `model` field
+    on /v1/complete and /v1/embed. Proxies LiteLLM's /v1/models.
+    """
+    from aitelier.config import get_config
+    from aitelier.providers.llm import get_shared_client
+
+    cfg = get_config().litellm
+    client = await get_shared_client()
+    try:
+        resp = await client.get(
+            f"{cfg.base_url}/v1/models",
+            headers={"Authorization": f"Bearer {cfg.api_key}"},
+            timeout=5,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"LiteLLM unreachable: {type(exc).__name__}: {exc}",
+        ) from None
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    return data.get("data", []) if isinstance(data, dict) else data
+
+
+@app.get("/v1/sandbox/agents/{agent}")
+async def get_sandbox_agent_info(agent: str) -> dict:
+    """Capability info for one Sandbox Agent backend (claude / codex / etc.).
+
+    Includes supported models, permission semantics, MCP support flags, etc.
+    Proxies Sandbox Agent's GET /v1/agents/{agent}.
+    """
+    _validate_path_component(agent, "agent")
+    from aitelier.config import get_config
+    from aitelier.providers.llm import get_shared_client
+
+    cfg = get_config().sandbox_agent
+    client = await get_shared_client()
+    headers: dict[str, str] = {}
+    if cfg.token:
+        headers["Authorization"] = f"Bearer {cfg.token}"
+    try:
+        resp = await client.get(
+            f"{cfg.base_url}/v1/agents/{agent}",
+            headers=headers, timeout=5,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Sandbox Agent unreachable: {type(exc).__name__}: {exc}",
+        ) from None
+    if resp.status_code == 404:
+        raise HTTPException(status_code=404, detail=f"Agent not found: {agent}")
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
 
 
 @app.get("/v1/discovery")

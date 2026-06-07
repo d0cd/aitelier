@@ -223,6 +223,7 @@ export class Aitelier {
   async runAgent(opts: RunAgentOpts, reqOpts?: RequestOpts): Promise<Result> {
     const body = toSnake({
       model: opts.model,
+      agentModel: opts.agentModel,
       systemPrompt: opts.systemPrompt,
       initialMessage: opts.initialMessage,
       examples: opts.examples,
@@ -418,6 +419,7 @@ export class Aitelier {
   ): AsyncIterable<{ type: string; data: Record<string, unknown> }> {
     const body = toSnake({
       model: opts.model,
+      agentModel: opts.agentModel,
       systemPrompt: opts.systemPrompt,
       initialMessage: opts.initialMessage,
       examples: opts.examples,
@@ -483,6 +485,26 @@ export class Aitelier {
       signal: AbortSignal.timeout(this.timeout),
     });
     if (!resp.ok) throw new Error(`agentPreview failed: ${resp.status}`);
+    return resp.json();
+  }
+
+  // --- Model + agent discovery ---
+
+  async litellmModels(): Promise<Array<Record<string, unknown>>> {
+    const resp = await fetch(`${this.baseUrl}/v1/litellm/models`, {
+      headers: this.authHeader(),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    if (!resp.ok) throw new Error(`litellmModels failed: ${resp.status}`);
+    return (await resp.json()) as Array<Record<string, unknown>>;
+  }
+
+  async sandboxAgentInfo(agent: string): Promise<Record<string, unknown>> {
+    const resp = await fetch(`${this.baseUrl}/v1/sandbox/agents/${agent}`, {
+      headers: this.authHeader(),
+      signal: AbortSignal.timeout(this.timeout),
+    });
+    if (!resp.ok) throw new Error(`sandboxAgentInfo failed: ${resp.status}`);
     return resp.json();
   }
 

@@ -70,6 +70,11 @@ POST /v1/runs/{id}/cancel     — cancel an in-flight run
 GET  /v1/health               — cheap liveness probe (status, version, known_limitations)
 GET  /v1/discovery            — capability + endpoint inventory (live dependency probes)
 GET  /v1/schemas/{name}       — fetch a JSON Schema by name (task, result, events)
+GET  /v1/litellm/models       — proxy to LiteLLM /v1/models (lists every routable model)
+GET  /v1/sandbox/agents/{id}  — proxy to Sandbox Agent /v1/agents/{id} (capability info)
+GET  /v1/runs                 — list runs from durable store, with filters
+GET  /v1/runs/{id}/events     — paginated run event timeline
+GET  /v1/runs/{id}/events/stream — SSE: live event feed for one run
 ```
 
 All requests accept `X-Correlation-Id` (generated if absent), echoed in

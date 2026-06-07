@@ -20,6 +20,24 @@ model_list:
       model: "anthropic/claude-haiku-4-5-20251001"
       api_key: "os.environ/ANTHROPIC_API_KEY"
 
+  # --- Passthrough wildcards ---
+  # Lets consumers request arbitrary model strings (e.g.
+  # "anthropic/claude-opus-4-7", "openai/gpt-4o", "ollama/llama3:70b")
+  # without adding a named alias here. Each wildcard pulls the right
+  # provider creds via the matching env var.
+  - model_name: "anthropic/*"
+    litellm_params:
+      model: "anthropic/*"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+  - model_name: "openai/*"
+    litellm_params:
+      model: "openai/*"
+      api_key: "os.environ/OPENAI_API_KEY"
+  - model_name: "ollama/*"
+    litellm_params:
+      model: "ollama/*"
+      api_base: "http://host.docker.internal:11434"
+
 general_settings:
   master_key: "os.environ/LITELLM_MASTER_KEY"
 

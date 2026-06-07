@@ -279,9 +279,10 @@ async def call_via_sandbox(
     workspace_mode: str = "copy",  # noqa: ARG001 — Sandbox Agent owns isolation
     system_prompt: str | None = None,
     mcp_servers: list[dict] | None = None,
-    tool_allowlist: list[str] | None = None,  # noqa: ARG001 — TODO: wire to set_config_option
+    tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
-    max_turns: int | None = None,  # noqa: ARG001 — TODO: wire to set_config_option
+    max_turns: int | None = None,
+    agent_model: str | None = None,
     timeout: int = 600,
     run_dir: Any = None,  # noqa: ARG001 — kept for signature parity
     run_id: str = "",
@@ -321,6 +322,9 @@ async def call_via_sandbox(
                     system_prompt=system_prompt,
                     mcp_servers=mcp_servers,
                     response_format=response_format,
+                    tool_allowlist=tool_allowlist,
+                    max_turns=max_turns,
+                    agent_model=agent_model,
                     run_id=run_id,
                     start=start,
                 ),
@@ -344,6 +348,9 @@ async def _run_one_turn(
     system_prompt: str | None,
     mcp_servers: list[dict] | None,
     response_format: dict | None,
+    tool_allowlist: list[str] | None = None,
+    max_turns: int | None = None,
+    agent_model: str | None = None,
     run_id: str,
     start: float,
 ) -> dict:
@@ -375,17 +382,28 @@ async def _run_one_turn(
     # 3. Start SSE consumer for notifications during the prompt
     client.start_stream()
 
-    # 4. Optional: set system prompt via config option (agent-specific).
-    if system_prompt:
+    # 4. Best-effort config options. Agent backends accept different keys
+    #    (claude-code: model, systemPrompt, allowedTools, maxTurns; codex:
+    #    similar). We try the conventional names — if a backend doesn't
+    #    recognize one, sandbox-agent silently swallows it.
+    async def _set(option: str, value: object) -> None:
         try:
             await client.notify("session/set_config_option", {
                 "sessionId": session_id,
-                "option": "systemPrompt",
-                "value": system_prompt,
+                "option": option,
+                "value": value,
             })
         except Exception:
-            # Best-effort — not all agents support this key.
             pass
+
+    if system_prompt:
+        await _set("systemPrompt", system_prompt)
+    if agent_model:
+        await _set("model", agent_model)
+    if tool_allowlist:
+        await _set("allowedTools", tool_allowlist)
+    if max_turns is not None:
+        await _set("maxTurns", max_turns)
 
     # 5. Run the turn (POST blocks until the agent completes a turn)
     prompt_params = {
@@ -441,7 +459,10 @@ async def call_via_sandbox_stream(
     workspace: str | None = None,
     system_prompt: str | None = None,
     mcp_servers: list[dict] | None = None,
+    tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
+    max_turns: int | None = None,
+    agent_model: str | None = None,
     timeout: int = 600,  # noqa: ARG001 — outer endpoint enforces timeout
     run_id: str = "",
 ):
@@ -501,15 +522,24 @@ async def call_via_sandbox_stream(
 
             client.start_stream()
 
-            if system_prompt:
+            async def _set(option: str, value: object) -> None:
                 try:
                     await client.notify("session/set_config_option", {
                         "sessionId": session_id,
-                        "option": "systemPrompt",
-                        "value": system_prompt,
+                        "option": option,
+                        "value": value,
                     })
                 except Exception:
                     pass
+
+            if system_prompt:
+                await _set("systemPrompt", system_prompt)
+            if agent_model:
+                await _set("model", agent_model)
+            if tool_allowlist:
+                await _set("allowedTools", tool_allowlist)
+            if max_turns is not None:
+                await _set("maxTurns", max_turns)
 
             prompt_params: dict = {
                 "sessionId": session_id,

@@ -275,6 +275,49 @@ These are the model names to use (routed by the LiteLLM proxy):
 
 For agent calls, use agent names from `GET /v1/discovery → dependencies.sandbox_agent.agents` (currently: `claude`, `codex`, plus whatever other backends sandbox-agent advertises).
 
+### Pass-through model strings
+
+Beyond the aliases above, aitelier accepts arbitrary provider-prefixed
+model strings and forwards them to LiteLLM directly:
+
+```python
+await ai.complete(model="anthropic/claude-opus-4-7", messages=[...])
+await ai.complete(model="openai/gpt-4o-2024-08-06", messages=[...])
+await ai.complete(model="ollama/llama3:70b", messages=[...])
+```
+
+LiteLLM resolves the provider from the prefix and uses the matching env
+var for credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.).
+Listed in `docker/litellm/config.yaml` under the `*/*` wildcard entries.
+
+Discover what LiteLLM knows about:
+
+```python
+models = await ai.litellm_models()   # list of {id, ...}
+```
+
+### Agent model selection
+
+For `/v1/agent`, the `model` field selects the **agent backend** (claude,
+codex, opencode, …). To override which LLM the backend uses internally,
+pass `agent_model`:
+
+```python
+await ai.run_agent(
+    model="claude",                      # backend
+    agent_model="claude-opus-4-20250514", # LLM the backend uses
+    initial_message="…",
+)
+```
+
+Aitelier sends this as `session/set_config_option name=model` over ACP.
+Best-effort: if the backend doesn't recognize the key, it falls back to
+its default. Discover what a backend supports:
+
+```python
+info = await ai.sandbox_agent_info("claude")   # models, permissions, MCP flags
+```
+
 ### Alias stability
 
 Model names above are **stable aliases**, not versioned model IDs. The

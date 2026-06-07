@@ -107,6 +107,8 @@ export interface EmbedOpts {
 
 export interface RunAgentOpts {
   model: string;
+  /** Override the LLM the agent uses (e.g. claude-opus-4-7); leave undefined for backend default. */
+  agentModel?: string;
   systemPrompt?: string;
   initialMessage?: string;
   /** Few-shot examples ({user, assistant} pairs); folded into systemPrompt server-side. */

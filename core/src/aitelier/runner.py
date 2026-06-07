@@ -124,6 +124,7 @@ async def _dispatch(
             tool_allowlist=task.get("tool_allowlist"),
             response_format=task.get("response_format"),
             max_turns=task.get("max_turns"),
+            agent_model=task.get("agent_model"),
             timeout=timeout,
             run_dir=run_dir,
             run_id=run_id,
