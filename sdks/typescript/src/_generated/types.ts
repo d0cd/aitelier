@@ -113,6 +113,15 @@ export interface RunAgentOpts {
   initialMessage?: string;
   /** Few-shot examples ({user, assistant} pairs); folded into systemPrompt server-side. */
   examples?: Array<{ user: string; assistant: string }>;
+  /** Pre-flight setup inside the sandbox before the agent runs. */
+  prepare?: {
+    installAgents?: string[];
+    commands?: Array<{ cmd: string; args?: string[]; cwd?: string; env?: Record<string, string> }>;
+    files?: Array<{ path: string; content: string; encoding?: string }>;
+    sidecars?: Array<{ name: string; cmd: string; args?: string[]; env?: Record<string, string> }>;
+  };
+  /** Files to fetch from the sandbox after the agent finishes. */
+  artifacts?: { fetch?: string[] };
   mcpServers?: McpServer[];
   toolAllowlist?: string[];
   responseFormat?:

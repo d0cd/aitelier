@@ -193,6 +193,8 @@ class Aitelier:
         trace_tag: str | None = None,
         metadata: dict | None = None,
         correlation_id: str | None = None,
+        prepare: dict | None = None,
+        artifacts: dict | None = None,
     ) -> Result:
         """Run an agent with MCP tool loop.
 
@@ -201,6 +203,21 @@ class Aitelier:
 
         `agent_model` overrides the LLM the agent uses internally (e.g.
         claude-opus-4-7); leave None to use the backend's default.
+
+        `prepare` runs setup inside the sandbox before the agent starts:
+            {
+              "install_agents": ["claude"],
+              "commands":       [{"cmd": "apt-get", "args": ["install","jq"]}],
+              "files":          [{"path": "/workspace/in.txt", "content": "..."}],
+              "sidecars":       [{"name": "mockapi", "cmd": "python", "args": ["x.py"]}],
+            }
+        A failed install / command / file write aborts the run with
+        finish_reason="prepare_failed". Sidecars are torn down when the
+        agent finishes (even on error).
+
+        `artifacts` fetches files back from the sandbox after the run:
+            {"fetch": ["/workspace/out.json", "/workspace/diff.patch"]}
+        Returned in result.artifacts keyed by path.
         """
         client = self._ensure_client()
         body: dict[str, Any] = {"model": model}
@@ -230,6 +247,10 @@ class Aitelier:
             body["trace_tag"] = trace_tag
         if metadata is not None:
             body["metadata"] = metadata
+        if prepare is not None:
+            body["prepare"] = prepare
+        if artifacts is not None:
+            body["artifacts"] = artifacts
 
         resp = await client.post("/v1/agent", json=body,
                                   headers=self._cid_header(correlation_id))

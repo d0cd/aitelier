@@ -318,6 +318,53 @@ Discover what LiteLLM knows about:
 models = await ai.litellm_models()   # list of {id, ...}
 ```
 
+### Agent workflow — prepare, run, fetch in one call
+
+`/v1/agent` is a consolidated workflow endpoint, not just an agent-run
+trigger. Pass `prepare` to set up the sandbox env before the agent
+starts, `artifacts.fetch` to pull files back after — all in one call:
+
+```python
+result = await ai.run_agent(
+    model="claude",
+    initial_message="Run the test suite and write the failures to /workspace/fail.json",
+    prepare={
+        "install_agents": ["claude"],                      # JIT-install CLI if missing
+        "commands": [                                       # env setup
+            {"cmd": "apt-get", "args": ["install", "-y", "jq"]},
+            {"cmd": "pip",     "args": ["install", "pytest"], "cwd": "/workspace"},
+        ],
+        "files": [                                          # seed inputs
+            {"path": "/workspace/conftest.py", "content": "..."},
+        ],
+        "sidecars": [                                       # long-lived for the run
+            {"name": "mockapi", "cmd": "python", "args": ["/sidecars/mock.py"]},
+        ],
+    },
+    artifacts={"fetch": ["/workspace/fail.json", "/workspace/diff.patch"]},
+)
+
+# result.prepare       — per-step outcomes (install_results, command_results, files, sidecars)
+# result.content       — agent output
+# result.tool_calls    — what the agent invoked
+# result.artifacts     — {path: content} for every requested file
+```
+
+What aitelier orchestrates internally on a single `/v1/agent` call:
+
+1. `install_agents` → sandbox-agent `POST /v1/agents/{a}/install` for each
+2. `commands` → `POST /v1/processes/run`, **first non-zero exit aborts** (finish_reason="prepare_failed", agent never starts)
+3. `files` → `PUT /v1/fs/file`
+4. `sidecars` → `POST /v1/processes`, PIDs tracked
+5. Run the agent via ACP (existing flow)
+6. `artifacts.fetch` → `GET /v1/fs/file` for each
+7. Stop sidecars (always — even if the agent errored)
+
+Consumers never touch sandbox-agent directly. For edge cases not covered
+by this workflow (browser testing, log tailing from a sidecar mid-flight,
+generic sandbox poking), the SA URL is exposed in `GET /v1/discovery →
+dependencies.sandbox_agent.base_url` — connect there with `SANDBOX_TOKEN`.
+
 ### Agent model selection
 
 For `/v1/agent`, the `model` field selects the **agent backend** (claude,

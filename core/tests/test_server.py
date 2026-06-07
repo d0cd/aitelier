@@ -541,6 +541,206 @@ def test_complete_stream_records_trace_at_done(client):
 # --- Cancellation ---
 
 
+# --- Sandbox passthrough endpoints ---
+
+
+def _stub_sa_response(status: int = 200, json_body=None, text: str = ""):
+    from unittest.mock import MagicMock
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = text
+    resp.headers = {"content-type": "application/json"}
+    resp.json = MagicMock(return_value=json_body or {})
+    resp.content = b""
+    return resp
+
+
+def _patch_sa_proxy(status: int = 200, json_body=None):
+    """Stub the shared httpx client used by _sa_proxy."""
+    from unittest.mock import MagicMock
+    fake_client = MagicMock()
+    fake_client.request = AsyncMock(
+        return_value=_stub_sa_response(status=status, json_body=json_body),
+    )
+
+    async def fake_get_shared():
+        return fake_client
+
+    return patch("aitelier.providers.llm.get_shared_client",
+                 side_effect=fake_get_shared), fake_client
+
+
+# --- /v1/agent prepare + artifacts orchestration ---
+
+
+def _patch_sa_request(routes):
+    """Stub the shared httpx client. `routes` maps a substring of the URL
+    (or method:URL_substring) to a (status, json_body) tuple. Default 200/{}."""
+    from unittest.mock import MagicMock
+
+    async def fake_request(method, url, **kwargs):
+        for key, (status, body) in routes.items():
+            if ":" in key:
+                k_method, k_path = key.split(":", 1)
+                if method != k_method:
+                    continue
+                if k_path in url:
+                    return _stub_sa_response(status=status, json_body=body)
+            elif key in url:
+                return _stub_sa_response(status=status, json_body=body)
+        return _stub_sa_response(status=200, json_body={})
+
+    fake_client = MagicMock()
+    fake_client.request = AsyncMock(side_effect=fake_request)
+
+    async def fake_get_shared():
+        return fake_client
+
+    return patch("aitelier.providers.llm.get_shared_client",
+                 side_effect=fake_get_shared), fake_client
+
+
+def test_agent_prepare_runs_setup_commands_and_files(client):
+    """prepare.commands + prepare.files run before agent; both succeed."""
+    async def fake_call(name, prompt, **kwargs):
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.1, "run_id": kwargs.get("run_id", ""),
+            "trace_id": kwargs.get("run_id", ""),
+            "content": "ok", "parsed": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    p, fake_client = _patch_sa_request({
+        "/v1/processes/run": (200, {"exit_code": 0, "stdout": "ok"}),
+        "/v1/fs/file":       (200, {"ok": True}),
+    })
+    with p, patch("aitelier.runner.call_agent", side_effect=fake_call):
+        resp = client.post("/v1/agent", json={
+            "model": "claude",
+            "initial_message": "hi",
+            "prepare": {
+                "commands": [{"cmd": "apt-get", "args": ["install", "jq"]}],
+                "files": [{"path": "/workspace/in.txt", "content": "hello"}],
+            },
+        })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    # prepare results surfaced
+    assert "prepare" in data
+    cmds = data["prepare"]["command_results"]
+    assert cmds and cmds[0]["exit_code"] == 0
+    files = data["prepare"]["file_results"]
+    assert files and files[0]["ok"] is True
+    # SA was hit for the right phases
+    methods_and_paths = [(c.args[0], c.args[1]) for c in fake_client.request.call_args_list]
+    assert any(m == "POST" and "/v1/processes/run" in p for m, p in methods_and_paths)
+    assert any(m == "PUT" and "/v1/fs/file" in p for m, p in methods_and_paths)
+
+
+def test_agent_prepare_command_failure_short_circuits_agent(client):
+    """A non-zero exit in prepare.commands aborts the workflow — agent never runs."""
+    called_agent = False
+
+    async def fake_call(name, prompt, **kwargs):
+        nonlocal called_agent
+        called_agent = True
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.0, "run_id": "", "trace_id": "",
+        }
+
+    p, _ = _patch_sa_request({
+        "/v1/processes/run": (200, {"exit_code": 1, "stderr": "no jq"}),
+    })
+    with p, patch("aitelier.runner.call_agent", side_effect=fake_call):
+        resp = client.post("/v1/agent", json={
+            "model": "claude",
+            "initial_message": "hi",
+            "prepare": {
+                "commands": [{"cmd": "false", "args": []}],
+            },
+        })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "error"
+    assert data["finish_reason"] == "prepare_failed"
+    assert data["error_type"] == "PrepareFailed"
+    assert called_agent is False
+
+
+def test_agent_artifacts_fetched_after_run(client):
+    async def fake_call(name, prompt, **kwargs):
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.1, "run_id": "", "trace_id": "",
+            "content": "ok", "parsed": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    p, fake_client = _patch_sa_request({
+        "GET:/v1/fs/file": (200, {"content": "{\"hello\": \"world\"}"}),
+    })
+    with p, patch("aitelier.runner.call_agent", side_effect=fake_call):
+        resp = client.post("/v1/agent", json={
+            "model": "claude",
+            "initial_message": "hi",
+            "artifacts": {"fetch": ["/workspace/out.json"]},
+        })
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert "artifacts" in data
+    assert data["artifacts"]["/workspace/out.json"] == "{\"hello\": \"world\"}"
+
+
+def test_agent_sidecars_stopped_even_after_agent_error(client):
+    """Sidecars start in prepare; even if the agent errors, they're stopped."""
+    started_ids = []
+    stop_calls = []
+
+    async def fake_request(method, url, **kwargs):
+        if method == "POST" and "/v1/processes" in url and "/stop" not in url:
+            started_ids.append("sc1")
+            return _stub_sa_response(status=200, json_body={"id": "sc1"})
+        if method == "POST" and url.endswith("/processes/sc1/stop"):
+            stop_calls.append(url)
+            return _stub_sa_response(status=200, json_body={"stopped": True})
+        return _stub_sa_response(status=200, json_body={})
+
+    from unittest.mock import MagicMock
+    fake_client = MagicMock()
+    fake_client.request = AsyncMock(side_effect=fake_request)
+
+    async def fake_get_shared():
+        return fake_client
+
+    async def fake_call(name, prompt, **kwargs):
+        raise RuntimeError("agent kaboom")
+
+    with (
+        patch("aitelier.providers.llm.get_shared_client",
+              side_effect=fake_get_shared),
+        patch("aitelier.runner.call_agent", side_effect=fake_call),
+    ):
+        resp = client.post("/v1/agent", json={
+            "model": "claude",
+            "initial_message": "hi",
+            "prepare": {
+                "sidecars": [{"name": "mockapi", "cmd": "python", "args": ["x.py"]}],
+            },
+        })
+    assert resp.status_code == 200
+    # Agent failed but sidecar was stopped
+    assert len(started_ids) == 1
+    assert len(stop_calls) == 1
+
+
 # --- Model selection: passthrough + listing ---
 
 
@@ -572,42 +772,20 @@ def test_litellm_models_proxy(client):
 
 
 def test_sandbox_agent_info_proxy(client):
-    """GET /v1/sandbox/agents/{agent} forwards to Sandbox Agent."""
-    from unittest.mock import MagicMock
-
-    fake_client = MagicMock()
-    fake_resp = MagicMock()
-    fake_resp.status_code = 200
-    fake_resp.json = MagicMock(return_value={
+    """GET /v1/sandbox/agents/{agent} forwards to Sandbox Agent via _sa_proxy."""
+    p, _ = _patch_sa_proxy(json_body={
         "id": "claude", "permissions": True,
         "models": ["claude-opus-4-7", "claude-sonnet-4-6"],
     })
-    fake_client.get = AsyncMock(return_value=fake_resp)
-
-    async def fake_get_shared():
-        return fake_client
-
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    with p:
         resp = client.get("/v1/sandbox/agents/claude")
     assert resp.status_code == 200
     assert "claude-opus-4-7" in resp.json()["models"]
 
 
 def test_sandbox_agent_info_unknown_agent(client):
-    from unittest.mock import MagicMock
-
-    fake_client = MagicMock()
-    fake_resp = MagicMock()
-    fake_resp.status_code = 404
-    fake_resp.text = "not found"
-    fake_client.get = AsyncMock(return_value=fake_resp)
-
-    async def fake_get_shared():
-        return fake_client
-
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    p, _ = _patch_sa_proxy(status=404, json_body={"detail": "not found"})
+    with p:
         resp = client.get("/v1/sandbox/agents/nonexistent")
     assert resp.status_code == 404
 
