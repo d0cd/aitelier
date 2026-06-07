@@ -541,6 +541,105 @@ def test_complete_stream_records_trace_at_done(client):
 # --- Cancellation ---
 
 
+# --- /v1/runs (read API) ---
+
+
+def test_list_runs_filters(client):
+    """Seed runs via the store; verify list_runs endpoint honors filters."""
+    from datetime import UTC, datetime
+
+    from aitelier.storage._store import _store
+    now = datetime.now(UTC)
+    from aitelier.storage.models import Run as _R
+    _store._runs["r-ok"] = _R(
+        run_id="r-ok", state="completed", kind="agent",
+        started_at=now, ended_at=now, agent_id="claude",
+        trace_tag="A", status="ok", total_tokens=100,
+    )
+    _store._runs["r-fail"] = _R(
+        run_id="r-fail", state="failed", kind="agent",
+        started_at=now, ended_at=now, agent_id="claude",
+        trace_tag="A", status="error", error_type="Timeout",
+    )
+    _store._runs["r-other"] = _R(
+        run_id="r-other", state="completed", kind="complete",
+        started_at=now, ended_at=now, model="claude-sonnet",
+        trace_tag="B",
+    )
+
+    # All
+    resp = client.get("/v1/runs")
+    assert resp.status_code == 200
+    ids = {r["run_id"] for r in resp.json()}
+    assert ids == {"r-ok", "r-fail", "r-other"}
+
+    # By trace_tag
+    resp = client.get("/v1/runs?trace_tag=A")
+    ids = {r["run_id"] for r in resp.json()}
+    assert ids == {"r-ok", "r-fail"}
+
+    # By kind
+    resp = client.get("/v1/runs?kind=agent")
+    ids = {r["run_id"] for r in resp.json()}
+    assert "r-other" not in ids
+
+
+def test_list_run_events(client):
+    from datetime import UTC, datetime
+
+    from aitelier.storage._store import _store
+    from aitelier.storage.models import Run as _R
+    from aitelier.storage.models import RunEvent as _E
+
+    now = datetime.now(UTC)
+    _store._runs["r1"] = _R(run_id="r1", state="completed", kind="agent",
+                             started_at=now, ended_at=now)
+    _store._events["r1"] = [
+        _E(run_id="r1", seq=1, kind="start", payload={}, ts=now, event_id=1),
+        _E(run_id="r1", seq=2, kind="delta", payload={"content": "hi"},
+            ts=now, event_id=2),
+        _E(run_id="r1", seq=3, kind="finish", payload={}, ts=now, event_id=3),
+    ]
+
+    resp = client.get("/v1/runs/r1/events")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert [e["kind"] for e in data] == ["start", "delta", "finish"]
+
+    # since_seq pagination
+    resp = client.get("/v1/runs/r1/events?since_seq=1")
+    seqs = [e["seq"] for e in resp.json()]
+    assert seqs == [2, 3]
+
+
+def test_events_stream_for_terminal_run(client):
+    """For a run that's already terminal, the stream yields the backlog then closes."""
+    from datetime import UTC, datetime
+
+    from aitelier.storage._store import _store
+    from aitelier.storage.models import Run as _R
+    from aitelier.storage.models import RunEvent as _E
+
+    now = datetime.now(UTC)
+    _store._runs["r1"] = _R(run_id="r1", state="completed", kind="agent",
+                             started_at=now, ended_at=now)
+    _store._events["r1"] = [
+        _E(run_id="r1", seq=1, kind="start", payload={}, ts=now, event_id=1),
+        _E(run_id="r1", seq=2, kind="finish", payload={"finish_reason": "ok"},
+            ts=now, event_id=2),
+    ]
+    resp = client.get("/v1/runs/r1/events/stream")
+    assert resp.status_code == 200
+    body = resp.text
+    assert "event: run.start" in body
+    assert "event: run.finish" in body
+
+
+def test_events_stream_404_for_unknown(client):
+    resp = client.get("/v1/runs/nonexistent/events/stream")
+    assert resp.status_code == 404
+
+
 def test_runs_active_empty(client):
     from aitelier.server import _active_runs
     # ensure clean

@@ -247,6 +247,30 @@ class AcpClient:
 # ---------------------------------------------------------------------------
 
 
+class _RunEventEmitter:
+    """Tiny helper that appends run_events to the durable store, monotonically.
+
+    Best-effort: if the store hiccups, the run keeps going — observability
+    must never block agent execution.
+    """
+
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self._seq = 0
+
+    async def emit(self, kind: str, payload: dict | None = None) -> None:
+        from aitelier.storage import RunEvent, get_store
+        self._seq += 1
+        try:
+            store = await get_store()
+            await store.append_event(RunEvent(
+                run_id=self.run_id, seq=self._seq, kind=kind,
+                payload=payload or {},
+            ))
+        except Exception:
+            pass
+
+
 async def call_via_sandbox(
     name: str,
     prompt: str,
@@ -323,6 +347,13 @@ async def _run_one_turn(
     run_id: str,
     start: float,
 ) -> dict:
+    emitter = _RunEventEmitter(run_id)
+    await emitter.emit("start", {
+        "agent": client.agent,
+        "sandbox_url": client.base_url,
+        "workspace": workspace,
+    })
+
     # 1. Handshake
     await client.call("initialize", {
         "protocolVersion": _ACP_PROTOCOL_VERSION,
@@ -366,8 +397,12 @@ async def _run_one_turn(
 
     turn_result = await client.call("session/prompt", prompt_params)
 
-    # 6. Drain any remaining notifications
+    # 6. Drain any remaining notifications and persist each as a run_event
     notifications = await client.drain_notifications()
+    for note in notifications:
+        ev = _notification_to_event(note)
+        if ev:
+            await emitter.emit(ev["type"], {k: v for k, v in ev.items() if k != "type"})
 
     # 7. Close session
     try:
@@ -376,7 +411,7 @@ async def _run_one_turn(
         pass
 
     elapsed = time.monotonic() - start
-    return _aggregate_result(
+    result = _aggregate_result(
         agent=client.agent,
         run_id=run_id,
         turn_result=turn_result,
@@ -384,6 +419,14 @@ async def _run_one_turn(
         elapsed=elapsed,
         response_format=response_format,
     )
+    await emitter.emit(
+        "finish" if result.get("status") == "ok" else "error",
+        {
+            "finish_reason": result.get("finish_reason"),
+            "tool_call_count": len(result.get("tool_calls") or []),
+        },
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +461,11 @@ async def call_via_sandbox_stream(
 
     text_chunks: list[str] = []
     tool_calls: list[dict] = []
+
+    emitter = _RunEventEmitter(run_id)
+    await emitter.emit("start", {
+        "agent": name, "sandbox_url": cfg.base_url, "workspace": workspace,
+    })
 
     _trace, _gen = trace_agent_call(
         task_name="agent",
@@ -490,6 +538,8 @@ async def call_via_sandbox_stream(
                         "tool": ev.get("tool"),
                         "input": ev.get("input"),
                     })
+                await emitter.emit(ev["type"],
+                                    {k: v for k, v in ev.items() if k != "type"})
                 yield ev
 
             # Final turn response
@@ -498,11 +548,13 @@ async def call_via_sandbox_stream(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                yield {
+                err = {
                     "type": "error",
                     "error_type": classify_error(exc),
                     "error_msg": str(exc),
                 }
+                await emitter.emit("error", err)
+                yield err
                 return
 
             # Drain any straggling notifications.
@@ -512,6 +564,8 @@ async def call_via_sandbox_stream(
                     continue
                 if ev["type"] == "delta":
                     text_chunks.append(ev["content"])
+                await emitter.emit(ev["type"],
+                                    {k: v for k, v in ev.items() if k != "type"})
                 yield ev
 
             try:
@@ -533,19 +587,26 @@ async def call_via_sandbox_stream(
             if tool_calls:
                 done["tool_calls"] = tool_calls
             done["type"] = "done"
+            await emitter.emit("finish", {
+                "finish_reason": done.get("finish_reason"),
+                "tool_call_count": len(tool_calls),
+            })
             end_agent_trace(_gen, done.get("content") or "", None, run_id)
             yield done
 
     except asyncio.CancelledError:
+        await emitter.emit("cancelled", {})
         end_agent_trace(_gen, "".join(text_chunks), None, run_id)
         raise
     except Exception as exc:
-        end_agent_trace(_gen, str(exc), None, run_id)
-        yield {
+        err = {
             "type": "error",
             "error_type": classify_error(exc),
             "error_msg": str(exc),
         }
+        await emitter.emit("error", err)
+        end_agent_trace(_gen, str(exc), None, run_id)
+        yield err
 
 
 # ---------------------------------------------------------------------------

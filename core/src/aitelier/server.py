@@ -951,6 +951,136 @@ def _validate_path_component(value: str, label: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: path traversal not allowed")
 
 
+def _run_to_dict(run) -> dict:
+    """Convert a Run dataclass → dict for the /v1/runs* wire format.
+
+    Distinct from the legacy /v1/traces shape: surfaces state, environment,
+    sandbox info, error fields. trace_id retained as an alias of run_id.
+    """
+    return {
+        "run_id": run.run_id,
+        "trace_id": run.run_id,
+        "state": run.state,
+        "kind": run.kind,
+        "agent_id": run.agent_id,
+        "model": run.model,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "trace_tag": run.trace_tag,
+        "correlation_id": run.correlation_id,
+        "sandbox_backend": run.sandbox_backend,
+        "sandbox_url": run.sandbox_url,
+        "sandbox_server_id": run.sandbox_server_id,
+        "workspace": run.workspace,
+        "environment": run.environment,
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+        "cost_usd": run.cost_usd,
+        "finish_reason": run.finish_reason,
+        "tool_call_count": run.tool_call_count,
+        "status": run.status,
+        "error_type": run.error_type,
+        "error_msg": run.error_msg,
+        "metadata": run.metadata,
+    }
+
+
+def _event_to_dict(event) -> dict:
+    return {
+        "event_id": event.event_id,
+        "run_id": event.run_id,
+        "seq": event.seq,
+        "kind": event.kind,
+        "ts": event.ts.isoformat() if event.ts else None,
+        "payload": event.payload,
+    }
+
+
+@app.get("/v1/runs")
+async def list_runs_endpoint(
+    state: str | None = None,
+    kind: str | None = None,
+    agent_id: str | None = None,
+    trace_tag: str | None = None,
+    correlation_id: str | None = None,
+    since: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """List runs from the durable store with optional filters.
+
+    `state` ∈ {pending, running, completed, failed, cancelled, orphaned}.
+    """
+    store = await get_store()
+    since_dt = datetime.fromisoformat(since) if since else None
+    runs = await store.list_runs(RunFilter(
+        state=state, kind=kind, agent_id=agent_id,
+        trace_tag=trace_tag, correlation_id=correlation_id,
+        since=since_dt, limit=limit,
+    ))
+    return [_run_to_dict(r) for r in runs]
+
+
+@app.get("/v1/runs/{run_id}/events")
+async def list_run_events_endpoint(
+    run_id: str, since_seq: int = 0, limit: int = 1000,
+) -> list[dict]:
+    """Paginated event timeline for a single run."""
+    _validate_path_component(run_id, "run_id")
+    store = await get_store()
+    events = await store.list_events(run_id, since_seq=since_seq, limit=limit)
+    return [_event_to_dict(e) for e in events]
+
+
+@app.get("/v1/runs/{run_id}/events/stream")
+async def stream_run_events_endpoint(run_id: str, request: Request):
+    """SSE: live event feed for one run.
+
+    Tails the run_events table — useful for dashboards rendering an active
+    agent's progress. Streams every event as it's appended; for already-
+    completed runs, simply yields the full backlog then closes.
+    """
+    _validate_path_component(run_id, "run_id")
+    store = await get_store()
+    run = await store.get_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+
+    async def event_generator():
+        last_seq = 0
+        # Poll-based tail: cheap at our scale; LISTEN/NOTIFY is a Phase-9.5
+        # upgrade for Postgres specifically. InMemoryStore polling works fine.
+        idle_ticks = 0
+        while True:
+            if await request.is_disconnected():
+                break
+            new = await store.list_events(run_id, since_seq=last_seq, limit=500)
+            if new:
+                for ev in new:
+                    yield _sse_event(f"run.{ev.kind}", _event_to_dict(ev))
+                    last_seq = max(last_seq, ev.seq)
+                idle_ticks = 0
+            else:
+                idle_ticks += 1
+            # If the run is terminal AND we've drained, close the stream.
+            current = await store.get_run(run_id)
+            if current and current.state in (
+                "completed", "failed", "cancelled", "orphaned",
+            ) and not new:
+                break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/v1/runs/active")
 async def list_active_runs() -> dict:
     """List run_ids currently in-flight in this server process."""
