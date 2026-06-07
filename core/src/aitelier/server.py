@@ -142,11 +142,15 @@ async def _schedule_handler(entry: dict) -> None:
             "finish_reason": "error",
         }
     if entry.get("webhook_url"):
-        await _post_webhook(entry["webhook_url"], {
-            "schedule_id": entry["id"],
-            "run_id": run_id,
-            "result": result,
-        })
+        await _enqueue_webhook(
+            entry["webhook_url"],
+            {
+                "schedule_id": entry["id"],
+                "run_id": run_id,
+                "result": result,
+            },
+            run_id=run_id, schedule_id=entry["id"],
+        )
 
 
 @asynccontextmanager
@@ -166,6 +170,10 @@ async def lifespan(app: FastAPI):
     # Start the persistent schedule tick loop
     from aitelier.schedules import start_tick_loop, stop_tick_loop
     start_tick_loop(_schedule_handler)
+
+    # Start the durable webhook delivery worker
+    from aitelier.webhook_worker import start_webhook_worker, stop_webhook_worker
+    start_webhook_worker()
 
     # Health check LiteLLM proxy
     from aitelier.config import get_config
@@ -199,8 +207,9 @@ async def lifespan(app: FastAPI):
         except TimeoutError:
             logger.warning("Some runs did not cleanly cancel within 2s")
 
-    # Stop the schedule tick loop.
+    # Stop the schedule tick loop + webhook worker.
     stop_tick_loop()
+    stop_webhook_worker()
 
     # Release the shared HTTP client pool.
     from aitelier.providers.llm import close_shared_client
@@ -384,16 +393,30 @@ def _merge_correlation(metadata: dict | None, cid: str) -> dict:
     return out
 
 
-async def _post_webhook(url: str, payload: dict) -> None:
-    """Best-effort POST to a consumer-supplied webhook URL. Never raises."""
+async def _enqueue_webhook(
+    url: str, payload: dict, *, run_id: str | None = None,
+    schedule_id: str | None = None,
+) -> None:
+    """Enqueue a webhook for durable delivery by the background worker.
+
+    Replaces the previous fire-and-forget inline POST. The worker retries
+    with exponential backoff (1s/5s/30s/5min/1hr) up to 5 attempts.
+    """
     try:
-        from aitelier.providers.llm import get_shared_client
-        client = await get_shared_client()
-        resp = await client.post(url, json=payload, timeout=10)
-        if resp.status_code >= 400:
-            logger.warning("Webhook %s returned %s", url, resp.status_code)
+        store = await get_store()
+        await store.enqueue_webhook(url, payload,
+                                     run_id=run_id, schedule_id=schedule_id)
     except Exception as exc:
-        logger.warning("Webhook POST to %s failed: %s", url, exc)
+        # If enqueueing itself fails (e.g. DB down), fall back to inline POST
+        # so the consumer at least *might* hear about completion.
+        logger.warning("Webhook enqueue failed (%s); attempting inline POST", exc)
+        try:
+            from aitelier.providers.llm import get_shared_client
+            client = await get_shared_client()
+            await client.post(url, json=payload, timeout=10)
+        except Exception as exc2:
+            logger.warning("Inline webhook fallback to %s also failed: %s",
+                            url, exc2)
 
 
 def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> str | None:
@@ -588,7 +611,7 @@ async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
                 _active_runs.pop(run_id, None)
             result["correlation_id"] = cid
             if webhook_url:
-                await _post_webhook(webhook_url, result)
+                await _enqueue_webhook(webhook_url, result, run_id=run_id)
 
         asyncio.create_task(_run_and_callback())
         return {
