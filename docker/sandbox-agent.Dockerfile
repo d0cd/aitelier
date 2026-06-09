@@ -24,6 +24,9 @@ WORKDIR /workspaces
 
 EXPOSE 2468
 
-# `--listen 0.0.0.0:2468` exposes SA's HTTP control plane to the docker
-# network so aitelier (on the host or in another service) can reach it.
-CMD ["sandbox-agent", "serve", "--listen", "0.0.0.0:2468"]
+# Subcommand + flags match what scripts/start.sh uses for host-mode SA:
+#   sandbox-agent server --host <h> --port <p> --no-token
+# Bind 0.0.0.0 so the docker bridge can route aitelier↔SA. `--no-token`
+# is fine inside the container — the only consumer is aitelier on the
+# same compose network. Add SANDBOX_TOKEN if you expose SA off-network.
+CMD ["sandbox-agent", "server", "--host", "0.0.0.0", "--port", "2468", "--no-token"]

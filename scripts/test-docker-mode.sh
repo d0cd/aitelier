@@ -55,7 +55,9 @@ trap cleanup EXIT
 
 echo "=== Saving current config ==="
 if [ -f "$CONFIG" ]; then
-    BACKUP="$(mktemp -t aitelier.toml.XXXXXX)"
+    # Full template path is portable across macOS BSD-mktemp and Linux
+    # GNU-mktemp (`-t prefix` differs between them).
+    BACKUP="$(mktemp "${TMPDIR:-/tmp}/aitelier.toml.XXXXXX")"
     cp "$CONFIG" "$BACKUP"
     echo "  backed up $CONFIG → $BACKUP"
 fi

@@ -375,6 +375,17 @@ finally:
 
     if [ "${AITELIER_SA_PROFILE:-}" = "1" ]; then
         echo "  Docker: SA runs in the compose `sa` profile container"
+        # If a previous host-mode SA is still bound to :2468, the docker
+        # container can't claim the port. Tear down the host SA before
+        # waiting on the container.
+        if [ -f "$SANDBOX_AGENT_PID_FILE" ]; then
+            HOST_SA_PID="$(cat "$SANDBOX_AGENT_PID_FILE" 2>/dev/null || true)"
+            if [ -n "$HOST_SA_PID" ] && kill -0 "$HOST_SA_PID" 2>/dev/null; then
+                echo "  Stopping previously-running host-mode SA (PID $HOST_SA_PID)"
+                kill "$HOST_SA_PID" 2>/dev/null || true
+                rm -f "$SANDBOX_AGENT_PID_FILE"
+            fi
+        fi
         echo "  → docker compose --profile sa up -d (handled above)"
         for i in {1..30}; do
             if curl -sf "http://localhost:2468/v1/agents" >/dev/null 2>&1; then

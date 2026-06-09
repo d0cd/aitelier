@@ -1,16 +1,26 @@
-# Build aitelier core into a single-binary-ish container.
-# Sandbox Agent and LiteLLM run separately (compose); this image is just
-# the FastAPI service.
+# Build aitelier core into a container image.
 #
-# Usage:
+# Sandbox Agent and LiteLLM run separately (compose / brig / other);
+# this image is just the FastAPI service.
+#
+# CONFIG: aitelier reads ZERO env vars by design — all configuration
+# lives in TOML. Mount a config file into the container:
+#
 #   docker build -f docker/Dockerfile -t aitelier:latest .
 #   docker run -p 7777:7777 \
-#       -e AITELIER_HOST=0.0.0.0 \
-#       -e AITELIER_API_KEY=<your-key> \
-#       -e LITELLM_BASE_URL=http://litellm:4000 \
-#       -e SANDBOX_AGENT_BASE_URL=http://sandbox-agent:2468 \
+#       -v "$PWD/aitelier.toml:/app/aitelier.toml:ro" \
+#       -v "$PWD/aitelier.secrets.toml:/app/aitelier.secrets.toml:ro" \
 #       -v aitelier-runs:/app/runs \
 #       aitelier:latest
+#
+# Or mount a user-global config:
+#       -v "$PWD/aitelier.toml:/root/.config/aitelier/config.toml:ro"
+#
+# Inside aitelier.toml, point at the docker-compose service names:
+#   [database]      url = "postgresql://aitelier:aitelier_local@postgres:5432/aitelier"
+#   [litellm]       base_url = "http://litellm:4000"
+#   [sandbox_agent] base_url = "http://sandbox-agent:2468"
+#   [service]       host = "0.0.0.0"  port = 7777
 
 FROM python:3.11-slim AS build
 ENV UV_SYSTEM_PYTHON=1
@@ -29,7 +39,8 @@ COPY --from=build /usr/local/bin/aitelier /usr/local/bin/aitelier
 COPY core/ ./core/
 COPY schemas/ ./schemas/
 RUN mkdir -p /app/runs
-ENV AITELIER_HOST=0.0.0.0
-ENV AITELIER_PORT=7777
 EXPOSE 7777
+# `aitelier serve` reads [service] host/port from the mounted TOML. The
+# CLI flags below are the in-container defaults if no config is found;
+# they get overridden by the file once mounted.
 CMD ["aitelier", "serve", "--host", "0.0.0.0", "--port", "7777"]

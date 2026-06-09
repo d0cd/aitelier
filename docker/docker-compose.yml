@@ -68,7 +68,8 @@ services:
       - aitelier_sa_workspaces:/workspaces
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:2468/v1/agents"]
+      # `curl` is installed in the SA Dockerfile; wget isn't.
+      test: ["CMD", "curl", "-sf", "http://localhost:2468/v1/agents"]
       interval: 10s
       timeout: 3s
       retries: 3
