@@ -448,6 +448,85 @@ def test_chat_completions_rejects_prepare_files_dotdot(client):
     assert "aitelier.prepare.files" in resp.text
 
 
+def test_chat_completions_rejects_loopback_mcp_server_url(client):
+    """`aitelier.mcp_servers[*].url` must resolve to a public host when
+    SSRF guard is on (default). Same posture as webhook_url."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"mcp_servers": [
+            {"name": "internal", "transport": "http",
+             "url": "http://127.0.0.1:9999/mcp"},
+        ]},
+    })
+    assert resp.status_code == 400
+    assert "mcp_servers" in resp.text
+
+
+def test_chat_completions_rejects_imds_mcp_server_url(client):
+    """The IMDS metadata service (169.254.169.254) must be refused."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"mcp_servers": [
+            {"name": "evil", "transport": "http",
+             "url": "http://169.254.169.254/latest/meta-data/"},
+        ]},
+    })
+    assert resp.status_code == 400
+
+
+def test_chat_completions_allows_stdio_mcp_server_without_url_check(client):
+    """stdio MCP servers have no URL; the SSRF guard must skip them.
+    Exercising the validator alone — dispatch is mocked away."""
+    with patch("aitelier.server._agent_chat_completion",
+                new_callable=AsyncMock,
+                return_value={
+                    "kind": "agent", "status": "ok",
+                    "content": "hi", "provider": "claude",
+                    "usage": {"input_tokens": 0, "output_tokens": 0,
+                              "total_tokens": 0},
+                    "finish_reason": "completed",
+                    "run_id": "r-1", "trace_id": "r-1",
+                    "tool_calls": [], "cost_usd": None,
+                    "error_type": None, "error_msg": None,
+                }):
+        resp = client.post("/v1/chat/completions", json={
+            "model": "agent:claude",
+            "messages": [{"role": "user", "content": "x"}],
+            "aitelier": {"mcp_servers": [
+                {"name": "aitelier", "transport": "stdio",
+                 "command": "aitelier-mcp"},
+            ]},
+        })
+    assert resp.status_code == 200, resp.text
+
+
+def test_chat_completions_rejects_too_many_mcp_servers(client):
+    """Pydantic Field(max_length=32) rejects at parse time as 422."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"mcp_servers": [
+            {"name": f"s{i}", "transport": "stdio", "command": "c"}
+            for i in range(100)
+        ]},
+    })
+    assert resp.status_code == 422
+    assert "mcp_servers" in resp.text
+
+
+def test_chat_completions_rejects_oversized_tool_allowlist(client):
+    """Pydantic Field(max_length=256) rejects at parse time as 422."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"tool_allowlist": [f"t{i}" for i in range(1000)]},
+    })
+    assert resp.status_code == 422
+    assert "tool_allowlist" in resp.text
+
+
 def test_body_size_middleware_rejects_negative_content_length(client):
     """Negative Content-Length (Content-Length: -1) must 413, not pass."""
     from aitelier.config import get_config

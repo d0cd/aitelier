@@ -185,7 +185,7 @@ async def _schedule_handler(entry: dict) -> None:
     try:
         req = ChatCompletionRequest(**task)
         route, agent_backend, inner_llm = parse_model_route(req.model)
-        _validate_aitelier_opts(req, agent_path=(route == "agent"))
+        await _validate_aitelier_opts(req, agent_path=(route == "agent"))
         if route == "agent":
             result = await _agent_chat_completion(
                 req, _FakeRequest(),  # type: ignore[arg-type]
@@ -866,15 +866,16 @@ def _reject_agent_incompatible_fields(req: ChatCompletionRequest) -> None:
         )
 
 
-def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> None:
+async def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> None:
     """Refuse aitelier.* on the LLM path. The namespace is agent-specific.
 
     On the agent path, also runs the workspace + artifacts + prepare.files
-    path checks at the request boundary. The checks bound what aitelier
-    hands to SA — they do not constrain the agent's own tool calls
-    (claude-code's `Read`, `Bash`, etc., which traverse SA's filesystem
-    layer directly). A complete fix for symlink-follow inside the agent's
-    tool surface lives in SA (track upstream brig safe_open adoption).
+    path checks and SSRF-checks every HTTP MCP server URL. List-size caps
+    on `mcp_servers` and `tool_allowlist` live on the Pydantic model as
+    `Field(max_length=…)` — those reject at parse time. The checks here
+    bound what aitelier hands to SA. They do not constrain the agent's
+    own tool calls (claude-code's `Read`, `Bash`, etc., which traverse
+    SA's filesystem layer directly) — that fix lives in SA upstream.
     """
     if req.aitelier is not None and not agent_path:
         raise HTTPException(
@@ -885,8 +886,9 @@ def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> 
     if not agent_path or req.aitelier is None:
         return
 
-    from aitelier.security import validate_workspace_path
-    roots = get_config().service.allowed_workspace_roots or None
+    from aitelier.security import is_public_url, validate_workspace_path
+    cfg = get_config().service
+    roots = cfg.allowed_workspace_roots or None
 
     opts = req.aitelier
     validate_workspace_path(opts.workspace, roots=roots, label="aitelier.workspace")
@@ -902,6 +904,28 @@ def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> 
             validate_workspace_path(
                 p, roots=roots, label="aitelier.artifacts.fetch[]",
             )
+
+    # SSRF: every consumer-supplied URL that aitelier causes to be
+    # connected to is gated against private / loopback / metadata ranges.
+    # stdio servers have no URL; skip them. The `allow_loopback_webhooks`
+    # toggle relaxes both webhook and MCP-URL checks for local dev.
+    if opts.mcp_servers and not cfg.allow_loopback_webhooks:
+        for s in opts.mcp_servers:
+            if (s.get("transport") or "http") != "http":
+                continue
+            url = s.get("url") or ""
+            if not url:
+                continue
+            if not await is_public_url(url):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "aitelier.mcp_servers[].url must resolve to a "
+                        "public, non-loopback host. Set "
+                        "`service.allow_loopback_webhooks = true` for "
+                        "local-dev MCP servers."
+                    ),
+                )
 
 
 async def _agent_chat_completion(
@@ -1525,7 +1549,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
     `aitelier.*` options on the agent path; not accepted on the LLM path.
     """
     route, agent_backend, inner_llm = parse_model_route(req.model)
-    _validate_aitelier_opts(req, agent_path=(route == "agent"))
+    await _validate_aitelier_opts(req, agent_path=(route == "agent"))
     _reject_if_saturated()
 
     if route == "agent":
@@ -1746,7 +1770,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
                    "'agent:<backend>[/<inner-llm>]', or use "
                    "/v1/chat/completions for LLM calls.",
         )
-    _validate_aitelier_opts(req, agent_path=True)
+    await _validate_aitelier_opts(req, agent_path=True)
     _reject_if_saturated()
 
     cid = request.state.correlation_id
