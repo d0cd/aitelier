@@ -26,6 +26,7 @@ cd "$REPO_ROOT"
 
 CONFIG=aitelier.toml
 BACKUP=
+CREATED_CONFIG=0
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "✗ docker not installed; aborting."
@@ -42,10 +43,10 @@ cleanup() {
     echo "=== Restoring previous config ==="
     if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
         mv "$BACKUP" "$CONFIG"
-        echo "  ✓ restored $CONFIG"
-    elif [ -f "$CONFIG.test-docker-mode" ]; then
+        echo "  ✓ restored $CONFIG from $BACKUP"
+    elif [ "$CREATED_CONFIG" = "1" ] && [ -f "$CONFIG" ]; then
         rm "$CONFIG"
-        echo "  ✓ removed temp $CONFIG (no original to restore)"
+        echo "  ✓ removed $CONFIG (no original to restore)"
     fi
     echo "=== Restarting in original mode ==="
     ./scripts/stop.sh >/dev/null 2>&1 || true
@@ -63,6 +64,9 @@ if [ -f "$CONFIG" ]; then
 fi
 
 echo "=== Writing mode = 'docker' config ==="
+if [ ! -f "$CONFIG" ]; then
+    CREATED_CONFIG=1
+fi
 cat > "$CONFIG.test-docker-mode" <<EOF
 [sandbox_agent]
 mode = "docker"
