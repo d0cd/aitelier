@@ -264,6 +264,10 @@ async def lifespan(app: FastAPI):
     from aitelier.webhook_worker import start_webhook_worker, stop_webhook_worker
     start_webhook_worker()
 
+    # Start the background purge worker
+    from aitelier.purge_worker import start_purge_worker, stop_purge_worker
+    start_purge_worker()
+
     # Health check LiteLLM proxy. /health/liveness — no auth, no upstream
     # provider probing. /health would 5xx on transient backend issues (e.g.
     # OpenAI 429) and falsely log the proxy as unreachable on startup.
@@ -294,9 +298,10 @@ async def lifespan(app: FastAPI):
         except TimeoutError:
             logger.warning("Some runs did not cleanly cancel within 2s")
 
-    # Stop the schedule tick loop + webhook worker.
+    # Stop the schedule tick loop + webhook worker + purge worker.
     stop_tick_loop()
     stop_webhook_worker()
+    stop_purge_worker()
 
     # Release the shared HTTP client pool.
     from aitelier.providers.llm import close_shared_client
@@ -364,6 +369,91 @@ async def _correlation_id_middleware(request: Request, call_next):
         _correlation_id_var.reset(token)
     response.headers["X-Correlation-Id"] = cid
     return response
+
+
+@app.middleware("http")
+async def _body_size_middleware(request: Request, call_next):
+    """Reject requests whose Content-Length exceeds the configured cap
+    with 413, before any handler runs.
+
+    Blocks the trivial memory-exhaustion vector where a hostile caller
+    POSTs gigabytes into idempotency hashing or JSON parsing. Honors
+    `service.max_request_body_bytes`; 0 disables the check.
+
+    Notes:
+      - Header-only check: clients that omit Content-Length (chunked
+        transfer-encoding) are not blocked here. Put a reverse proxy
+        in front of hosted aitelier if you need a hard cap.
+      - /v1/health is exempt — k8s probes shouldn't bounce off this.
+    """
+    from fastapi.responses import JSONResponse
+
+    if request.url.path == "/v1/health":
+        return await call_next(request)
+
+    cap = get_config().service.max_request_body_bytes
+    if cap:
+        raw_len = request.headers.get("Content-Length")
+        if raw_len:
+            try:
+                body_len = int(raw_len)
+            except ValueError:
+                body_len = 0
+            if body_len > cap:
+                return JSONResponse(
+                    {"detail": (
+                        f"Request body {body_len} bytes exceeds cap "
+                        f"{cap} bytes. Adjust service.max_request_body_bytes."
+                    )},
+                    status_code=413,
+                )
+    return await call_next(request)
+
+
+# Rate limit state — in-process token bucket keyed by (api_key or remote_addr).
+# Single-process assumption; horizontal scaling would move this to Redis.
+_rate_limit_buckets: dict[str, tuple[float, float]] = {}
+_RATE_LIMIT_EXEMPT_PATHS = {"/v1/health"}
+
+
+def _rate_limit_key(request: Request) -> str:
+    """Identify the caller for rate-limiting. Bearer token if present (so
+    a single key shared by N clients is one bucket), else remote IP."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        return f"bearer:{auth[7:]}"
+    client = request.client
+    return f"ip:{client.host}" if client else "ip:unknown"
+
+
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    """Per-caller token bucket. Returns 429 with Retry-After when the
+    bucket is empty. 0 = disabled (default). Excludes /v1/health.
+
+    Bucket capacity equals the per-minute budget; the bucket refills
+    linearly at budget/60 tokens per second."""
+    from fastapi.responses import JSONResponse
+
+    budget = get_config().service.rate_limit_per_minute
+    if budget <= 0 or request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
+        return await call_next(request)
+
+    now = time.monotonic()
+    refill_rate = budget / 60.0
+    key = _rate_limit_key(request)
+    tokens, last = _rate_limit_buckets.get(key, (float(budget), now))
+    tokens = min(float(budget), tokens + (now - last) * refill_rate)
+    if tokens < 1.0:
+        retry_after = max(1, int((1.0 - tokens) / refill_rate))
+        _rate_limit_buckets[key] = (tokens, now)
+        return JSONResponse(
+            {"detail": "Rate limit exceeded"},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    _rate_limit_buckets[key] = (tokens - 1.0, now)
+    return await call_next(request)
 
 
 # Per-process registry of in-flight runs, for cancellation.

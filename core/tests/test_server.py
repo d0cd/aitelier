@@ -98,6 +98,73 @@ def test_health(client):
     assert isinstance(data["known_limitations"], list)
 
 
+# --- Body-size middleware ----------------------------------------------------
+
+
+def test_body_size_middleware_rejects_oversized_body(client):
+    from aitelier.config import get_config
+    cfg = get_config()
+    original = cfg.service.max_request_body_bytes
+    cfg.service.max_request_body_bytes = 100
+    try:
+        big = "x" * 500
+        resp = client.post(
+            "/v1/chat/completions",
+            content=big,
+            headers={"Content-Length": str(len(big)),
+                     "Content-Type": "application/json"},
+        )
+        assert resp.status_code == 413
+        assert "exceeds cap" in resp.json()["detail"]
+    finally:
+        cfg.service.max_request_body_bytes = original
+
+
+def test_body_size_middleware_health_exempt(client):
+    from aitelier.config import get_config
+    cfg = get_config()
+    original = cfg.service.max_request_body_bytes
+    cfg.service.max_request_body_bytes = 10
+    try:
+        resp = client.get("/v1/health")
+        assert resp.status_code == 200
+    finally:
+        cfg.service.max_request_body_bytes = original
+
+
+# --- Rate limit middleware ---------------------------------------------------
+
+
+def test_rate_limit_middleware_429_when_bucket_empty(client):
+    from aitelier.config import get_config
+    from aitelier.server import _rate_limit_buckets
+    cfg = get_config()
+    original = cfg.service.rate_limit_per_minute
+    cfg.service.rate_limit_per_minute = 60  # 1 token/sec
+    _rate_limit_buckets.clear()
+    try:
+        # Drain the bucket — capacity == budget, 60 calls should burst through.
+        for _ in range(60):
+            assert client.get("/v1/health").status_code == 200
+        # Health is exempt; trigger via a different endpoint. listSchedules
+        # is cheap and reachable.
+        for _ in range(60):
+            client.get("/v1/schedules")
+        resp = client.get("/v1/schedules")
+        assert resp.status_code == 429
+        assert "Retry-After" in resp.headers
+    finally:
+        cfg.service.rate_limit_per_minute = original
+        _rate_limit_buckets.clear()
+
+
+def test_rate_limit_disabled_by_default(client):
+    from aitelier.config import get_config
+    assert get_config().service.rate_limit_per_minute == 0
+    for _ in range(200):
+        assert client.get("/v1/health").status_code == 200
+
+
 def _openai_chat_response(content: str = "Hello!") -> dict:
     return {
         "id": "chatcmpl-upstream", "object": "chat.completion",
@@ -1641,7 +1708,11 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
     cap = 4
     monkeypatch.setattr(
         "aitelier.server.get_config",
-        lambda: MagicMock(service=MagicMock(max_in_flight_runs=cap)),
+        lambda: MagicMock(service=MagicMock(
+            max_in_flight_runs=cap,
+            rate_limit_per_minute=0,
+            max_request_body_bytes=0,
+        )),
     )
     # Fill the registry so the next call hits the cap.
     for i in range(cap):

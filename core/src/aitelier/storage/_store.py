@@ -66,6 +66,7 @@ class Store(Protocol):
     async def append_event(self, event: RunEvent) -> RunEvent: ...
     async def list_events(self, run_id: str, *, since_seq: int = 0,
                             limit: int = 1000) -> list[RunEvent]: ...
+    async def purge_old_run_events(self, max_age_days: int = 30) -> int: ...
 
     # Schedules
     async def create_schedule(self, schedule: Schedule) -> Schedule: ...
@@ -85,6 +86,7 @@ class Store(Protocol):
                                        status_code: int | None,
                                        error: str | None,
                                        next_attempt_at: datetime | None) -> None: ...
+    async def purge_old_webhook_deliveries(self, max_age_days: int = 7) -> int: ...
 
     # Idempotency keys
     async def get_idempotent(self, key: str) -> IdempotencyRecord | None: ...
@@ -502,6 +504,30 @@ class PostgresStore:
                 status_code, error, next_attempt_at, new_state, delivery_id,
             )
 
+    async def purge_old_webhook_deliveries(self, max_age_days: int = 7) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM webhook_deliveries "
+                "WHERE state IN ('delivered', 'failed') AND created_at < $1",
+                cutoff,
+            )
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
+
+    async def purge_old_run_events(self, max_age_days: int = 30) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM run_events WHERE ts < $1", cutoff,
+            )
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
+
     # --- Idempotency keys ---
 
     async def get_idempotent(self, key: str) -> IdempotencyRecord | None:
@@ -744,6 +770,18 @@ class InMemoryStore:
                             limit: int = 1000) -> list[RunEvent]:
         return [e for e in self._events.get(run_id, []) if e.seq > since_seq][:limit]
 
+    async def purge_old_run_events(self, max_age_days: int = 30) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        purged = 0
+        for run_id, events in list(self._events.items()):
+            kept = [e for e in events if (e.ts or datetime.now(UTC)) >= cutoff]
+            purged += len(events) - len(kept)
+            if kept:
+                self._events[run_id] = kept
+            else:
+                self._events.pop(run_id, None)
+        return purged
+
     async def create_schedule(self, s: Schedule) -> Schedule:
         self._schedules[s.id] = s
         return s
@@ -806,6 +844,16 @@ class InMemoryStore:
             w.state = "delivered"
         elif next_attempt_at is None:
             w.state = "failed"
+
+    async def purge_old_webhook_deliveries(self, max_age_days: int = 7) -> int:
+        cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
+        old = [
+            wid for wid, w in self._webhooks.items()
+            if w.state in ("delivered", "failed") and w.created_at < cutoff
+        ]
+        for wid in old:
+            self._webhooks.pop(wid, None)
+        return len(old)
 
     # --- Idempotency keys ---
 

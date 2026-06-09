@@ -47,16 +47,25 @@ default_model = "qwen3:8b"             # which model the `local` alias resolves 
 [service]
 host = "127.0.0.1"
 port = 7777
-log_format = "human"           # "json" for one-line-per-record aggregator-friendly logs
-max_in_flight_runs = 32        # 503 when exceeded; 0 disables the cap
+log_format = "human"             # "json" for one-line-per-record aggregator-friendly logs
+max_in_flight_runs = 32          # 503 when exceeded; 0 disables the cap
 allow_loopback_webhooks = false  # opt-in for dev when webhook target is on localhost
+max_request_body_bytes = 4194304 # 4 MiB; 413 above this. 0 disables (only safe behind a proxy)
+rate_limit_per_minute = 0        # 0 = disabled. Set to e.g. 600 for hosted mode
 # api_key + webhook_secret go in aitelier.secrets.toml:
 #   [service]
-#   api_key = "replace-me"     # enables hosted-mode Bearer auth on /v1/*
-#   webhook_secret = "..."     # HMAC signing for outbound webhooks
+#   api_key = "replace-me"       # enables hosted-mode Bearer auth on /v1/*
+#   webhook_secret = "..."       # HMAC signing for outbound webhooks
 
 [storage]
 # Cap on JSON-encoded run metadata size. Aitelier persists the whole dict as
 # JSONB in Postgres; without a bound, a buggy consumer can bloat the runs
 # table. 64 KB is well above typical use.
 max_metadata_bytes = 65536
+
+[purge]
+# Background worker that trims expired idempotency keys, terminal webhook
+# deliveries, and old run events. Set interval_seconds = 0 to disable.
+interval_seconds = 3600
+webhook_retention_days = 7
+event_retention_days = 30

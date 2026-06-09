@@ -948,6 +948,48 @@ aitelier supports two modes:
 Always combine hosted mode with TLS termination upstream. Bearer over
 plain HTTP is unsafe.
 
+### Hosted-mode deployment envelope
+
+aitelier is built for trusted-team deployments, not multi-tenant SaaS.
+The following are intentionally **not** features — design around them:
+
+- **Single shared API key.** All `Authorization: Bearer …` callers share
+  one identity. Rotate the key by editing `aitelier.secrets.toml` and
+  restarting. No per-user keys, no scopes, no audit trail of which
+  consumer made which call (use `X-Correlation-Id` to thread requests
+  across systems instead).
+- **Schedule task blobs are visible to every key-holder.** `GET
+  /v1/schedules` returns the full `task` dict, including
+  `aitelier.mcp_servers[*].headers` (typically a Bearer/PAT for the MCP
+  server) and `aitelier.prepare.commands[*].env` (often DB DSNs or
+  registry creds). Treat the schedule store as team-shared.
+- **No body-size cap by default beyond a configurable 4 MiB.** Tune
+  `service.max_request_body_bytes` for your traffic. Put a reverse
+  proxy in front of hosted aitelier if you need a hard external cap.
+- **No per-caller rate limit by default.** Set
+  `service.rate_limit_per_minute` to a per-key budget (e.g. 600); it
+  excludes `/v1/health`. Returns 429 + `Retry-After`.
+- **Background purges run hourly by default.** Tune via `[purge]
+  interval_seconds`, `webhook_retention_days`, `event_retention_days`.
+  Set `interval_seconds = 0` to disable (only safe if you handle
+  cleanup externally; the startup `runs` purge still runs).
+
+Recommended hosted-mode TOML:
+
+```toml
+[service]
+api_key = "rotate-me-quarterly"      # in aitelier.secrets.toml
+webhook_secret = "rotate-me-too"     # in aitelier.secrets.toml
+max_request_body_bytes = 4194304
+rate_limit_per_minute = 600
+max_in_flight_runs = 32
+
+[purge]
+interval_seconds = 3600
+webhook_retention_days = 7
+event_retention_days = 30
+```
+
 ## Cost tracking
 
 LLM-path calls go through LiteLLM, which exposes cost via the

@@ -241,6 +241,50 @@ async def test_events_append_and_list(store):
 
 
 @pytest.mark.asyncio
+async def test_purge_old_run_events_drops_only_old_ones(store):
+    """`purge_old_run_events` removes rows older than the cutoff and
+    leaves recent ones alone."""
+    from datetime import timedelta
+
+    await store.create_run(RunSpec(run_id="r", kind="agent"))
+    now = datetime.now(UTC)
+    old = RunEvent(run_id="r", seq=1, kind="start", payload={},
+                    ts=now - timedelta(days=60))
+    recent = RunEvent(run_id="r", seq=2, kind="finish", payload={},
+                       ts=now - timedelta(days=1))
+    await store.append_event(old)
+    await store.append_event(recent)
+
+    removed = await store.purge_old_run_events(max_age_days=30)
+    assert removed == 1
+    remaining = await store.list_events("r")
+    assert [e.kind for e in remaining] == ["finish"]
+
+
+@pytest.mark.asyncio
+async def test_purge_old_webhook_deliveries_keeps_pending(store):
+    """Pending webhooks must not be purged regardless of age — they
+    haven't reached a terminal state."""
+    from datetime import timedelta
+
+    # Inject one delivered, one failed, one pending — all aged past cutoff.
+    wid_d = await store.enqueue_webhook("https://h/", {"v": 1})
+    wid_f = await store.enqueue_webhook("https://h/", {"v": 2})
+    wid_p = await store.enqueue_webhook("https://h/", {"v": 3})
+    store._webhooks[wid_d].state = "delivered"
+    store._webhooks[wid_f].state = "failed"
+    store._webhooks[wid_p].state = "pending"
+    for wid in (wid_d, wid_f, wid_p):
+        store._webhooks[wid].created_at = datetime.now(UTC) - timedelta(days=30)
+
+    removed = await store.purge_old_webhook_deliveries(max_age_days=7)
+    assert removed == 2
+    assert wid_p in store._webhooks
+    assert wid_d not in store._webhooks
+    assert wid_f not in store._webhooks
+
+
+@pytest.mark.asyncio
 async def test_events_since_seq(store):
     await store.create_run(RunSpec(run_id="r", kind="agent"))
     for i in range(1, 6):

@@ -224,6 +224,41 @@ class LLMError(Exception):
         self.status_code = status_code
 
 
+def _classify_llm_status(status: int) -> str:
+    """Map an upstream HTTP status to aitelier's error taxonomy."""
+    if status == 429:
+        return "RateLimited"
+    if status in (401, 403):
+        return "AuthError"
+    if status >= 500:
+        return "ProviderError"
+    return "ProviderError"
+
+
+def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
+    """Build a sanitized error message from an upstream LiteLLM response.
+
+    The raw response body can contain provider names, model SKUs,
+    internal request IDs, or echoed API key fragments — all of which
+    leak to /v1/* consumers as 4xx/5xx response bodies in hosted mode.
+    We surface only status + a short canonical phrase so consumers can
+    branch on type and operators can correlate via the run row's
+    `error_msg` (and full body in the log).
+    """
+    canonical = {
+        "RateLimited":   "Upstream rate limit",
+        "AuthError":     "Upstream auth failure",
+        "ProviderError": "Upstream provider error",
+    }.get(_classify_llm_status(status), "Upstream provider error")
+    body_preview = resp.text[:500] if resp.text else ""
+    if body_preview:
+        logger.warning(
+            "Upstream %d (%s); response body: %s",
+            status, canonical, body_preview,
+        )
+    return f"{canonical} (HTTP {status})"
+
+
 # ---------------------------------------------------------------------------
 # Ollama bypass routing — direct /api/chat call for `local` and `ollama/*`
 # ---------------------------------------------------------------------------
@@ -487,10 +522,8 @@ async def chat_completion(
     if resp.status_code >= 400:
         _raise_for_preflight_response_format(body, resp)
         raise LLMError(
-            "ProviderError" if resp.status_code >= 500 else "RateLimited"
-            if resp.status_code == 429 else "AuthError"
-            if resp.status_code in (401, 403) else "ProviderError",
-            resp.text[:500],
+            _classify_llm_status(resp.status_code),
+            _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
     return resp.json()
@@ -596,9 +629,8 @@ async def chat_completion_stream(
             await resp.aread()
             _raise_for_preflight_response_format(body, resp)
             raise LLMError(
-                "RateLimited" if resp.status_code == 429 else "AuthError"
-                if resp.status_code in (401, 403) else "ProviderError",
-                resp.text[:500],
+                _classify_llm_status(resp.status_code),
+                _safe_upstream_message(resp.status_code, resp),
                 status_code=resp.status_code,
             )
         async for line in resp.aiter_lines():
@@ -636,8 +668,8 @@ async def embeddings(body: dict, *, timeout: int = 30) -> dict:
         raise LLMError(classify_error(exc), str(exc)) from exc
     if resp.status_code >= 400:
         raise LLMError(
-            "ProviderError",
-            resp.text[:500],
+            _classify_llm_status(resp.status_code),
+            _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
     return resp.json()
@@ -663,7 +695,8 @@ async def list_models() -> list[dict]:
         raise LLMError(classify_error(exc), str(exc)) from exc
     if resp.status_code != 200:
         raise LLMError(
-            "ProviderError", resp.text[:500],
+            _classify_llm_status(resp.status_code),
+            _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
     data = resp.json()

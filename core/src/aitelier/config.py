@@ -69,6 +69,17 @@ class ServiceConfig:
     `api_key`. Flip on only for dev workflows where aitelier and the
     webhook target both live on `localhost`. Setting it disables the
     SSRF guard entirely, so flip it off again before exposing the port."""
+    max_request_body_bytes: int = 4 * 1024 * 1024
+    """Per-request body size cap. Requests with Content-Length above
+    this return 413 before any handler runs, blocking memory-exhaustion
+    DoS via large POST bodies into idempotency hashing or JSON parsing.
+    Set to 0 to disable (only safe when a reverse proxy enforces a cap)."""
+    rate_limit_per_minute: int = 0
+    """In-process token bucket keyed by (api_key or remote_addr). 0 =
+    disabled (default; appropriate for localhost-trust mode). For hosted
+    deployments to multiple callers, set to a reasonable per-key budget
+    (e.g. 600). Returns 429 with Retry-After when exceeded. Excludes
+    /v1/health."""
 
 
 @dataclass
@@ -76,6 +87,23 @@ class DatabaseConfig:
     url: str | None = None
     """Postgres DSN, e.g. postgresql://aitelier:aitelier_local@localhost:5433/aitelier.
     None = fall back to InMemoryStore (dev only — no durable state)."""
+
+
+@dataclass
+class PurgeConfig:
+    interval_seconds: int = 3600
+    """How often the background purge worker wakes up to clean expired
+    idempotency keys, terminal webhook deliveries, and old run events.
+    Set to 0 to disable the worker entirely (the startup purge of
+    `runs` older than 30 days still runs)."""
+    webhook_retention_days: int = 7
+    """Drop webhook_deliveries rows in terminal states (delivered,
+    failed) older than this. Pending rows are kept regardless — they're
+    still waiting to be sent or have given up retrying."""
+    event_retention_days: int = 30
+    """Drop run_events older than this. Independent of the run row
+    purge; events for runs that survive the purge window still age out
+    on this clock."""
 
 
 @dataclass
@@ -134,6 +162,7 @@ class Config:
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
+    purge: PurgeConfig = field(default_factory=PurgeConfig)
     runs_dir: str = "runs"
 
 
@@ -215,6 +244,12 @@ def load_config(path: Path | None = None) -> Config:
                 "allow_loopback_webhooks",
                 ServiceConfig.allow_loopback_webhooks,
             ),
+            max_request_body_bytes=service.get(
+                "max_request_body_bytes", ServiceConfig.max_request_body_bytes,
+            ),
+            rate_limit_per_minute=service.get(
+                "rate_limit_per_minute", ServiceConfig.rate_limit_per_minute,
+            ),
         ),
         ollama=OllamaConfig(
             mode=ollama.get("mode", OllamaConfig.mode),
@@ -226,6 +261,17 @@ def load_config(path: Path | None = None) -> Config:
         ),
         storage=StorageConfig(
             max_metadata_bytes=storage.get("max_metadata_bytes", StorageConfig.max_metadata_bytes),
+        ),
+        purge=PurgeConfig(
+            interval_seconds=_section("purge").get(
+                "interval_seconds", PurgeConfig.interval_seconds,
+            ),
+            webhook_retention_days=_section("purge").get(
+                "webhook_retention_days", PurgeConfig.webhook_retention_days,
+            ),
+            event_retention_days=_section("purge").get(
+                "event_retention_days", PurgeConfig.event_retention_days,
+            ),
         ),
         runs_dir=raw.get("runs_dir", "runs"),
     )
