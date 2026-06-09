@@ -28,6 +28,17 @@ def hash_system_prompt(system_prompt: str | None) -> str | None:
     return hashlib.sha256(system_prompt.encode()).hexdigest()[:16]
 
 
+async def start_run(spec: RunSpec) -> None:
+    """Persist a fresh run and transition to `running`. Used by streaming
+    paths that own their own state machine — `record_run` handles the
+    `pending → running → terminal` lifecycle for non-streaming flows,
+    but streaming generators need to yield chunks before the terminal
+    state is known and so finalize separately."""
+    store = await get_store()
+    await store.create_run(spec)
+    await store.update_run_state(spec.run_id, "running")
+
+
 async def record_run(spec: RunSpec, work: Awaitable[dict[str, Any]]) -> dict:
     """Persist a run around an awaitable. Single state-machine path.
 

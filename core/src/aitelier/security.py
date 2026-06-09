@@ -4,8 +4,32 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import re
 import socket
 from urllib.parse import urlparse
+
+from fastapi import HTTPException
+
+_PATH_COMPONENT_CHARSET = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+
+
+def validate_path_component(value: str, label: str) -> None:
+    """Reject path traversal in user-supplied URL path segments.
+
+    Whitelisted charset + explicit `..` ban. Used wherever a segment of
+    a `/v1/<…>/{name}` route is concatenated into a filesystem path or
+    a downstream URL — `run_id`, `schedule_id`, schema name, agent
+    name, etc.
+    """
+    if not _PATH_COMPONENT_CHARSET.match(value):
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: {value!r}",
+        )
+    if ".." in value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {label}: path traversal not allowed",
+        )
 
 
 def _is_public_addr(addr: str) -> bool:

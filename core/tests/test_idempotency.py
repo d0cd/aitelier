@@ -178,7 +178,7 @@ def test_idempotent_replay_for_retry_scenario(client, monkeypatch):
             return {"exit_code": 0, "stdout": "", "stderr": ""}
         return {}
 
-    monkeypatch.setattr("aitelier.server._sa_proxy", stub_sa_proxy)
+    monkeypatch.setattr("aitelier.sandbox_proxy.sa_proxy", stub_sa_proxy)
 
     headers = {"Idempotency-Key": "retry-uuid-1"}
     body = {
