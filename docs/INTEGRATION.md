@@ -1110,6 +1110,39 @@ Warden network policy provide isolation. A sample
 workspace mount declarations, ingress on :7777, and the recommended
 `policy.allow` list.
 
+### Test coverage for deployment modes
+
+Three tiers, ordered by cost:
+
+1. **Shape validation** (`core/tests/test_deploy_samples.py`) — runs
+   on every CI commit. Parses `docs/deploy/aitelier.cell.yaml`,
+   checks required brig keys (`name`, `image`, `command`, `network`,
+   `policy.allow`, `ingress.port == 7777`, …), validates
+   `docker/sandbox-agent.Dockerfile` mentions the Rivet install URL +
+   `EXPOSE 2468`, and asserts the compose `sa` profile is opt-in.
+   ~10 ms; pure file inspection.
+
+2. **Docker image build smoke** (`make test-docker-build`, also a CI
+   job) — runs `docker compose --profile sa build sandbox-agent`
+   without starting the container. ~30 s on CI. Catches: stale Rivet
+   install URL, base-image regression, apk dependency drift. Skips
+   cleanly if `docker` isn't on PATH.
+
+3. **Full e2e against Docker SA** (`./scripts/test-docker-mode.sh` or
+   `make test-docker-mode-e2e`) — **destructive, manual only**.
+   Stops your running aitelier + host SA, swaps `aitelier.toml` to
+   `mode = "docker"`, builds the SA image, brings the compose `sa`
+   profile up, and runs the full live test suite against it. Restores
+   the original config + restarts in the original mode on exit.
+   Requires Docker + real LLM credentials. Not in CI.
+
+**Brig-mode e2e is intentionally not in this repo's CI.** Brig
+isn't on PyPI / homebrew / a CI-installable artifact registry; setting
+it up in GitHub Actions is impractical. The user-side integration
+testing (your hermes-in-brig and dispatcher-in-brig deployments
+talking to an aitelier cell) IS the brig e2e suite — that signal
+lives in those projects' CI, not here.
+
 ## Cost tracking
 
 LLM-path calls go through LiteLLM, which exposes cost via the

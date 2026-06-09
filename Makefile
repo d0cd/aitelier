@@ -21,6 +21,25 @@ test-py:
 test-ts:
 	cd sdks/typescript && npx tsc --noEmit && npx vitest run
 
+# Build the Sandbox Agent image without starting the container — catches
+# Dockerfile breakage (stale Rivet install URL, bad base image, apk drift).
+# Skips cleanly if `docker` isn't on PATH.
+test-docker-build:
+	@if command -v docker >/dev/null 2>&1; then \
+		echo "=== Building sandbox-agent image (smoke) ==="; \
+		cd docker && docker compose --profile sa build sandbox-agent; \
+	else \
+		echo "  docker not installed — skipping test-docker-build"; \
+	fi
+
+# Full end-to-end against Sandbox Agent running in Docker. Destructive:
+# stops your running host-mode SA, swaps the active aitelier config to
+# `mode = "docker"`, runs the live suite against the Docker-hosted SA,
+# then restores the original config and restarts. Run manually only:
+#   make test-docker-mode-e2e
+test-docker-mode-e2e:
+	@./scripts/test-docker-mode.sh
+
 # End-to-end tests against a running aitelier. Boot the stack first
 # (`make start`), then `make test-live`. Auto-skipped without env var.
 test-live:

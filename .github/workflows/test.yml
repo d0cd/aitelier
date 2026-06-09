@@ -42,3 +42,19 @@ jobs:
         run: |
           uv run pytest core/tests/ sdks/python/tests/ -v --ignore=core/tests/smoke_test.py
           cd sdks/typescript && npx tsc --noEmit
+
+  docker-build:
+    # Smoke build of docker/sandbox-agent.Dockerfile to catch stale Rivet
+    # install URLs / base-image breakage. Doesn't run the container —
+    # full Docker-mode e2e is `./scripts/test-docker-mode.sh` (manual,
+    # destructive, needs LLM credentials).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build sandbox-agent image
+        working-directory: docker
+        run: docker compose --profile sa build sandbox-agent
