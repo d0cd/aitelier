@@ -45,6 +45,15 @@ class AitelierAgentOpts(BaseModel):
     mcp_servers: list[dict] | None = Field(default=None, max_length=32)
     tool_allowlist: list[str] | None = Field(default=None, max_length=256)
     max_turns: int | None = None
+    plan_mode: bool | None = None
+    """Whether the inner agent should enter plan-before-act mode. Codex
+    and cursor default `planMode: true` (interactive deliberation) which
+    blocks batch callers; claude has no plan mode and just executes.
+    Set explicitly per-request to override the backend default — `false`
+    for batch/non-interactive callers, `true` for interactive UX over
+    a deliberation-capable backend. Omit to inherit the backend default.
+    Plumbed through to ACP `session/set_config_option("planMode", value)`;
+    backends that don't recognize the option ignore it silently."""
     prepare: dict | None = None
     artifacts: dict | None = None
     trace_tag: str | None = None
@@ -77,9 +86,11 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     temperature: float | None = None
     max_tokens: int | None = None
+    max_completion_tokens: int | None = None
     top_p: float | None = None
     n: int | None = None
     response_format: dict | None = None
+    reasoning_effort: str | None = None
     tools: list[dict] | None = None
     tool_choice: Any = None
     user: str | None = None

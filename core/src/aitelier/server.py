@@ -989,6 +989,7 @@ async def _agent_chat_completion(
             tool_allowlist=opts.tool_allowlist,
             response_format=req.response_format,
             max_turns=opts.max_turns,
+            plan_mode=opts.plan_mode,
             agent_model=inner_llm,
             timeout=req.timeout or 600,
             run_id=run_id,
@@ -1063,6 +1064,7 @@ async def _producer_for_acp_stream(
             tool_allowlist=opts.tool_allowlist,
             response_format=req.response_format,
             max_turns=opts.max_turns,
+            plan_mode=opts.plan_mode,
             agent_model=inner_llm,
             timeout=req.timeout or 600,
             run_id=run_id,
@@ -1424,7 +1426,8 @@ def _http_status_for_llm_error(exc: LLMError) -> int:
 def _llm_body_from_request(req: ChatCompletionRequest) -> dict:
     body: dict[str, Any] = {"model": req.model, "messages": req.messages}
     for field in (
-        "temperature", "max_tokens", "top_p", "n", "response_format",
+        "temperature", "max_tokens", "max_completion_tokens",
+        "top_p", "n", "response_format", "reasoning_effort",
         "tool_choice", "user", "stream_options", "seed",
         "frequency_penalty", "presence_penalty", "stop",
         "logprobs", "top_logprobs",
@@ -2189,12 +2192,38 @@ _KNOWN_LIMITATIONS = [
 
 @app.get("/v1/health")
 async def health() -> dict:
-    return {
-        "status": "ok",
+    """Liveness probe. Cheap by design — k8s and load balancers hit
+    this on a tight cadence.
+
+    Surfaces a `dependencies` summary opportunistically from the
+    discovery cache (no fresh probes here — `/v1/discovery` is the
+    place to force a refresh). When the cache is warm, `status` flips
+    to `"degraded"` if any tracked dep is unreachable. When the cache
+    is empty (cold-start, before discovery has been called),
+    `dependencies` is omitted entirely and `status` stays `"ok"`.
+    """
+    deps_summary: dict | None = None
+    status = "ok"
+    cached = _discovery_cache["value"]
+    if isinstance(cached, dict):
+        deps = cached.get("dependencies") or {}
+        deps_summary = {
+            name: {"reachable": bool(info.get("reachable"))}
+            for name, info in deps.items()
+            if isinstance(info, dict)
+        }
+        if any(not v["reachable"] for v in deps_summary.values()):
+            status = "degraded"
+
+    body: dict[str, Any] = {
+        "status": status,
         "version": "0.1.0",
         "timestamp": _now_iso(),
         "known_limitations": _KNOWN_LIMITATIONS,
     }
+    if deps_summary is not None:
+        body["dependencies"] = deps_summary
+    return body
 
 
 @app.get("/v1/metrics")

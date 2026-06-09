@@ -27,6 +27,10 @@
       "minimum": 1,
       "description": "Cap on agent reasoning turns. Sent as `session/set_config_option maxTurns`."
     },
+    "plan_mode": {
+      "type": ["boolean", "null"],
+      "description": "Whether the inner agent should deliberate before acting. Codex / cursor default `true` (interactive); claude has no plan mode and just executes. Set `false` for batch / non-interactive callers, `true` for deliberation. Sent as `session/set_config_option planMode`. Backends that don't recognize it ignore silently."
+    },
     "prepare": {
       "type": ["object", "null"],
       "description": "Pre-flight sandbox setup. Shape: {install_agents, commands, files, sidecars}. Each phase runs in order; a failure aborts before the agent starts.",

@@ -383,6 +383,7 @@ async def _open_acp_session(
     agent_model: str | None,
     tool_allowlist: list[str] | None,
     max_turns: int | None,
+    plan_mode: bool | None = None,
     run_id: str = "",
 ) -> str:
     """Drive the ACP handshake up to a usable session_id.
@@ -449,7 +450,10 @@ async def _open_acp_session(
         ("model", agent_model),
         ("allowedTools", tool_allowlist),
         ("maxTurns", max_turns),
+        ("planMode", plan_mode),
     ):
+        # `False` is a meaningful value for planMode — don't filter it
+        # the way None / "" / [] are filtered.
         if value is None or value == "" or value == []:
             continue
         try:
@@ -516,6 +520,7 @@ async def call_via_sandbox(
     tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
     max_turns: int | None = None,
+    plan_mode: bool | None = None,
     agent_model: str | None = None,
     timeout: int = 600,
     run_id: str = "",
@@ -542,7 +547,8 @@ async def call_via_sandbox(
                 workspace=workspace, system_prompt=system_prompt,
                 mcp_servers=mcp_servers, tool_allowlist=tool_allowlist,
                 response_format=response_format, max_turns=max_turns,
-                agent_model=agent_model, timeout=timeout, run_id=run_id,
+                plan_mode=plan_mode, agent_model=agent_model,
+                timeout=timeout, run_id=run_id,
             ):
                 etype = event.get("type")
                 if etype == "done":
@@ -624,6 +630,7 @@ async def call_via_sandbox_stream(
     tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
     max_turns: int | None = None,
+    plan_mode: bool | None = None,
     agent_model: str | None = None,
     timeout: int = 600,
     run_id: str = "",
@@ -668,7 +675,7 @@ async def call_via_sandbox_stream(
                     workspace=workspace, mcp_servers=mcp_servers,
                     system_prompt=system_prompt, agent_model=agent_model,
                     tool_allowlist=tool_allowlist, max_turns=max_turns,
-                    run_id=run_id,
+                    plan_mode=plan_mode, run_id=run_id,
                 )
                 prompt_task = asyncio.create_task(client.call(
                     "session/prompt",

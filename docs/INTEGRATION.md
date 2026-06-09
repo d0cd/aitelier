@@ -263,8 +263,8 @@ The `aitelier` namespace is **only accepted when `model` starts with `agent:`** 
 The `aitelier` block is `additionalProperties: false` — see
 [`/v1/schemas/aitelier_request`](http://localhost:7777/v1/schemas/aitelier_request)
 for the authoritative field list. The accepted properties are exactly:
-`workspace, mcp_servers, tool_allowlist, max_turns, prepare, artifacts,
-trace_tag, parent_run_id, examples, allow_tool_drop`. Anything else (including
+`workspace, mcp_servers, tool_allowlist, max_turns, plan_mode, prepare,
+artifacts, trace_tag, parent_run_id, examples, allow_tool_drop`. Anything else (including
 common-misplacement candidates like `timeout`, `model`, `messages`,
 `stream`) is rejected.
 
@@ -290,6 +290,30 @@ option, and putting it there errors out under the strict schema.
 Both SDKs map this correctly: TS `submitRun({timeout: 300})` writes
 `body.timeout`, Python `submit_run(..., timeout=300)` writes
 `body["timeout"]`. If you handcraft requests, mirror that placement.
+
+#### `aitelier.plan_mode` for batch / non-interactive callers
+
+`codex` and `cursor` default to `planMode: true` — they deliberate
+and ask clarifying questions before acting. Useful for interactive
+UX, blocking for batch workloads ("summarize this doc and return
+JSON"). `claude` has no plan mode and just executes.
+
+Set `aitelier.plan_mode = false` to force immediate execution on
+deliberation-capable backends. Plumbed through ACP as
+`session/set_config_option("planMode", false)`. Backends that don't
+recognize the option ignore it silently — safe to set on every
+agent-path call.
+
+```jsonc
+{
+  "model": "agent:codex",
+  "messages": [...],
+  "aitelier": { "plan_mode": false }
+}
+```
+
+Omit to inherit the backend default. Symmetric with `max_turns` —
+caller specifies what it needs.
 
 #### Multi-turn history
 

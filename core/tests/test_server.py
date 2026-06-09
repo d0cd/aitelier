@@ -527,6 +527,68 @@ def test_chat_completions_rejects_oversized_tool_allowlist(client):
     assert "tool_allowlist" in resp.text
 
 
+def test_chat_completions_accepts_reasoning_effort_field():
+    """OpenAI reasoning-model knobs reasoning_effort and
+    max_completion_tokens must round-trip into the LiteLLM body."""
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _llm_body_from_request
+
+    req = ChatCompletionRequest(
+        model="local", messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="medium", max_completion_tokens=500,
+    )
+    body = _llm_body_from_request(req)
+    assert body["reasoning_effort"] == "medium"
+    assert body["max_completion_tokens"] == 500
+
+
+def test_aitelier_agent_opts_plan_mode_round_trips():
+    """plan_mode accepts bool | None and feeds into _open_acp_session
+    as planMode (via call_via_sandbox kwargs)."""
+    from aitelier.openai_compat import AitelierAgentOpts
+    assert AitelierAgentOpts(plan_mode=False).plan_mode is False
+    assert AitelierAgentOpts(plan_mode=True).plan_mode is True
+    assert AitelierAgentOpts().plan_mode is None
+
+
+def test_health_includes_dependencies_when_discovery_cache_warm(client):
+    """When /v1/discovery has populated the cache, /v1/health surfaces
+    a deps summary and flips status to "degraded" if any dep is down."""
+    from aitelier.server import _discovery_cache
+    original = dict(_discovery_cache)
+    _discovery_cache["value"] = {
+        "dependencies": {
+            "litellm": {"reachable": True},
+            "sandbox_agent": {"reachable": False, "reason": "down"},
+        },
+    }
+    _discovery_cache["at"] = 1.0
+    try:
+        resp = client.get("/v1/health")
+        body = resp.json()
+        assert body["status"] == "degraded"
+        assert body["dependencies"]["litellm"]["reachable"] is True
+        assert body["dependencies"]["sandbox_agent"]["reachable"] is False
+    finally:
+        _discovery_cache.update(original)
+
+
+def test_health_omits_dependencies_when_cache_empty(client):
+    """Cold-start /v1/health never blocks on dep probes; the field is
+    just absent until /v1/discovery has been hit at least once."""
+    from aitelier.server import _discovery_cache
+    original = dict(_discovery_cache)
+    _discovery_cache["value"] = None
+    _discovery_cache["at"] = 0.0
+    try:
+        resp = client.get("/v1/health")
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert "dependencies" not in body
+    finally:
+        _discovery_cache.update(original)
+
+
 def test_body_size_middleware_rejects_negative_content_length(client):
     """Negative Content-Length (Content-Length: -1) must 413, not pass."""
     from aitelier.config import get_config
