@@ -42,15 +42,18 @@ base_url = "http://localhost:2468"
 # starts a containerized Ollama via the compose `ollama` profile.
 mode = "host"   # "host" | "docker"
 # base_url = "http://my-ollama:11434"   # optional override; otherwise derived from mode
+default_model = "qwen3:8b"             # which model the `local` alias resolves to
 
 [service]
 host = "127.0.0.1"
 port = 7777
-log_format = "human"   # "json" for one-line-per-record aggregator-friendly logs
+log_format = "human"           # "json" for one-line-per-record aggregator-friendly logs
+max_in_flight_runs = 32        # 503 when exceeded; 0 disables the cap
+allow_loopback_webhooks = false  # opt-in for dev when webhook target is on localhost
 # api_key + webhook_secret go in aitelier.secrets.toml:
 #   [service]
-#   api_key = "replace-me"        # enables hosted-mode Bearer auth on /v1/*
-#   webhook_secret = "..."        # HMAC signing for outbound webhooks
+#   api_key = "replace-me"     # enables hosted-mode Bearer auth on /v1/*
+#   webhook_secret = "..."     # HMAC signing for outbound webhooks
 
 [storage]
 # Cap on JSON-encoded run metadata size. Aitelier persists the whole dict as

@@ -109,6 +109,7 @@ class Run(BaseModel):
     cost_usd: float | None = None
     finish_reason: str | None = None
     tool_call_count: int = 0
+    system_prompt_hash: str | None = None
     status: str | None = None
     error_type: str | None = None
     error_msg: str | None = None

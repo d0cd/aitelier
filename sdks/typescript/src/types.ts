@@ -94,6 +94,7 @@ export interface Run {
   endedAt?: string | null;
   traceTag?: string | null;
   correlationId?: string | null;
+  parentRunId?: string | null;
   sandboxBackend?: string | null;
   sandboxUrl?: string | null;
   sandboxServerId?: string | null;
@@ -105,9 +106,11 @@ export interface Run {
   costUsd?: number | null;
   finishReason?: string | null;
   toolCallCount?: number;
+  systemPromptHash?: string | null;
   status?: "ok" | "error" | "cancelled" | null;
   errorType?: string | null;
   errorMsg?: string | null;
+  result?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 }
 

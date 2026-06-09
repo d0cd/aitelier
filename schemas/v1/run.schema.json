@@ -36,6 +36,8 @@
     "status":            { "type": ["string", "null"], "enum": ["ok", "error", "cancelled", null] },
     "error_type":        { "type": ["string", "null"] },
     "error_msg":         { "type": ["string", "null"] },
+    "system_prompt_hash":{ "type": ["string", "null"], "description": "SHA-256 of the system prompt actually sent to the provider; lets dashboards group runs by prompt variant." },
+    "result":            { "type": "object", "description": "Final result payload from the run. For LLM/embed kinds: the OpenAI-shape response body. For agent kinds: the aggregated done event (content, finish_reason, usage, tool_calls). Empty object if the run hasn't reached a terminal state." },
     "metadata":          { "type": "object" }
   }
 }

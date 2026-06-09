@@ -148,6 +148,30 @@ async def test_list_active_runs():
 
 
 @pytest.mark.asyncio
+async def test_wait_for_run_posts_with_timeout_params():
+    sdk = Aitelier()
+    fake = _stub_http(sdk, {
+        "run_id": "abc", "state": "completed", "kind": "agent",
+    })
+    run = await sdk.wait_for_run("abc", timeout=10, poll_interval=0.25)
+    assert run.run_id == "abc"
+    assert run.state == "completed"
+    args, kwargs = fake.post.call_args
+    assert args[0] == "/v1/runs/abc/wait"
+    assert kwargs["params"] == {"timeout": 10, "poll_interval": 0.25}
+
+
+@pytest.mark.asyncio
+async def test_list_runs_passes_parent_run_id_filter():
+    sdk = Aitelier()
+    fake = _stub_http(sdk, [])
+    await sdk.list_runs(parent_run_id="parent-1", limit=10)
+    _, kwargs = fake.get.call_args
+    assert kwargs["params"]["parent_run_id"] == "parent-1"
+    assert kwargs["params"]["limit"] == 10
+
+
+@pytest.mark.asyncio
 async def test_discovery():
     sdk = Aitelier()
     fake_disc = {

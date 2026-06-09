@@ -94,6 +94,49 @@ describe("control plane", () => {
     expect(active.active).toEqual(["r-x"]);
   });
 
+  it("waitForRun POSTs to /v1/runs/{id}/wait with timeout params", async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: true, status: 200,
+        json: async () => ({ run_id: "r-1", state: "completed", kind: "agent" }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://example" });
+    const run = await c.waitForRun("r-1", { timeoutSeconds: 30, pollIntervalSeconds: 1 });
+    expect(run.runId).toBe("r-1");
+    expect(run.state).toBe("completed");
+    expect(calls[0].url).toBe("http://example/v1/runs/r-1/wait?timeout=30&poll_interval=1");
+    expect(calls[0].init?.method).toBe("POST");
+  });
+
+  it("waitForRun surfaces 408 timeout responses", async () => {
+    globalThis.fetch = mockFetch({
+      ok: false, status: 408, text: "still running",
+    });
+    const c = new Aitelier({ baseUrl: "http://example" });
+    await expect(c.waitForRun("r-1", { timeoutSeconds: 1 }))
+      .rejects.toThrow(/408/);
+  });
+
+  it("listRuns serializes parentRunId into query string", async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: true, status: 200,
+        json: async () => ([]),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://example" });
+    await c.listRuns({ parentRunId: "parent-1", limit: 10 });
+    expect(calls[0].url).toContain("parent_run_id=parent-1");
+    expect(calls[0].url).toContain("limit=10");
+  });
+
   it("listSchedules hits GET /v1/schedules", async () => {
     globalThis.fetch = mockFetch({ ok: true, json: [] });
     const c = new Aitelier({ baseUrl: "http://example" });
