@@ -185,6 +185,7 @@ async def _schedule_handler(entry: dict) -> None:
     try:
         req = ChatCompletionRequest(**task)
         route, agent_backend, inner_llm = parse_model_route(req.model)
+        _validate_aitelier_opts(req, agent_path=(route == "agent"))
         if route == "agent":
             result = await _agent_chat_completion(
                 req, _FakeRequest(),  # type: ignore[arg-type]
@@ -866,13 +867,41 @@ def _reject_agent_incompatible_fields(req: ChatCompletionRequest) -> None:
 
 
 def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> None:
-    """Refuse aitelier.* on the LLM path. The namespace is agent-specific."""
+    """Refuse aitelier.* on the LLM path. The namespace is agent-specific.
+
+    On the agent path, also runs the workspace + artifacts + prepare.files
+    path checks at the request boundary. The checks bound what aitelier
+    hands to SA — they do not constrain the agent's own tool calls
+    (claude-code's `Read`, `Bash`, etc., which traverse SA's filesystem
+    layer directly). A complete fix for symlink-follow inside the agent's
+    tool surface lives in SA (track upstream brig safe_open adoption).
+    """
     if req.aitelier is not None and not agent_path:
         raise HTTPException(
             status_code=400,
             detail="`aitelier.*` options are only valid when model starts "
                    "with `agent:`.",
         )
+    if not agent_path or req.aitelier is None:
+        return
+
+    from aitelier.security import validate_workspace_path
+    roots = get_config().service.allowed_workspace_roots or None
+
+    opts = req.aitelier
+    validate_workspace_path(opts.workspace, roots=roots, label="aitelier.workspace")
+
+    if opts.prepare:
+        for f in opts.prepare.get("files") or []:
+            validate_workspace_path(
+                f.get("path"), roots=roots,
+                label="aitelier.prepare.files[].path",
+            )
+    if opts.artifacts:
+        for p in opts.artifacts.get("fetch") or []:
+            validate_workspace_path(
+                p, roots=roots, label="aitelier.artifacts.fetch[]",
+            )
 
 
 async def _agent_chat_completion(
@@ -1717,6 +1746,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
                    "'agent:<backend>[/<inner-llm>]', or use "
                    "/v1/chat/completions for LLM calls.",
         )
+    _validate_aitelier_opts(req, agent_path=True)
     _reject_if_saturated()
 
     cid = request.state.correlation_id

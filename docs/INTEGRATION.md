@@ -1011,7 +1011,39 @@ max_in_flight_runs = 32
 interval_seconds = 3600
 webhook_retention_days = 7
 event_retention_days = 30
+
+[service]
+# For brig-cell or any deployment where you want to bound what host
+# paths consumers can hand to the agent. Empty (default) = no allowlist.
+allowed_workspace_roots = ["/var/lib/aitelier/workspaces"]
 ```
+
+### Workspace + artifact path validation
+
+`aitelier.workspace`, `aitelier.artifacts.fetch[*]`, and
+`aitelier.prepare.files[*].path` are validated at the request boundary
+on every agent-path call:
+
+- **`..` components are refused** regardless of resolved location.
+- **Symlinked components are refused** when the path is absolute.
+  Stops the trivial "consumer hands aitelier a workspace that points
+  through a symlink to `/etc`" vector. Once the path is resolved on
+  dispatch, every component (including the leaf) must be a real
+  directory or file.
+- **Allowlist** (`service.allowed_workspace_roots`) — when set, the
+  resolved path must be a descendant of one of the listed roots. For
+  brig-cell deployments, set this to the cell's workspace mount root
+  (`/Users/<u>/.brig/state/<cell>/workspace`).
+
+**What this does *not* fix:** the agent's own filesystem tool calls
+(claude-code's `Read`, `Bash`, etc.) bypass aitelier and go directly
+through the Sandbox Agent's filesystem layer. A symlink *inside* the
+workspace pointing outside the workspace will still be followed by
+the agent's `Read` tool. The complete fix lives in Sandbox Agent —
+brig ships a `safe_open(cell, relpath)` primitive that walks path
+components with `O_NOFOLLOW`; SA needs to adopt it. Until that lands,
+the application-side defense here is the consumer's first layer; a
+mount-side `nosymfollow` (podman 5.x) closes the bug class entirely.
 
 ## Cost tracking
 

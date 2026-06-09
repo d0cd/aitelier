@@ -80,6 +80,13 @@ class ServiceConfig:
     deployments to multiple callers, set to a reasonable per-key budget
     (e.g. 600). Returns 429 with Retry-After when exceeded. Excludes
     /v1/health."""
+    allowed_workspace_roots: list[str] = field(default_factory=list)
+    """Allowlist of host paths that `aitelier.workspace`,
+    `aitelier.artifacts.fetch[*]`, and `aitelier.prepare.files[*].path`
+    may resolve under. Empty list = no allowlist (current behavior).
+    Independent of the always-on symlink-component refusal — this is
+    the second layer that pins agent workspaces to declared roots.
+    For a brig-cell deployment, set to the cell's workspace mount."""
 
 
 @dataclass
@@ -254,6 +261,9 @@ def load_config(path: Path | None = None) -> Config:
             rate_limit_per_minute=service.get(
                 "rate_limit_per_minute", ServiceConfig.rate_limit_per_minute,
             ),
+            allowed_workspace_roots=list(service.get(
+                "allowed_workspace_roots", [],
+            ) or []),
         ),
         ollama=OllamaConfig(
             mode=ollama.get("mode", OllamaConfig.mode),

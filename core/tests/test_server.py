@@ -372,6 +372,82 @@ def test_validate_path_component_length_cap():
         validate_path_component("a" * 300, "run_id")
 
 
+def test_validate_workspace_path_rejects_dotdot():
+    """`..` is refused regardless of resolved location."""
+    from aitelier.security import validate_workspace_path
+    with pytest.raises(Exception, match="\\.\\."):
+        validate_workspace_path("/tmp/foo/../bar", roots=None)
+
+
+def test_validate_workspace_path_allowlist_enforced(tmp_path):
+    """When roots is set, the resolved path must be a descendant."""
+    from aitelier.security import validate_workspace_path
+    # Under root → ok
+    nested = tmp_path / "ws"
+    nested.mkdir()
+    validate_workspace_path(str(nested), roots=[str(tmp_path)])
+    # Outside root → 400. Pick a sibling tmp path that doesn't traverse
+    # any symlinks (macOS resolves /etc → /private/etc, which trips the
+    # earlier symlink check; we want to exercise the allowlist branch).
+    outside = tmp_path.parent / "another-root-that-isnt-allowlisted"
+    outside.mkdir(exist_ok=True)
+    try:
+        with pytest.raises(Exception, match="allowed_workspace_roots"):
+            validate_workspace_path(str(outside), roots=[str(tmp_path)])
+    finally:
+        outside.rmdir()
+
+
+def test_validate_workspace_path_rejects_symlinked_component(tmp_path):
+    """A workspace whose path traverses a symlink is refused — even
+    if the final target is benign."""
+    from aitelier.security import validate_workspace_path
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    # Through the symlink: refused.
+    with pytest.raises(Exception, match="symlinked component"):
+        validate_workspace_path(str(link), roots=None)
+    # Direct: accepted.
+    validate_workspace_path(str(real), roots=None)
+
+
+def test_chat_completions_rejects_workspace_dotdot(client):
+    """The same validator runs at request boundary on /v1/chat/completions."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"workspace": "/tmp/x/../etc"},
+    })
+    assert resp.status_code == 400
+    assert "aitelier.workspace" in resp.text
+
+
+def test_chat_completions_rejects_artifacts_fetch_dotdot(client):
+    """`aitelier.artifacts.fetch[*]` paths are also validated."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"artifacts": {"fetch": ["/tmp/ws/../etc/passwd"]}},
+    })
+    assert resp.status_code == 400
+    assert "aitelier.artifacts.fetch" in resp.text
+
+
+def test_chat_completions_rejects_prepare_files_dotdot(client):
+    """`aitelier.prepare.files[*].path` is also validated."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "x"}],
+        "aitelier": {"prepare": {"files": [
+            {"path": "/tmp/ws/../etc/cron.d/evil", "content": "x"},
+        ]}},
+    })
+    assert resp.status_code == 400
+    assert "aitelier.prepare.files" in resp.text
+
+
 def test_body_size_middleware_rejects_negative_content_length(client):
     """Negative Content-Length (Content-Length: -1) must 413, not pass."""
     from aitelier.config import get_config
