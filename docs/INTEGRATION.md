@@ -381,8 +381,7 @@ Every non-streaming response (and every SSE chunk) carries three IDs:
 | Field | Meaning |
 |---|---|
 | `id` | OpenAI chat-completion id — `chatcmpl-<run_id>`. Set by aitelier so an OpenAI client's correlation logic works against aitelier responses. |
-| `aitelier_run_id` | The aitelier run id. Use this to fetch `/v1/runs/{id}`, `/v1/runs/{id}/events`, or `/v1/runs/{id}/cancel`. |
-| `aitelier_trace_id` | The trace id used in `/v1/traces` queries. Today this is always equal to `aitelier_run_id` — one trace per run. Kept as a separate field so future divergence (e.g., grouping retried runs under one trace) doesn't break consumers. |
+| `aitelier_run_id` | The aitelier run id. Use this to fetch `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/cancel`, or `/v1/traces/{id}` (trace id == run id; one trace per run). |
 
 ### aitelier-specific response signals
 
@@ -436,8 +435,8 @@ Set `stream: true`. The response is OpenAI-compatible SSE.
   (`tool_call`, `tool_result`, `thought`, …) lives at
   `GET /v1/runs/{id}/events`.
 
-Every chunk carries `aitelier_run_id`, `aitelier_trace_id`, and `correlation_id`
-so consumers can correlate without parsing the body.
+Every chunk carries `aitelier_run_id` and `correlation_id` so consumers
+can correlate without parsing the body.
 
 **Keepalive cadence.** During silent agent-planning phases — including
 phases where the inner agent is emitting tool-call events that aitelier

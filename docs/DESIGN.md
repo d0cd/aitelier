@@ -168,9 +168,9 @@ decides LLM vs agent path — no named-task lookup, no fanout, no diffing.
 ### Result shape
 
 Inference responses are **OpenAI's** ChatCompletion / ChatCompletionChunk /
-CreateEmbeddingResponse shapes, extended with three aitelier fields stamped
-onto every response: `aitelier_run_id`, `aitelier_trace_id`,
-`correlation_id`. Schema is documented at
+CreateEmbeddingResponse shapes, extended with two aitelier fields stamped
+onto every response: `aitelier_run_id` and `correlation_id`. Schema is
+documented at
 [platform.openai.com](https://platform.openai.com/docs/api-reference).
 
 Internal sandbox-agent results (the dicts `call_via_sandbox` returns) are

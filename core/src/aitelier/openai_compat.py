@@ -245,7 +245,6 @@ def agent_result_to_chat_completion(
         },
         # aitelier extensions — non-standard but harmless to OpenAI clients.
         "aitelier_run_id": result.get("run_id") or run_id,
-        "aitelier_trace_id": result.get("trace_id") or run_id,
     }
     # Saves the consumer's `/v1/runs/{id}/events` roundtrip for the common
     # "did the agent use my tools?" question. Empty list when nothing fired.

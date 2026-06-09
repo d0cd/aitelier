@@ -725,6 +725,36 @@ def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> st
     return f"{system_prompt}\n\n{section}" if system_prompt else section
 
 
+def _fold_response_format(
+    system_prompt: str | None, response_format: dict | None,
+) -> str | None:
+    """Best-effort schema enforcement for the agent path.
+
+    The ACP `session/prompt.responseFormat` parameter is passed through
+    to the backend, but coding-agent backends (claude-code, codex) often
+    ignore it. To raise the floor, the JSON Schema is also rendered into
+    the system prompt as text — agents that read instructions in plain
+    English will conform without needing native schema support.
+
+    Best-effort, not guaranteed. Consumers needing hard enforcement
+    should run the response through their own validator and surface a
+    typed retry.
+    """
+    if not response_format or response_format.get("type") != "json_schema":
+        return system_prompt
+    schema = response_format.get("schema") or response_format.get("json_schema")
+    if not schema:
+        return system_prompt
+    section = (
+        "## Required output format\n\n"
+        "Your final assistant message MUST be a JSON object conforming "
+        "exactly to this JSON Schema. Emit only the JSON object, with "
+        "no prose, code fences, or commentary.\n\n"
+        f"{json.dumps(schema, indent=2)}"
+    )
+    return f"{system_prompt}\n\n{section}" if system_prompt else section
+
+
 def _translate_messages(messages: list[dict]) -> tuple[str | None, str]:
     """Map OpenAI `messages` → aitelier's (system_prompt, initial_message).
 
@@ -849,6 +879,7 @@ async def _agent_chat_completion(
 
     system_prompt, initial_message = _translate_messages(req.messages)
     system_prompt = _fold_examples(system_prompt, opts.examples)
+    system_prompt = _fold_response_format(system_prompt, req.response_format)
 
     prep_result = await _run_prepare(opts.prepare)
     if prep_result.get("error"):
@@ -1094,6 +1125,7 @@ async def _agent_chat_completion_stream(
 
     system_prompt, initial_message = _translate_messages(req.messages)
     system_prompt = _fold_examples(system_prompt, opts.examples)
+    system_prompt = _fold_response_format(system_prompt, req.response_format)
 
     await start_run(RunSpec(
         run_id=run_id, kind="agent",
@@ -1111,7 +1143,6 @@ async def _agent_chat_completion_stream(
 
     def _stamp(chunk: dict) -> dict:
         chunk["aitelier_run_id"] = run_id
-        chunk["aitelier_trace_id"] = run_id
         chunk["correlation_id"] = cid
         return chunk
 
@@ -1288,7 +1319,6 @@ async def _llm_chat_completion(
             }
         normalize_response_extras(body, resp)
         resp["aitelier_run_id"] = run_id
-        resp["aitelier_trace_id"] = run_id
         resp["correlation_id"] = cid
         return resp
 
@@ -1364,7 +1394,6 @@ async def _llm_chat_completion_stream(
                 body, timeout=req.timeout or 60,
             ):
                 chunk["aitelier_run_id"] = run_id
-                chunk["aitelier_trace_id"] = run_id
                 chunk["correlation_id"] = cid
                 if isinstance(chunk.get("usage"), dict):
                     usage = chunk["usage"]
@@ -1397,7 +1426,6 @@ async def _llm_chat_completion_stream(
             if extras:
                 yield _sse_event("", {
                     "aitelier_run_id": run_id,
-                    "aitelier_trace_id": run_id,
                     "correlation_id": cid,
                     **extras,
                 })
@@ -1510,7 +1538,6 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
         if req.encoding_format == "base64":
             _ensure_base64_embeddings(resp)
         resp["aitelier_run_id"] = run_id
-        resp["aitelier_trace_id"] = run_id
         resp["correlation_id"] = cid
         return resp
 
@@ -2264,10 +2291,16 @@ async def _probe_sandbox_agent(cfg) -> dict:
             data = resp.json()
             # /v1/agents returns either a list or {"agents": [...]} — accept both
             raw = data if isinstance(data, list) else data.get("agents") or []
+            # `mock` is filtered: the SA mock backend doesn't return a
+            # sessionId on session/new, so any consumer who picks it up
+            # as a test target gets a confusing handshake error. The
+            # backend is still reachable via direct SA URL for SA-level
+            # tests; aitelier just doesn't advertise it.
             agents = sorted(
                 a["id"] if isinstance(a, dict) else a
                 for a in raw
-                if (isinstance(a, dict) and a.get("id")) or isinstance(a, str)
+                if ((isinstance(a, dict) and a.get("id") and a["id"] != "mock")
+                    or (isinstance(a, str) and a != "mock"))
             )
             return {
                 "reachable": True,

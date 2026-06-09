@@ -338,6 +338,36 @@ def test_adapt_mcp_servers_no_injection_when_run_id_empty():
     assert out[0]["env"] == []
 
 
+@pytest.mark.asyncio
+async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
+    """ACP backends that respond to session/new without a sessionId must
+    surface a classified ProviderError, not a bare KeyError. Regression
+    test for the agent:mock backend reported by dispatcher 2026-05-18."""
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+
+    class _FakeClient:
+        agent = "mock"
+        async def call(self, method, params, first=False):
+            if method == "initialize":
+                return {}
+            if method == "session/new":
+                return {"agentName": "mock"}  # no sessionId!
+            return None
+        def start_stream(self):
+            pass
+        async def notify(self, *a, **k):
+            pass
+
+    with pytest.raises(AcpError, match="sessionId"):
+        await _open_acp_session(
+            _FakeClient(),
+            workspace=None, mcp_servers=None,
+            system_prompt=None, agent_model=None,
+            tool_allowlist=None, max_turns=None,
+            run_id="r-1",
+        )
+
+
 # --- Remote-SA misconfiguration warnings -------------------------------------
 
 

@@ -281,6 +281,44 @@ def test_schedules_redacts_headers_and_env_on_get(client):
         client.delete(f"/v1/schedules/{sid}")
 
 
+def test_fold_response_format_injects_json_schema_into_system_prompt():
+    """response_format: json_schema is forwarded to ACP AND folded into
+    the system prompt as enforced-output text. Backends that ignore
+    ACP responseFormat (claude-code et al) still see the contract."""
+    from aitelier.server import _fold_response_format
+    out = _fold_response_format(
+        "Be helpful.",
+        {"type": "json_schema",
+         "schema": {"type": "object",
+                    "properties": {"verdict": {"type": "string"}}}},
+    )
+    assert "Required output format" in out
+    assert "Be helpful." in out
+    assert "verdict" in out
+
+
+def test_fold_response_format_no_op_for_other_types():
+    """response_format types other than json_schema are passed through
+    without prompt modification."""
+    from aitelier.server import _fold_response_format
+    assert _fold_response_format("hi", None) == "hi"
+    assert _fold_response_format("hi", {"type": "json_object"}) == "hi"
+
+
+def test_chat_completions_does_not_emit_aitelier_trace_id(client):
+    """aitelier_trace_id was always identical to aitelier_run_id and is
+    now removed. Regression guard so it doesn't sneak back."""
+    with patch("aitelier.server.chat_completion",
+                new_callable=AsyncMock, return_value=_openai_chat_response()):
+        resp = client.post("/v1/chat/completions", json={
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "x"}],
+        })
+    body = resp.json()
+    assert "aitelier_run_id" in body
+    assert "aitelier_trace_id" not in body
+
+
 def test_schedule_name_rejects_invalid_charset(client):
     """Schedule name flows into log lines and the inner agent's
     <aitelier_context> block via make_run_id. Must be charset-restricted

@@ -421,10 +421,22 @@ async def _open_acp_session(
         "cwd": workspace or ".",
         "mcpServers": _adapt_mcp_servers(mcp_servers, run_id=run_id),
     })
-    session_id = (
-        session_resp["sessionId"]
-        if isinstance(session_resp, dict) else session_resp
-    )
+    if isinstance(session_resp, dict):
+        session_id = session_resp.get("sessionId")
+        if not session_id:
+            # The `mock` backend (and any future ACP server that botches
+            # the handshake) returns a session/new response without a
+            # `sessionId`. Surface this as a classified ProviderError
+            # instead of letting KeyError leak through `error_type`.
+            raise AcpError(
+                -32603,
+                f"session/new returned no sessionId "
+                f"(keys: {sorted(session_resp.keys())}). The backend's "
+                f"handshake is broken — the `mock` agent in older "
+                f"Sandbox Agent builds is a known case.",
+            )
+    else:
+        session_id = session_resp
 
     client.start_stream()
 

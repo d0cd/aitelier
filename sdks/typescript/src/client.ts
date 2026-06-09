@@ -70,9 +70,6 @@ export interface AitelierOptions {
   timeoutMs?: number;
 }
 
-/** @deprecated Use AitelierOptions. Kept as an alias for the 0.1.x typo. */
-export type AtelierOptions = AitelierOptions;
-
 export interface SubmitRunOpts {
   model: string;                       // must start with `agent:`
   messages: Array<Record<string, unknown>>;
