@@ -40,6 +40,13 @@ test-docker-build:
 test-docker-mode-e2e:
 	@./scripts/test-docker-mode.sh
 
+# Local brig deployment e2e. Skips cleanly if `brig` isn't installed.
+# Launches aitelier from docs/deploy/aitelier.cell.yaml, polls the
+# ingress, and runs the live suite against the cell. Tears down on exit.
+# Not in CI — brig isn't a CI-installable artifact.
+test-brig-mode-e2e:
+	@./scripts/test-brig-mode.sh
+
 # End-to-end tests against a running aitelier. Boot the stack first
 # (`make start`), then `make test-live`. Auto-skipped without env var.
 test-live:
