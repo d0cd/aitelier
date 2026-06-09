@@ -555,6 +555,37 @@ async def call_via_sandbox(
 # ---------------------------------------------------------------------------
 
 
+async def _translate_note(
+    note: dict, *,
+    text_chunks: list[str], tool_calls: list[dict],
+    emitter: _RunEventEmitter, live: bool,
+) -> dict | None:
+    """Map one ACP notification → an aitelier event, with side effects.
+
+    Mutates `text_chunks` / `tool_calls` so the caller can aggregate
+    them into the final `done` payload, and emits an event to
+    `emitter`. Returns the event dict (for the caller to yield) or
+    None when the notification doesn't map to a surfaced event.
+
+    `live=False` is used by the post-prompt drain pass: tool_call /
+    tool_result notifications during drain are not added to
+    `tool_calls` (they would already have been counted live) — only
+    `delta` content is accumulated so a trailing message-chunk
+    completes the visible output.
+    """
+    ev = _notification_to_event(note)
+    if ev is None:
+        return None
+    if ev["type"] == "delta":
+        text_chunks.append(ev["content"])
+    elif live and ev["type"] in ("tool_call", "tool_result"):
+        tool_calls.append({k: v for k, v in ev.items() if k != "type"})
+    await emitter.emit(
+        ev["type"], {k: v for k, v in ev.items() if k != "type"},
+    )
+    return ev
+
+
 async def call_via_sandbox_stream(
     name: str,
     prompt: str,
@@ -587,7 +618,6 @@ async def call_via_sandbox_stream(
 
     text_chunks: list[str] = []
     tool_calls: list[dict] = []
-
     emitter = _RunEventEmitter(run_id)
     # `sandbox_url` is internal topology — keep it out of consumer-visible
     # event payloads so it can't end up in dashboards or leak to remote
@@ -611,36 +641,26 @@ async def call_via_sandbox_stream(
                     system_prompt=system_prompt, agent_model=agent_model,
                     tool_allowlist=tool_allowlist, max_turns=max_turns,
                 )
-
-                # Run session/prompt in the background; surface notifications live.
-                prompt_task = asyncio.create_task(
-                    client.call(
-                        "session/prompt",
-                        _prompt_params(session_id, prompt, response_format),
-                    )
-                )
+                prompt_task = asyncio.create_task(client.call(
+                    "session/prompt",
+                    _prompt_params(session_id, prompt, response_format),
+                ))
 
                 turn_result: dict | None = None
                 prompt_err: dict | None = None
                 try:
+                    # Live phase: pump notifications until session/prompt
+                    # completes. Tool events here count toward tool_calls.
                     while not prompt_task.done():
                         note = await client.next_notification(timeout=0.25)
                         if note is None:
                             continue
-                        ev = _notification_to_event(note)
-                        if ev is None:
-                            continue
-                        if ev["type"] == "delta":
-                            text_chunks.append(ev["content"])
-                        elif ev["type"] in ("tool_call", "tool_result"):
-                            tool_calls.append(
-                                {k: v for k, v in ev.items() if k != "type"},
-                            )
-                        await emitter.emit(
-                            ev["type"],
-                            {k: v for k, v in ev.items() if k != "type"},
+                        ev = await _translate_note(
+                            note, text_chunks=text_chunks,
+                            tool_calls=tool_calls, emitter=emitter, live=True,
                         )
-                        yield ev
+                        if ev is not None:
+                            yield ev
 
                     try:
                         turn_result = await prompt_task
@@ -653,24 +673,21 @@ async def call_via_sandbox_stream(
                             "error_msg": _scrub_sandbox_url(str(exc), cfg.base_url),
                         }
 
-                    # Drain straggling notifications even on prompt error so the
-                    # event stream is consistent and we know what fired.
+                    # Drain phase: surface trailing notifications even on
+                    # prompt error, so the event stream is consistent.
+                    # Tool events were already counted live; only delta
+                    # content accumulates here.
                     for note in await client.drain_notifications():
-                        ev = _notification_to_event(note)
-                        if ev is None:
-                            continue
-                        if ev["type"] == "delta":
-                            text_chunks.append(ev["content"])
-                        await emitter.emit(
-                            ev["type"],
-                            {k: v for k, v in ev.items() if k != "type"},
+                        ev = await _translate_note(
+                            note, text_chunks=text_chunks,
+                            tool_calls=tool_calls, emitter=emitter, live=False,
                         )
-                        yield ev
+                        if ev is not None:
+                            yield ev
                 finally:
                     # Close session on every exit path — cancellation, prompt
                     # error, successful completion. Without this the inner
-                    # agent process (claude / codex / …) stays alive
-                    # indefinitely. Failures are logged inside _close_acp_session.
+                    # agent process stays alive indefinitely.
                     await _close_acp_session(client, session_id)
                     session_id = None
 
@@ -679,28 +696,16 @@ async def call_via_sandbox_stream(
                     yield prompt_err
                     return
 
-                elapsed = time.monotonic() - start
-                done = _aggregate_result(
-                    agent=client.agent,
-                    run_id=run_id,
-                    turn_result=turn_result,
-                    elapsed=elapsed,
-                    response_format=response_format,
+                yield await _build_done_event(
+                    client=client, run_id=run_id, start=start,
+                    turn_result=turn_result, response_format=response_format,
+                    text_chunks=text_chunks, tool_calls=tool_calls,
+                    emitter=emitter,
                 )
-                if text_chunks:
-                    done["content"] = "".join(text_chunks)
-                if tool_calls:
-                    done["tool_calls"] = tool_calls
-                done["type"] = "done"
-                await emitter.emit("finish", {
-                    "finish_reason": done.get("finish_reason"),
-                    "tool_call_count": len(tool_calls),
-                })
-                yield done
             finally:
-                # Belt-and-suspenders: session_id is None after a normal
-                # close; non-None only when the inner try raised before
-                # the finally above ran (shouldn't be possible, but cheap).
+                # Race-window guard: if cancellation hit between
+                # _close_acp_session() and `session_id = None` above,
+                # session_id stays non-None and we retry the close here.
                 if session_id is not None:
                     await _close_acp_session(client, session_id)
 
@@ -715,6 +720,37 @@ async def call_via_sandbox_stream(
         }
         await emitter.emit("error", err)
         yield err
+
+
+async def _build_done_event(
+    *, client, run_id: str, start: float,
+    turn_result: dict | None, response_format: dict | None,
+    text_chunks: list[str], tool_calls: list[dict],
+    emitter: _RunEventEmitter,
+) -> dict:
+    """Assemble the terminal `done` event from turn_result + accumulators.
+
+    Lives in its own function because the streaming entry point's
+    happy-path tail was the densest part of `call_via_sandbox_stream` —
+    aggregator call + accumulator merge + finish emit. Pulling it out
+    keeps the orchestration loop readable."""
+    done = _aggregate_result(
+        agent=client.agent,
+        run_id=run_id,
+        turn_result=turn_result,
+        elapsed=time.monotonic() - start,
+        response_format=response_format,
+    )
+    if text_chunks:
+        done["content"] = "".join(text_chunks)
+    if tool_calls:
+        done["tool_calls"] = tool_calls
+    done["type"] = "done"
+    await emitter.emit("finish", {
+        "finish_reason": done.get("finish_reason"),
+        "tool_call_count": len(tool_calls),
+    })
+    return done
 
 
 # ---------------------------------------------------------------------------

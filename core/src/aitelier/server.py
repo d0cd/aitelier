@@ -804,6 +804,141 @@ def _render_chat_completion(payload: dict) -> dict | JSONResponse:
     return payload
 
 
+_STREAM_QUEUE_SENTINEL: dict = {"_eof": True}
+
+
+async def _producer_for_acp_stream(
+    queue: asyncio.Queue, *,
+    agent_backend: str, initial_message: str, system_prompt: str | None,
+    opts: AitelierAgentOpts, req: ChatCompletionRequest,
+    inner_llm: str | None, run_id: str,
+) -> None:
+    """Drive `call_via_sandbox_stream` into a queue. Wraps cancellation
+    and unexpected exceptions as `error` events so the consumer side
+    always sees terminal traffic before the sentinel. Always pushes the
+    sentinel last so the consumer drains cleanly even on failure."""
+    from aitelier.providers.sandbox_agent import call_via_sandbox_stream
+    try:
+        async for event in call_via_sandbox_stream(
+            agent_backend, initial_message,
+            workspace=opts.workspace,
+            system_prompt=system_prompt,
+            mcp_servers=opts.mcp_servers,
+            tool_allowlist=opts.tool_allowlist,
+            response_format=req.response_format,
+            max_turns=opts.max_turns,
+            agent_model=inner_llm,
+            timeout=req.timeout or 600,
+            run_id=run_id,
+        ):
+            await queue.put(event)
+    except asyncio.CancelledError:
+        await queue.put({"type": "error", "error_type": "Cancelled",
+                          "error_msg": "run cancelled"})
+        raise
+    except Exception as exc:
+        await queue.put({"type": "error",
+                          "error_type": classify_error(exc),
+                          "error_msg": str(exc)})
+    finally:
+        await queue.put(_STREAM_QUEUE_SENTINEL)
+
+
+def _stream_chunks_for_delta(
+    event: dict, *, model: str, run_id: str,
+    stamp, first: bool,
+) -> tuple[list[dict], bool]:
+    """Build the openai-chunk(s) for an ACP delta event.
+
+    The first delta also seeds the assistant role on its own chunk,
+    matching OpenAI's streaming convention. Returns the chunks to write
+    + the updated `first` flag.
+    """
+    chunks: list[dict] = []
+    if first:
+        chunks.append(stamp(chat_completion_chunk(
+            request_model=model, run_id=run_id,
+            delta={"role": "assistant"},
+        )))
+    chunks.append(stamp(chat_completion_chunk(
+        request_model=model, run_id=run_id,
+        delta={"content": event.get("content") or ""},
+    )))
+    return chunks, False
+
+
+def _stream_chunk_for_done(
+    event: dict, *, model: str, run_id: str, stamp,
+) -> tuple[dict, dict]:
+    """Build the terminal chunk for a `done` event + the `final` dict
+    that drives finalize_run. Routes usage through `agent_usage_to_openai`
+    so the OpenAI invariant `total == prompt + completion` holds on the
+    streaming wire and inner-agent overhead lands in `aitelier_inner_tokens`.
+    Mirrors the non-streaming response shape's `aitelier_tool_call_count`
+    + `aitelier_tool_names` so consumers don't need a separate code path
+    for "did the agent use my tools?" on stream vs non-stream.
+    """
+    final = {k: v for k, v in event.items() if k != "type"}
+    chunk_usage = agent_usage_to_openai(final.get("usage")) or {
+        "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+    }
+    tool_names, tool_count = summarize_tool_calls(final)
+    c = stamp(chat_completion_chunk(
+        request_model=model, run_id=run_id,
+        delta={}, finish_reason="stop", usage=chunk_usage,
+    ))
+    c["aitelier_tool_call_count"] = tool_count
+    c["aitelier_tool_names"] = tool_names
+    return c, final
+
+
+def _stream_error_payload(
+    event: dict, *, run_id: str, cid: str, agent_backend: str,
+) -> tuple[dict, dict]:
+    """Build the SSE error frame for an `error` event + the `final`
+    dict for storage. Errors are NOT recorded for idempotency replay —
+    a retrying consumer should get a fresh attempt at success."""
+    err_type = event.get("error_type") or "ProviderError"
+    final = {
+        "kind": "agent", "provider": agent_backend,
+        "status": "error",
+        "error_type": err_type,
+        "error_msg": event.get("error_msg") or "stream error",
+        "finish_reason": (
+            "cancelled" if err_type == "Cancelled" else "error"
+        ),
+    }
+    frame = {
+        "error": {"type": err_type, "message": event.get("error_msg")},
+        "aitelier_run_id": run_id,
+        "correlation_id": cid,
+    }
+    return frame, final
+
+
+def _stream_terminal_state(final: dict | None, *, agent_backend: str) -> tuple[dict, str]:
+    """Decide the run's terminal state from the captured `final` dict.
+
+    None → consumer disconnected mid-stream before observing a terminal
+    event; fabricate a `cancelled` final so the run doesn't stay
+    state=running forever (which would contaminate dashboards +
+    /v1/metrics in_flight)."""
+    if final is None:
+        final = {
+            "kind": "agent", "provider": agent_backend,
+            "status": "cancelled",
+            "error_type": "Cancelled",
+            "error_msg": "consumer disconnected mid-stream",
+            "finish_reason": "cancelled",
+        }
+    state = (
+        "cancelled" if final.get("error_type") == "Cancelled"
+        else "failed" if final.get("status") == "error"
+        else "completed"
+    )
+    return final, state
+
+
 async def _agent_chat_completion_stream(
     req: ChatCompletionRequest, request: Request, *,
     agent_backend: str, inner_llm: str | None, run_id: str,
@@ -821,8 +956,6 @@ async def _agent_chat_completion_stream(
     the subscription). Failed or cancelled streams are NOT cached — the
     consumer's retry should get a fresh attempt at success.
     """
-    from aitelier.providers.sandbox_agent import call_via_sandbox_stream
-
     cid = request.state.correlation_id
     _reject_agent_incompatible_fields(req)
     opts = req.aitelier or AitelierAgentOpts()
@@ -845,7 +978,7 @@ async def _agent_chat_completion_stream(
     ))
     await store.update_run_state(run_id, "running")
 
-    def _stamped(chunk: dict) -> dict:
+    def _stamp(chunk: dict) -> dict:
         chunk["aitelier_run_id"] = run_id
         chunk["aitelier_trace_id"] = run_id
         chunk["correlation_id"] = cid
@@ -855,44 +988,16 @@ async def _agent_chat_completion_stream(
     # the queue and translates to OpenAI chunks. Registering the producer
     # in `_active_runs` makes the stream cancellable via POST /v1/runs/{id}/cancel.
     queue: asyncio.Queue = asyncio.Queue(maxsize=32)
-    SENTINEL: dict = {"_eof": True}
-    # Chunks collected for idempotency replay. Each entry is the dict we
-    # serialize into the SSE `data:` line, so replay is byte-identical
-    # modulo the trailing `[DONE]` marker (always appended on replay).
     recorded_chunks: list[dict] = []
-
-    async def _producer() -> None:
-        try:
-            async for event in call_via_sandbox_stream(
-                agent_backend, initial_message,
-                workspace=opts.workspace,
-                system_prompt=system_prompt,
-                mcp_servers=opts.mcp_servers,
-                tool_allowlist=opts.tool_allowlist,
-                response_format=req.response_format,
-                max_turns=opts.max_turns,
-                agent_model=inner_llm,
-                timeout=req.timeout or 600,
-                run_id=run_id,
-            ):
-                await queue.put(event)
-        except asyncio.CancelledError:
-            await queue.put({"type": "error",
-                              "error_type": "Cancelled",
-                              "error_msg": "run cancelled"})
-            raise
-        except Exception as exc:
-            await queue.put({"type": "error",
-                              "error_type": classify_error(exc),
-                              "error_msg": str(exc)})
-        finally:
-            await queue.put(SENTINEL)
-
-    producer_task = asyncio.create_task(_producer())
+    producer_task = asyncio.create_task(_producer_for_acp_stream(
+        queue,
+        agent_backend=agent_backend, initial_message=initial_message,
+        system_prompt=system_prompt, opts=opts, req=req,
+        inner_llm=inner_llm, run_id=run_id,
+    ))
     _active_runs[run_id] = producer_task
 
     async def event_generator():
-        import time as _time
         final: dict | None = None
         first = True
         # Track time-since-last-wire-emission rather than relying on
@@ -900,128 +1005,67 @@ async def _agent_chat_completion_stream(
         # frequently during agent planning but are dropped from the wire;
         # without this counter, queue.get() never times out and the
         # consumer sees no traffic until the next `delta`.
-        last_yield_at = _time.monotonic()
+        last_yield_at = time.monotonic()
         try:
             while True:
                 remaining = _SSE_KEEPALIVE_SECONDS - (
-                    _time.monotonic() - last_yield_at
+                    time.monotonic() - last_yield_at
                 )
                 if remaining <= 0:
                     yield ": keepalive\n\n"
-                    last_yield_at = _time.monotonic()
+                    last_yield_at = time.monotonic()
                     continue
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=remaining)
                 except TimeoutError:
                     yield ": keepalive\n\n"
-                    last_yield_at = _time.monotonic()
+                    last_yield_at = time.monotonic()
                     continue
-                if event is SENTINEL:
+                if event is _STREAM_QUEUE_SENTINEL:
                     break
                 etype = event.get("type")
                 if etype == "delta":
-                    if first:
-                        c = _stamped(chat_completion_chunk(
-                            request_model=req.model, run_id=run_id,
-                            delta={"role": "assistant"},
-                        ))
+                    chunks, first = _stream_chunks_for_delta(
+                        event, model=req.model, run_id=run_id,
+                        stamp=_stamp, first=first,
+                    )
+                    for c in chunks:
                         recorded_chunks.append(c)
                         yield _sse_event("", c)
-                        last_yield_at = _time.monotonic()
-                        first = False
-                    c = _stamped(chat_completion_chunk(
-                        request_model=req.model, run_id=run_id,
-                        delta={"content": event.get("content") or ""},
-                    ))
-                    recorded_chunks.append(c)
-                    yield _sse_event("", c)
-                    last_yield_at = _time.monotonic()
+                    last_yield_at = time.monotonic()
                 elif etype == "done":
-                    final = {k: v for k, v in event.items() if k != "type"}
-                    # Route through the same translator as the non-streaming
-                    # path so the OpenAI invariant `total == prompt + completion`
-                    # holds and inner-agent overhead lands in
-                    # `aitelier_inner_tokens` on streaming responses too.
-                    chunk_usage = agent_usage_to_openai(final.get("usage")) or {
-                        "prompt_tokens": 0, "completion_tokens": 0,
-                        "total_tokens": 0,
-                    }
-                    tool_names, tool_count = summarize_tool_calls(final)
-                    c = _stamped(chat_completion_chunk(
-                        request_model=req.model, run_id=run_id,
-                        delta={},
-                        finish_reason="stop",
-                        usage=chunk_usage,
-                    ))
-                    # Mirror the non-streaming response shape so consumers
-                    # don't need a separate code path for "did the agent
-                    # use my tools?" on stream vs non-stream.
-                    c["aitelier_tool_call_count"] = tool_count
-                    c["aitelier_tool_names"] = tool_names
+                    c, final = _stream_chunk_for_done(
+                        event, model=req.model, run_id=run_id, stamp=_stamp,
+                    )
                     recorded_chunks.append(c)
                     yield _sse_event("", c)
-                    last_yield_at = _time.monotonic()
+                    last_yield_at = time.monotonic()
                 elif etype == "error":
-                    err_type = event.get("error_type") or "ProviderError"
-                    final = {
-                        "kind": "agent", "provider": agent_backend,
-                        "status": "error",
-                        "error_type": err_type,
-                        "error_msg": event.get("error_msg") or "stream error",
-                        "finish_reason": (
-                            "cancelled" if err_type == "Cancelled" else "error"
-                        ),
-                    }
-                    # Error frames are not recorded — idempotency only caches
-                    # successful completions so a retry after transient failure
-                    # gets a fresh attempt.
-                    last_yield_at = _time.monotonic()
-                    yield _sse_event("", {
-                        "error": {
-                            "type": err_type,
-                            "message": event.get("error_msg"),
-                        },
-                        "aitelier_run_id": run_id,
-                        "correlation_id": cid,
-                    })
+                    frame, final = _stream_error_payload(
+                        event, run_id=run_id, cid=cid,
+                        agent_backend=agent_backend,
+                    )
+                    # Error frames are not recorded — see _stream_error_payload.
+                    yield _sse_event("", frame)
+                    last_yield_at = time.monotonic()
                 # tool_call / tool_result intentionally dropped — see docstring.
             yield "data: [DONE]\n\n"
         finally:
             _active_runs.pop(run_id, None)
             if not producer_task.done():
                 producer_task.cancel()
-            # Consumer disconnect (FastAPI calls aclose() on the generator)
-            # raises GeneratorExit/CancelledError and skips straight to this
-            # finally with `final = None`. Without an explicit cancellation
-            # finalize the run stays in state=running forever, contaminating
-            # dashboards and /v1/metrics in_flight counts.
-            if final is None:
-                final = {
-                    "kind": "agent", "provider": agent_backend,
-                    "status": "cancelled",
-                    "error_type": "Cancelled",
-                    "error_msg": "consumer disconnected mid-stream",
-                    "finish_reason": "cancelled",
-                }
-            state = (
-                "cancelled" if final.get("error_type") == "Cancelled"
-                else "failed" if final.get("status") == "error"
-                else "completed"
-            )
+            final, state = _stream_terminal_state(final, agent_backend=agent_backend)
             # The current task may be mid-cancellation (uvicorn cancels the
             # response task when the client disconnects), which would
-            # interrupt any `await` here and skip the storage write — that
-            # was the original bug. Detach to a background task so the
-            # finalize survives the cancellation.
+            # interrupt any `await` here and skip the storage write. Detach
+            # to a background task so the finalize survives the cancellation.
             should_cache = (
                 idem is not None
                 and state == "completed"
                 and final.get("status") != "error"
             )
             asyncio.create_task(_finalize_stream_run(
-                run_id=run_id,
-                final=final,
-                state=state,
+                run_id=run_id, final=final, state=state,
                 idem=idem if should_cache else None,
                 recorded_chunks=recorded_chunks if should_cache else None,
             ))
