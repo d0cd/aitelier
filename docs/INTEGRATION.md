@@ -264,7 +264,7 @@ The `aitelier` block is `additionalProperties: false` — see
 [`/v1/schemas/aitelier_request`](http://localhost:7777/v1/schemas/aitelier_request)
 for the authoritative field list. The accepted properties are exactly:
 `workspace, mcp_servers, tool_allowlist, max_turns, prepare, artifacts,
-trace_tag, examples, allow_tool_drop`. Anything else (including
+trace_tag, parent_run_id, examples, allow_tool_drop`. Anything else (including
 common-misplacement candidates like `timeout`, `model`, `messages`,
 `stream`) is rejected.
 
@@ -672,15 +672,25 @@ The parent agent calls aitelier's HTTP API directly (claude-code has
 child run, gets the `run_id` back, and either polls or registers a
 webhook for completion.
 
+Aitelier surfaces the parent's own run_id two ways so the child can
+record lineage via `parent_run_id`:
+
+1. **`<aitelier_context>` block** prepended to the parent agent's
+   system prompt: `run_id={parent_run_id}`. Always present.
+2. **`AITELIER_RUN_ID` env var** injected into every stdio MCP server
+   spawned by the parent. The `aitelier-mcp` package's `get_my_run_id`
+   tool reads it (see Approach 2).
+
 ```bash
-# Inside the parent agent's sandbox:
+# Inside the parent agent's sandbox. The agent parses its own run_id
+# out of the system-prompt context block and passes it explicitly:
 curl -s -X POST http://localhost:7777/v1/runs \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "agent:codex",
     "messages": [{"role": "user", "content": "Audit deps in /workspace/pkg.json"}],
     "aitelier": {
-      "parent_run_id":  "'"$AITELIER_RUN_ID"'",
+      "parent_run_id":  "<parent run_id from the context block>",
       "trace_tag":      "deps-audit-2026-05",
       "workspace":      "/workspace"
     }
@@ -695,9 +705,11 @@ loopback webhook callbacks, set `[service] allow_loopback_webhooks = true`.
 
 `aitelier-mcp` is a small MCP server (separate package, sibling of
 `aitelier-client`) that exposes the control plane as typed MCP tools:
-`submit_run`, `get_run`, `list_runs`, `list_run_events`, `cancel_run`.
-The inner agent uses its MCP-tool channel (both `claude` and `codex`
-advertise `mcpTools: true`) rather than hand-rolling HTTP.
+`submit_run`, `get_run`, `list_runs`, `list_run_events`, `cancel_run`,
+plus `get_my_run_id` (returns the parent's own aitelier run_id from
+the `AITELIER_RUN_ID` env var aitelier injects). The inner agent
+uses its MCP-tool channel (both `claude` and `codex` advertise
+`mcpTools: true`) rather than hand-rolling HTTP.
 
 ```jsonc
 {

@@ -131,6 +131,18 @@ def create_server(client: Aitelier | None = None) -> FastMCP:
         ack = await client.cancel_run(run_id)
         return _as_dict(ack)
 
+    @server.tool()
+    async def get_my_run_id() -> dict[str, str | None]:
+        """Return the calling agent's own aitelier run_id, or None.
+
+        aitelier injects `AITELIER_RUN_ID` into the env of every stdio
+        MCP server it spawns. Call this first and pass the returned
+        value as `parent_run_id` on every `submit_run` so the children
+        can be recovered via `list_runs(parent_run_id=...)` and the
+        whole tree shows up under one workflow.
+        """
+        return {"run_id": os.environ.get("AITELIER_RUN_ID")}
+
     return server
 
 

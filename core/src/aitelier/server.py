@@ -1641,6 +1641,7 @@ def _run_to_dict(run) -> dict:
         "status": run.status,
         "error_type": run.error_type,
         "error_msg": run.error_msg,
+        "result": run.result,
         "metadata": run.metadata,
     }
 

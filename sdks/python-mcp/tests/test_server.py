@@ -139,11 +139,25 @@ async def test_cancel_run_acks_idempotently(server, fake_client):
 
 @pytest.mark.asyncio
 async def test_tool_catalog_complete(server):
-    """The five tools an inner agent needs to drive a multi-agent
-    workflow through aitelier."""
+    """The tools an inner agent needs to drive a multi-agent
+    workflow through aitelier, including self-identification."""
     tools = await server.list_tools()
     names = {t.name for t in tools}
     assert names == {
         "submit_run", "get_run", "list_runs",
-        "list_run_events", "cancel_run",
+        "list_run_events", "cancel_run", "get_my_run_id",
     }
+
+
+@pytest.mark.asyncio
+async def test_get_my_run_id_returns_env_var(server, monkeypatch):
+    monkeypatch.setenv("AITELIER_RUN_ID", "parent-123")
+    out = await _call_tool(server, "get_my_run_id")
+    assert out == {"run_id": "parent-123"}
+
+
+@pytest.mark.asyncio
+async def test_get_my_run_id_returns_none_when_unset(server, monkeypatch):
+    monkeypatch.delenv("AITELIER_RUN_ID", raising=False)
+    out = await _call_tool(server, "get_my_run_id")
+    assert out == {"run_id": None}

@@ -18,7 +18,7 @@ from aitelier_client import Aitelier
 
 async def fanout_and_summarize() -> str:
     ait = Aitelier(base_url="http://localhost:7777")
-    openai = await ait.openai()
+    openai = ait.openai()
 
     # 1. Choose specialists. Each gets its own agent backend or model
     #    routing string. Mix and match LiteLLM models + agent backends.
@@ -42,7 +42,7 @@ async def fanout_and_summarize() -> str:
                 aitelier_opts={"trace_tag": workflow_tag},
             )
             run = await ait.wait_for_run(submission["run_id"], timeout=60)
-            return run.result.get("content", "(empty)")
+            return (run.result or {}).get("content", "(empty)")
 
         # LLM path: sync chat completion.
         resp = await openai.chat.completions.create(

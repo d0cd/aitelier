@@ -26,17 +26,19 @@ async def run_orchestrator() -> str:
     workflow_tag = f"mcp-orch-{uuid.uuid4().hex[:8]}"
 
     # 1. Submit the parent. The agent receives `aitelier-mcp` as a stdio
-    #    MCP server, so its tool list now includes submit_run / list_runs.
-    #    We hand the parent its own workflow_tag so it can pass it down
-    #    to children, letting `/v1/traces?trace_tag=...` roll the whole
-    #    fan-out into one query later.
+    #    MCP server, so its tool list now includes submit_run / list_runs
+    #    plus `get_my_run_id` — the parent learns its own aitelier run_id
+    #    at the start of the turn. trace_tag pins the whole fan-out so
+    #    `/v1/traces?trace_tag=...` rolls it up later.
     parent_prompt = (
         "Audit this repository three ways in parallel: security, "
-        "dependencies, and docstrings. Use the `aitelier` MCP tools "
-        "to dispatch three children with model=agent:claude. Pass "
-        f"trace_tag='{workflow_tag}' and parent_run_id=<your own run id> "
-        "on each submit_run call. Poll list_runs(parent_run_id=...) until "
-        "all three are terminal, then summarize their results."
+        "dependencies, and docstrings.\n\n"
+        "Step 1: call get_my_run_id once and remember the value.\n"
+        "Step 2: call submit_run three times with model=agent:claude, "
+        f"trace_tag='{workflow_tag}', and parent_run_id set to the value "
+        "from step 1.\n"
+        "Step 3: poll list_runs(parent_run_id=...) until all three are "
+        "terminal, then summarize their results."
     )
 
     submission = await ait.submit_run(

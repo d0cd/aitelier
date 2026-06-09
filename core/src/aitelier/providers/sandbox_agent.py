@@ -383,6 +383,7 @@ async def _open_acp_session(
     agent_model: str | None,
     tool_allowlist: list[str] | None,
     max_turns: int | None,
+    run_id: str = "",
 ) -> str:
     """Drive the ACP handshake up to a usable session_id.
 
@@ -392,6 +393,10 @@ async def _open_acp_session(
     or terminal/* (the SSE consumer rejects them in `_respond_to_agent_request`),
     so we say `false`. The agent then never asks, instead of asking and
     hanging on the rejection.
+
+    When `run_id` is non-empty, an `<aitelier_context>` block carrying
+    the run_id is prepended to the system prompt so the inner agent
+    can pass `parent_run_id` when dispatching subagents through aitelier.
     """
     await client.call("initialize", {
         "protocolVersion": _ACP_PROTOCOL_VERSION,
@@ -402,9 +407,19 @@ async def _open_acp_session(
         "clientInfo": {"name": "aitelier", "version": "0.1.0"},
     }, first=True)
 
+    if run_id:
+        ctx_block = (
+            f"<aitelier_context>\n"
+            f"run_id={run_id}\n"
+            f"</aitelier_context>"
+        )
+        system_prompt = (
+            f"{ctx_block}\n\n{system_prompt}" if system_prompt else ctx_block
+        )
+
     session_resp = await client.call("session/new", {
         "cwd": workspace or ".",
-        "mcpServers": _adapt_mcp_servers(mcp_servers),
+        "mcpServers": _adapt_mcp_servers(mcp_servers, run_id=run_id),
     })
     session_id = (
         session_resp["sessionId"]
@@ -640,6 +655,7 @@ async def call_via_sandbox_stream(
                     workspace=workspace, mcp_servers=mcp_servers,
                     system_prompt=system_prompt, agent_model=agent_model,
                     tool_allowlist=tool_allowlist, max_turns=max_turns,
+                    run_id=run_id,
                 )
                 prompt_task = asyncio.create_task(client.call(
                     "session/prompt",
@@ -813,7 +829,9 @@ def _notification_to_event(note: dict) -> dict | None:
     return None
 
 
-def _adapt_mcp_servers(servers: list[dict] | None) -> list[dict]:
+def _adapt_mcp_servers(
+    servers: list[dict] | None, *, run_id: str = "",
+) -> list[dict]:
     """Convert aitelier's MCP server shape to ACP's wire schema.
 
     aitelier's public API uses `transport: "http" | "stdio"`. ACP's
@@ -821,6 +839,12 @@ def _adapt_mcp_servers(servers: list[dict] | None) -> list[dict]:
       - `type` as the discriminator (literal const, not `transport`)
       - `headers: [{name, value}]` required on http (empty list is valid)
       - `env: [{name, value}]` required on stdio (empty list is valid)
+
+    When `run_id` is non-empty, AITELIER_RUN_ID is injected into every
+    stdio server's env (unless the caller already set it). This lets
+    aitelier-mcp expose the parent's run_id to the inner agent so it
+    can dispatch subagents with the correct parent_run_id without
+    out-of-band coordination.
     """
     if not servers:
         return []
@@ -835,12 +859,17 @@ def _adapt_mcp_servers(servers: list[dict] | None) -> list[dict]:
                 "headers": s.get("headers", []),
             })
         elif transport == "stdio":
+            env = list(s.get("env", []))
+            if run_id and not any(
+                e.get("name") == "AITELIER_RUN_ID" for e in env
+            ):
+                env.append({"name": "AITELIER_RUN_ID", "value": run_id})
             out.append({
                 "type": "stdio",
                 "name": s["name"],
                 "command": s.get("command", ""),
                 "args": s.get("args", []),
-                "env": s.get("env", []),
+                "env": env,
             })
     return out
 

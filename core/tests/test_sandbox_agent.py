@@ -300,6 +300,44 @@ def test_adapt_mcp_servers_uses_type_not_transport():
     assert out[0]["type"] == "http"
 
 
+def test_adapt_mcp_servers_injects_run_id_into_stdio_env():
+    """AITELIER_RUN_ID injected into stdio servers when run_id is provided."""
+    out = _adapt_mcp_servers(
+        [{"name": "aitelier", "transport": "stdio", "command": "aitelier-mcp"}],
+        run_id="run-abc-123",
+    )
+    assert out[0]["env"] == [
+        {"name": "AITELIER_RUN_ID", "value": "run-abc-123"},
+    ]
+
+
+def test_adapt_mcp_servers_does_not_override_existing_run_id():
+    """Caller-provided AITELIER_RUN_ID wins over the auto-injected value."""
+    out = _adapt_mcp_servers(
+        [{"name": "x", "transport": "stdio", "command": "c",
+          "env": [{"name": "AITELIER_RUN_ID", "value": "custom"}]}],
+        run_id="auto",
+    )
+    assert out[0]["env"] == [{"name": "AITELIER_RUN_ID", "value": "custom"}]
+
+
+def test_adapt_mcp_servers_skips_injection_for_http_servers():
+    """HTTP servers run out-of-process; env injection is stdio-only."""
+    out = _adapt_mcp_servers(
+        [{"name": "x", "transport": "http", "url": "http://h/"}],
+        run_id="run-id",
+    )
+    assert "env" not in out[0]
+
+
+def test_adapt_mcp_servers_no_injection_when_run_id_empty():
+    """Backward-compat: empty run_id leaves env untouched."""
+    out = _adapt_mcp_servers(
+        [{"name": "x", "transport": "stdio", "command": "c"}],
+    )
+    assert out[0]["env"] == []
+
+
 # --- Remote-SA misconfiguration warnings -------------------------------------
 
 

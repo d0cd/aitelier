@@ -112,6 +112,7 @@ class Run(BaseModel):
     status: str | None = None
     error_type: str | None = None
     error_msg: str | None = None
+    result: dict[str, Any] = {}
     metadata: dict[str, Any] = {}
 
 
