@@ -1,16 +1,12 @@
 """Sandbox-agent workflow helpers — install, commands, files, sidecars, artifacts.
 
-Aitelier consolidates SA primitives into a single `/v1/agent` workflow
-(install → commands → file seed → sidecars → ACP agent run → artifact
-fetch). This module owns the orchestration of those phases against
-SA's HTTP surface; the agent-path endpoint composes them around the
-ACP call.
+Aitelier consolidates SA primitives into one agent workflow (install →
+commands → file seed → sidecars → ACP agent run → artifact fetch).
+The agent path of `/v1/chat/completions` composes them around the ACP
+call via the `aitelier.prepare` + `aitelier.artifacts` request fields.
 
-Edge cases beyond the workflow (browser testing, mid-run fs queries,
-generic SA poking) reach SA directly via the URL in `/v1/discovery`.
-This module is not a generic SA passthrough — it implements the
-narrow choreography that `aitelier.prepare` + `aitelier.artifacts`
-promise on the wire.
+Edge cases beyond the workflow reach SA directly via the URL in
+`/v1/discovery`; this module is the workflow, not a generic passthrough.
 """
 
 from __future__ import annotations

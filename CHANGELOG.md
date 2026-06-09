@@ -7,7 +7,119 @@ relevant section.
 
 ## Unreleased
 
-### Added
+### Added — Phase F (audit-2 fixes)
+
+- **Secret redaction** on `/v1/runs/{id}` and `/v1/schedules*`.
+  `environment.mcp_servers[*].headers` (Bearer/PAT tokens for third-
+  party MCP servers) and `prepare.commands[*].env` values are returned
+  as `[redacted]` instead of verbatim. The stored row keeps the real
+  values; only the HTTP projection is redacted, so the Sandbox Agent
+  still receives real values at dispatch time.
+- **`POST /v1/schedules` rejects schedule names with invalid charset.**
+  `name` is now `[A-Za-z0-9_\-\.]{1,64}` — blocks stored prompt-
+  injection through the `<aitelier_context>` system-prompt block.
+- **Rate limit runs after auth.** Middleware registration order
+  reversed so unauthenticated 401s don't fill the bucket map.
+- **Rate-limit bucket map is LRU-capped at 10 000 entries.** A caller
+  cycling Bearer values can no longer grow memory without bound.
+- **`[purge] run_retention_days`** (default 30) replaces the literal
+  `30` in the startup runs purge. `_KNOWN_LIMITATIONS` updated.
+- **`Store.count_pending_webhooks`** — `/v1/metrics.webhooks.pending`
+  now reports a real count on Postgres (previously always 0).
+- **TS SDK gains `streamRunEvents`** (SSE iterator); brings the TS
+  control plane to parity with Python.
+- **TS SDK adds `AitelierOptions`** as the correct name; the original
+  `AtelierOptions` is kept as a `@deprecated` alias for 0.1.x callers.
+- **`TraceRecord` gains `parent_run_id`, `error_type`, `error_msg`,
+  `metadata`** in both SDKs — fields the server has always emitted
+  but the typed clients dropped.
+- **`schemas/v1/discovery.schema.json` declares `models`** (the server
+  has emitted it since Phase 10; the schema lagged).
+
+### Changed — Phase F
+
+- **`make_run_id` appends 4 hex chars of entropy.** Microsecond
+  timestamps alone can collide inside one event-loop tick under tight
+  async fan-outs; runs are now PK-collision-proof.
+- **Ollama bypass path runs through `_safe_upstream_message`.** Phase C
+  scrubbed LiteLLM errors but the direct Ollama route was missed.
+- **`purge_worker` re-reads `interval_seconds` on every tick.** Operator
+  config edits take effect without a restart; setting to 0 pauses the
+  worker.
+- **`ScheduleRequest` and `EmbeddingsRequest`** use
+  `model_config = ConfigDict(extra="forbid")` for parity with
+  `ChatCompletionRequest` / `AitelierAgentOpts`.
+- **Stale `/v1/agent` comments cleaned up** across `server.py`,
+  `sandbox_proxy.py`, `providers/sandbox_agent.py`, migration 002,
+  and `core/tests/live/README.md`. The endpoint has been
+  `/v1/chat/completions` (model-prefix routed) since Phase 10.
+- **INTEGRATION.md documents `POST /v1/runs/{id}/wait`** and corrects
+  the SSRF guard description (always on, not hosted-mode-only).
+
+### Added — Phase E
+
+- `sandbox_proxy.py` extracts `sa_proxy`, `run_prepare`, `stop_sidecars`,
+  `fetch_artifacts`, `prepare_failed_result` from `server.py` (~180
+  lines).
+- `security.validate_path_component` lifted out of `server.py` so the
+  whitelist regex is module-level rather than re-compiled per call.
+- `runs.start_run(spec)` packages `create_run` + `update_run_state` for
+  the two streaming paths.
+
+### Added — Phase D
+
+- `ChatCompletionRequest` gains `extra="forbid"` + declared fields for
+  `stream_options`, `seed`, `frequency_penalty`, `presence_penalty`,
+  `stop`, `logprobs`, `top_logprobs` (previously dropped silently).
+- Defense-in-depth `os.sep` suffix on the runs-directory prefix check.
+- `runs_dir` honored from config (was a hardcoded `Path("runs")`).
+- Stale `DATABASE_URL` references replaced with `[database] url`.
+- Dead `sdks/python/.../streaming.py` removed.
+- `make test-py` now includes `sdks/python-mcp/tests/`.
+
+### Added — Phase C
+
+- `service.max_request_body_bytes` (default 4 MiB) + body-size
+  middleware (413 before any handler runs).
+- `service.rate_limit_per_minute` (default 0 = off) + token-bucket
+  middleware (429 with `Retry-After`).
+- Background `purge_worker` (`[purge] interval_seconds`,
+  `webhook_retention_days`, `event_retention_days`) — calls
+  `purge_expired_idempotency_keys`, `purge_old_webhook_deliveries`
+  (new), `purge_old_run_events` (new).
+- LLM upstream error body scrubbed via `_safe_upstream_message`
+  (canonical phrase + status code; raw body logged server-side).
+- INTEGRATION.md "Hosted-mode deployment envelope" section: single-key
+  semantics, schedule task visibility, recommended TOML.
+
+### Added — Phase B
+
+- `system_prompt_hash` and `result` on `schemas/v1/run.schema.json`.
+- TS `Run` gains `parentRunId`, `systemPromptHash`, `result`.
+- Python Run gains `system_prompt_hash` (was on TraceRecord only).
+- `aitelier.toml.example` documents `service.max_in_flight_runs`,
+  `service.allow_loopback_webhooks`, `ollama.default_model`.
+- SDK tests for `wait_for_run`, `list_runs(parent_run_id=…)`.
+
+### Added — Phase A
+
+- **`AITELIER_RUN_ID` injection** into every stdio MCP server's env
+  (`_adapt_mcp_servers`) and the parent agent's system prompt via an
+  `<aitelier_context>` block (`_open_acp_session`). The inner agent
+  can now learn its own run_id and dispatch children with the right
+  `parent_run_id`.
+- **`aitelier-mcp` gains `get_my_run_id` tool** reading
+  `AITELIER_RUN_ID` from the stdio env.
+- `Run.result` now surfaced by `_run_to_dict` (was persisted but
+  silently dropped); Python SDK Run model gains the field.
+- INTEGRATION.md documents the self-identification mechanism (replaces
+  the broken `$AITELIER_RUN_ID` shell-var docs).
+- Examples 01 and 02 fixed: `await ait.openai()` → `ait.openai()`
+  (Python is sync); `run.result.get("content")` works because the field
+  is now returned; example 02 uses `get_my_run_id` instead of an
+  un-implementable prompt placeholder.
+
+### Earlier in unreleased — pre-Phase-A polish
 
 - **Multi-agent workflows.** `parent_run_id` is a pure-passthrough field
   on `/v1/runs` and `/v1/chat/completions` (agent path). No FK, no

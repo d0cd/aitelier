@@ -1,9 +1,10 @@
 -- aitelier storage schema v2: idempotency keys
 --
--- Lets the SDK retry POSTs that have side effects (notably /v1/agent with
--- prepare.commands) without re-triggering them. The retry resends the same
--- Idempotency-Key header; if we've already executed it, return the stored
--- response instead of running the work again.
+-- Lets the SDK retry POSTs that have side effects (the agent path of
+-- /v1/chat/completions with `aitelier.prepare.commands`, or /v1/runs)
+-- without re-triggering them. The retry resends the same Idempotency-Key
+-- header; if we've already executed it, return the stored response
+-- instead of running the work again.
 --
 -- `body_hash` lets us detect "same key, different body" — a consumer bug
 -- worth surfacing loud (HTTP 422) rather than silently treating as a new
@@ -12,7 +13,7 @@
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key              TEXT PRIMARY KEY,
     body_hash        TEXT NOT NULL,            -- sha256(request body bytes)
-    endpoint         TEXT NOT NULL,            -- e.g. "/v1/agent"
+    endpoint         TEXT NOT NULL,            -- e.g. "/v1/chat/completions"
     status_code      INTEGER NOT NULL,
     response_json    JSONB NOT NULL,
     run_id           TEXT,                     -- link back to runs table when applicable

@@ -88,8 +88,10 @@ full surface; `docs/INTEGRATION.md` for the rationale.
 ```
 core/                   Python core (FastAPI service, providers, storage)
 sdks/python/            Python SDK (`aitelier_client`)
+sdks/python-mcp/        MCP server exposing the control plane (`aitelier-mcp`)
 sdks/typescript/        TypeScript SDK (`aitelier`)
 schemas/v1/             JSON Schemas — control-plane wire format
+examples/               Runnable recipes against a live aitelier
 docker/                 docker-compose (Postgres, LiteLLM, optional Ollama)
 scripts/                start / stop / status / doctor / release
 docs/                   design, plan, integration guide

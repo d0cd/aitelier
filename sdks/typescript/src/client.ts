@@ -63,12 +63,15 @@ function discoverBaseUrl(): string | undefined {
   return undefined;
 }
 
-export interface AtelierOptions {
+export interface AitelierOptions {
   baseUrl?: string;
   apiKey?: string;
   /** Per-request timeout in milliseconds. Default 60s. */
   timeoutMs?: number;
 }
+
+/** @deprecated Use AitelierOptions. Kept as an alias for the 0.1.x typo. */
+export type AtelierOptions = AitelierOptions;
 
 export interface SubmitRunOpts {
   model: string;                       // must start with `agent:`
@@ -88,7 +91,7 @@ export class Aitelier {
   // installed can still use the control plane.
   private _openai?: OpenAI;
 
-  constructor(opts: AtelierOptions = {}) {
+  constructor(opts: AitelierOptions = {}) {
     this.baseUrl = (
       opts.baseUrl ?? discoverBaseUrl() ?? DEFAULT_BASE_URL
     ).replace(/\/$/, "");
@@ -227,6 +230,51 @@ export class Aitelier {
 
   async listRunEvents(runId: string): Promise<RunEvent[]> {
     return this.getJson<RunEvent[]>(`/v1/runs/${runId}/events`);
+  }
+
+  /**
+   * Stream run events as Server-Sent Events. Yields parsed
+   * `{type, data}` records and closes when the server closes the
+   * stream (terminal run drains the backlog, then closes; in-flight
+   * runs stream until the run is terminal).
+   *
+   * Uses native `fetch` streaming. Cancellation: break out of the
+   * async iteration and the underlying reader is released.
+   */
+  async *streamRunEvents(runId: string): AsyncIterator<{ type: string; data: unknown }> {
+    const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/events/stream`, {
+      headers: { ...this.authHeader(), Accept: "text/event-stream" },
+    });
+    if (!resp.ok || !resp.body) {
+      throw new Error(`streamRunEvents failed: ${resp.status}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) return;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const block = buf.slice(0, idx);
+          buf = buf.slice(idx + 2);
+          let event = "message";
+          let data = "";
+          for (const line of block.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (data) {
+            try { yield { type: event, data: JSON.parse(data) }; }
+            catch { /* skip malformed frame */ }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   async listActiveRuns(): Promise<ActiveRuns> {

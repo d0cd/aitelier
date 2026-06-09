@@ -394,8 +394,8 @@ async def _chat_completion_via_ollama(
         raise LLMError(classify_error(exc), str(exc)) from exc
     if resp.status_code >= 400:
         raise LLMError(
-            "ProviderError",
-            resp.text[:500],
+            _classify_llm_status(resp.status_code),
+            _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
     return _ollama_to_chat_completion(resp.json(), request_model=body["model"])
@@ -425,7 +425,8 @@ async def _chat_completion_via_ollama_stream(
         if resp.status_code >= 400:
             await resp.aread()
             raise LLMError(
-                "ProviderError", resp.text[:500],
+                _classify_llm_status(resp.status_code),
+                _safe_upstream_message(resp.status_code, resp),
                 status_code=resp.status_code,
             )
         async for line in resp.aiter_lines():

@@ -104,7 +104,13 @@ async def _run_tick(now: datetime,
         if not s.next_run_at or s.next_run_at > now:
             continue
         logger.info("Firing schedule %s (%s)", s.id, s.name)
-        asyncio.create_task(handler(_to_dict(s)))
+        # Hand the handler the unredacted task — it needs real
+        # `headers` / `env` values to dispatch the inference call.
+        # The HTTP projection (_to_dict) redacts; this in-process path
+        # doesn't cross a trust boundary.
+        entry = _to_dict(s)
+        entry["task"] = s.task
+        asyncio.create_task(handler(entry))
         nxt = _next_run_after(now, Schedule(
             id=s.id, name=s.name, task=s.task,
             interval_seconds=s.interval_seconds, at_iso=s.at_iso,
@@ -141,10 +147,13 @@ def stop_tick_loop() -> None:
 
 
 def _to_dict(s: Schedule) -> dict[str, Any]:
+    # Late import: schedules.py is imported during config setup so it can't
+    # reach back into server at module load.
+    from aitelier.server import _redact_secrets
     return {
         "id": s.id,
         "name": s.name,
-        "task": s.task,
+        "task": _redact_secrets(s.task),
         "interval_seconds": s.interval_seconds,
         "at_iso": s.at_iso.isoformat() if s.at_iso else None,
         "webhook_url": s.webhook_url,
@@ -152,3 +161,10 @@ def _to_dict(s: Schedule) -> dict[str, Any]:
         "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
+
+
+def _task_for_dispatch(s: Schedule) -> dict:
+    """Return the unredacted task dict that the scheduler hands to the
+    inference path. `_to_dict` redacts secrets for the HTTP projection;
+    the in-process dispatch still needs the real values."""
+    return s.task

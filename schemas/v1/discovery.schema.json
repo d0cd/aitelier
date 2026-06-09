@@ -67,6 +67,11 @@
         }
       }
     },
+    "models": {
+      "type": "array",
+      "description": "Convenience list of model identifiers callable on /v1/chat/completions (LiteLLM aliases + curated agent: routes). The authoritative listing is GET /v1/models.",
+      "items": { "type": "string" }
+    },
     "schemas": {
       "type": "object",
       "description": "Map of schema name → fetch URL",

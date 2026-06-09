@@ -161,9 +161,11 @@ export interface TraceRecord {
   costUsd?: number;
   systemPromptHash?: string;
   traceTag?: string;
+  parentRunId?: string | null;
   status?: string;
   errorType?: string;
   errorMsg?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface TracesAggregateBucket {

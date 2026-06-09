@@ -50,9 +50,15 @@ async def _purge_tick() -> None:
 
 
 async def _loop() -> None:
-    interval = get_config().purge.interval_seconds
     while True:
         try:
+            # Re-read on every tick so operator config edits take effect
+            # without a restart. A zero/negative value pauses the worker
+            # without killing it.
+            interval = get_config().purge.interval_seconds
+            if interval <= 0:
+                await asyncio.sleep(60)
+                continue
             await asyncio.sleep(interval)
             await _purge_tick()
         except asyncio.CancelledError:

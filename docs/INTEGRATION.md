@@ -489,6 +489,26 @@ GET    /v1/runs/{run_id}/events       # all events
 GET    /v1/runs/{run_id}/events/stream # SSE — tails events live
 ```
 
+### `POST /v1/runs/{run_id}/wait`
+
+Server-side polling: blocks until the run reaches a terminal state
+(`completed`, `failed`, `cancelled`, `orphaned`), then returns the Run
+row.
+
+```
+POST /v1/runs/{run_id}/wait?timeout=60&poll_interval=0.5
+```
+
+- `timeout` ∈ (0, 600] seconds (default 60). 408 when elapsed with
+  the run still pending/running — caller retries to keep waiting.
+- `poll_interval` ∈ (0, 10] seconds (default 0.5).
+- 404 if the run id doesn't exist.
+
+SDK methods: `Aitelier.wait_for_run(run_id, timeout=…)` (Python) and
+`Aitelier.waitForRun(runId, { timeoutSeconds })` (TypeScript). Use when
+you submitted async via `POST /v1/runs` and don't want to stand up a
+webhook receiver.
+
 ### `POST /v1/runs/{run_id}/cancel`
 
 Cancel an in-flight run by ID. Returns `{run_id, cancelled: true}` on
@@ -797,8 +817,12 @@ worker:
   5 attempts.
 - **Optional HMAC signing**: set `[service] webhook_secret` to enable a
   `X-Aitelier-Signature: sha256=<hmac>` header on every delivery.
-- **SSRF guard** (hosted mode only): when `[service] api_key` is set,
-  webhook URLs must resolve to a public, non-loopback host.
+- **SSRF guard** (always on): webhook URLs must resolve to a public,
+  non-loopback host at enqueue time AND at delivery time (DNS-rebinding
+  protection across both windows). Set `[service]
+  allow_loopback_webhooks = true` to opt back into loopback callbacks
+  for local dev. The check applies in both localhost-trust and hosted
+  modes.
 
 The payload is the ChatCompletion (success) or
 `{error: {...}, aitelier_run_id}` (failure).

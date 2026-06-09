@@ -310,7 +310,7 @@ def _warn_remote_misconfig(
             "workspace=%s looks like a host path but Sandbox Agent is remote "
             "(%s); the directory likely doesn't exist inside the sandbox. "
             "Use a path under /workspace (the SA default) or seed files via "
-            "the `prepare.files` option on /v1/agent.",
+            "the `aitelier.prepare.files` option on /v1/chat/completions.",
             workspace, sa_base_url,
         )
 
@@ -566,7 +566,8 @@ async def call_via_sandbox(
 
 
 # ---------------------------------------------------------------------------
-# Streaming entry point used by /v1/agent/stream and call_via_sandbox
+# Streaming entry point used by the agent path of /v1/chat/completions
+# (`stream: true`) and by the non-streaming call_via_sandbox wrapper.
 # ---------------------------------------------------------------------------
 
 

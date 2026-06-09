@@ -33,11 +33,11 @@ Each test should be:
 
 ## What's covered
 
-- `/v1/complete` sync + stream round-trip
-- `/v1/embed`
-- `/v1/agent` sync against the `mock` SA backend
-- `/v1/agent/stream` SSE event ordering
-- `/v1/agent` with `mode: "async"` + webhook callback
+- `/v1/chat/completions` (LLM path) sync + stream round-trip
+- `/v1/embeddings`
+- `/v1/chat/completions` (agent path) sync against the `mock` SA backend
+- `/v1/chat/completions` (agent path) `stream: true` SSE event ordering
+- `/v1/runs` async submission + webhook callback
 - `/v1/schedules` CRUD
 - `/v1/runs` query + `/v1/runs/{id}/events` follow-up
 

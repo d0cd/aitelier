@@ -14,6 +14,7 @@ import re
 import resource
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error
@@ -266,9 +267,12 @@ async def lifespan(app: FastAPI):
                 )
 
     # Purge old runs on startup
-    deleted = await store.purge_old_runs(max_age_days=30)
+    run_retention = get_config().purge.run_retention_days
+    deleted = await store.purge_old_runs(max_age_days=run_retention)
     if deleted:
-        logger.info("Purged %d runs older than 30 days", deleted)
+        logger.info(
+            "Purged %d runs older than %d days", deleted, run_retention,
+        )
 
     # Start the persistent schedule tick loop
     from aitelier.schedules import start_tick_loop, stop_tick_loop
@@ -332,57 +336,64 @@ app = FastAPI(title="aitelier", version="0.1.0", lifespan=lifespan)
 _AUTH_EXEMPT_PATHS = {"/v1/health"}
 
 
-@app.middleware("http")
-async def _auth_middleware(request: Request, call_next):
-    """Gate every /v1/* endpoint on Authorization: Bearer <api_key> *if*
-    service.api_key is configured. When unset (default), no auth is enforced
-    — preserves the localhost-trust model.
+# Rate limit state — in-process token bucket keyed by (api_key or remote_addr).
+# Single-process assumption; horizontal scaling would move this to Redis.
+# OrderedDict so the LRU eviction below has O(1) `popitem(last=False)`.
+_rate_limit_buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
+_RATE_LIMIT_EXEMPT_PATHS = {"/v1/health"}
+_RATE_LIMIT_BUCKET_CAP = 10_000
 
-    /v1/health is always public so liveness probes (k8s, load balancers)
-    can hit it without a token.
-    """
+
+def _rate_limit_key(request: Request) -> str:
+    """Identify the caller for rate-limiting. Bearer token if present (so
+    a single key shared by N clients is one bucket), else remote IP.
+    No X-Forwarded-For parsing: behind a reverse proxy every external
+    caller shares one IP bucket — a hosted-mode deployment should either
+    set per-key budgets via api_key + rate_limit_per_minute, or run the
+    rate limit in the proxy itself."""
+    auth = request.headers.get("Authorization") or ""
+    if auth.startswith("Bearer "):
+        return f"bearer:{auth[7:]}"
+    client = request.client
+    return f"ip:{client.host}" if client else "ip:unknown"
+
+
+# Registered FIRST so it executes LAST in the middleware stack — auth runs
+# before rate-limit, so unauthenticated traffic can't fill the bucket map.
+@app.middleware("http")
+async def _rate_limit_middleware(request: Request, call_next):
+    """Per-caller token bucket. Returns 429 with Retry-After when the
+    bucket is empty. 0 = disabled (default). Excludes /v1/health.
+
+    Bucket capacity equals the per-minute budget; the bucket refills
+    linearly at budget/60 tokens per second. The bucket map is LRU-
+    capped at _RATE_LIMIT_BUCKET_CAP entries so a caller cycling Bearer
+    values can't grow it without bound."""
     from fastapi.responses import JSONResponse
 
-    from aitelier.config import get_config
+    budget = get_config().service.rate_limit_per_minute
+    if budget <= 0 or request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
+        return await call_next(request)
 
-    if request.url.path not in _AUTH_EXEMPT_PATHS:
-        configured = get_config().service.api_key
-        if configured:
-            auth = request.headers.get("Authorization") or ""
-            # Constant-time compare so an attacker can't reconstruct the
-            # key byte-by-byte via response timing.
-            if not auth.startswith("Bearer ") or not hmac.compare_digest(
-                auth[7:], configured,
-            ):
-                return JSONResponse(
-                    {"detail": "Unauthorized"}, status_code=401,
-                )
+    now = time.monotonic()
+    refill_rate = budget / 60.0
+    key = _rate_limit_key(request)
+    tokens, last = _rate_limit_buckets.get(key, (float(budget), now))
+    tokens = min(float(budget), tokens + (now - last) * refill_rate)
+    if tokens < 1.0:
+        retry_after = max(1, int((1.0 - tokens) / refill_rate))
+        _rate_limit_buckets[key] = (tokens, now)
+        _rate_limit_buckets.move_to_end(key)
+        return JSONResponse(
+            {"detail": "Rate limit exceeded"},
+            status_code=429,
+            headers={"Retry-After": str(retry_after)},
+        )
+    _rate_limit_buckets[key] = (tokens - 1.0, now)
+    _rate_limit_buckets.move_to_end(key)
+    while len(_rate_limit_buckets) > _RATE_LIMIT_BUCKET_CAP:
+        _rate_limit_buckets.popitem(last=False)
     return await call_next(request)
-
-
-_CORRELATION_ID_MAX_LEN = 128
-_CORRELATION_ID_CHARSET = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
-
-
-@app.middleware("http")
-async def _correlation_id_middleware(request: Request, call_next):
-    """Echo or generate X-Correlation-Id so consumers can tie their logs
-    to ours. Untrusted input — length-cap and charset-restrict to keep
-    log lines parseable and to block log-injection / terminal-escape
-    vectors when the CID is rendered into structured log output."""
-    raw = request.headers.get("X-Correlation-Id")
-    if raw and _CORRELATION_ID_CHARSET.match(raw):
-        cid = raw
-    else:
-        cid = str(uuid.uuid4())
-    request.state.correlation_id = cid
-    token = _correlation_id_var.set(cid)
-    try:
-        response = await call_next(request)
-    finally:
-        _correlation_id_var.reset(token)
-    response.headers["X-Correlation-Id"] = cid
-    return response
 
 
 @app.middleware("http")
@@ -424,49 +435,55 @@ async def _body_size_middleware(request: Request, call_next):
     return await call_next(request)
 
 
-# Rate limit state — in-process token bucket keyed by (api_key or remote_addr).
-# Single-process assumption; horizontal scaling would move this to Redis.
-_rate_limit_buckets: dict[str, tuple[float, float]] = {}
-_RATE_LIMIT_EXEMPT_PATHS = {"/v1/health"}
-
-
-def _rate_limit_key(request: Request) -> str:
-    """Identify the caller for rate-limiting. Bearer token if present (so
-    a single key shared by N clients is one bucket), else remote IP."""
-    auth = request.headers.get("Authorization") or ""
-    if auth.startswith("Bearer "):
-        return f"bearer:{auth[7:]}"
-    client = request.client
-    return f"ip:{client.host}" if client else "ip:unknown"
+_CORRELATION_ID_CHARSET = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
 
 
 @app.middleware("http")
-async def _rate_limit_middleware(request: Request, call_next):
-    """Per-caller token bucket. Returns 429 with Retry-After when the
-    bucket is empty. 0 = disabled (default). Excludes /v1/health.
+async def _correlation_id_middleware(request: Request, call_next):
+    """Echo or generate X-Correlation-Id so consumers can tie their logs
+    to ours. Untrusted input — length-cap and charset-restrict to keep
+    log lines parseable and to block log-injection / terminal-escape
+    vectors when the CID is rendered into structured log output."""
+    raw = request.headers.get("X-Correlation-Id")
+    if raw and _CORRELATION_ID_CHARSET.match(raw):
+        cid = raw
+    else:
+        cid = str(uuid.uuid4())
+    request.state.correlation_id = cid
+    token = _correlation_id_var.set(cid)
+    try:
+        response = await call_next(request)
+    finally:
+        _correlation_id_var.reset(token)
+    response.headers["X-Correlation-Id"] = cid
+    return response
 
-    Bucket capacity equals the per-minute budget; the bucket refills
-    linearly at budget/60 tokens per second."""
+
+# Registered LAST so it executes FIRST — every other middleware runs only
+# for authenticated callers (in hosted mode).
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    """Gate every /v1/* endpoint on Authorization: Bearer <api_key> *if*
+    service.api_key is configured. When unset (default), no auth is enforced
+    — preserves the localhost-trust model.
+
+    /v1/health is always public so liveness probes (k8s, load balancers)
+    can hit it without a token.
+    """
     from fastapi.responses import JSONResponse
 
-    budget = get_config().service.rate_limit_per_minute
-    if budget <= 0 or request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
-        return await call_next(request)
-
-    now = time.monotonic()
-    refill_rate = budget / 60.0
-    key = _rate_limit_key(request)
-    tokens, last = _rate_limit_buckets.get(key, (float(budget), now))
-    tokens = min(float(budget), tokens + (now - last) * refill_rate)
-    if tokens < 1.0:
-        retry_after = max(1, int((1.0 - tokens) / refill_rate))
-        _rate_limit_buckets[key] = (tokens, now)
-        return JSONResponse(
-            {"detail": "Rate limit exceeded"},
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-        )
-    _rate_limit_buckets[key] = (tokens - 1.0, now)
+    if request.url.path not in _AUTH_EXEMPT_PATHS:
+        configured = get_config().service.api_key
+        if configured:
+            auth = request.headers.get("Authorization") or ""
+            # Constant-time compare so an attacker can't reconstruct the
+            # key byte-by-byte via response timing.
+            if not auth.startswith("Bearer ") or not hmac.compare_digest(
+                auth[7:], configured,
+            ):
+                return JSONResponse(
+                    {"detail": "Unauthorized"}, status_code=401,
+                )
     return await call_next(request)
 
 
@@ -531,9 +548,19 @@ class AsyncRunRequest(ChatCompletionRequest):
 
 
 class ScheduleRequest(BaseModel):
-    name: str = "scheduled"
-    # Same shape as a /v1/chat/completions request body; validated by the
-    # scheduler when it fires (built into a ChatCompletionRequest then).
+    """Schedule a recurring or one-shot task. `task` mirrors the chat-
+    completions request body and is validated when the schedule fires.
+
+    `name` is charset-restricted because it flows into log lines and into
+    the inner agent's `<aitelier_context>` system-prompt block via
+    `make_run_id`; permitting arbitrary text would enable stored prompt-
+    injection across team users on the same aitelier."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        default="scheduled", min_length=1, max_length=64,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+    )
     task: dict
     interval_seconds: int | None = None
     at_iso: str | None = None
@@ -1691,6 +1718,34 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
     return accepted
 
 
+_REDACTED = "[redacted]"
+
+
+def _redact_secrets(value):
+    """Strip secret-bearing fields from any dict/list before it crosses the
+    HTTP boundary.
+
+    Authenticated callers reading `/v1/runs/{id}` or `/v1/schedules*` get
+    `environment.mcp_servers[*].headers` (Bearer tokens for third-party MCP
+    servers) and `prepare.commands[*].env` (DB DSNs, registry creds) back
+    verbatim otherwise. Stored runs / schedules keep the original values —
+    only the wire projection is redacted. The Sandbox Agent still receives
+    real values at dispatch time."""
+    if isinstance(value, dict):
+        out: dict = {}
+        for k, v in value.items():
+            if k in ("headers", "env") and isinstance(v, list):
+                out[k] = [_REDACTED for _ in v]
+            elif k in ("api_key", "token", "secret", "authorization"):
+                out[k] = _REDACTED
+            else:
+                out[k] = _redact_secrets(v)
+        return out
+    if isinstance(value, list):
+        return [_redact_secrets(item) for item in value]
+    return value
+
+
 # Field set for the TraceRecord shape on /v1/traces — a strict subset of the
 # Run dict. Kept narrower than _run_to_dict so /v1/traces stays focused on
 # the observability summary while /v1/runs surfaces operational fields
@@ -1726,7 +1781,7 @@ def _run_to_dict(run) -> dict:
         "sandbox_url": run.sandbox_url,
         "sandbox_server_id": run.sandbox_server_id,
         "workspace": run.workspace,
-        "environment": run.environment,
+        "environment": _redact_secrets(run.environment),
         "input_tokens": run.input_tokens,
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
@@ -2021,7 +2076,9 @@ async def get_run(run_id: str) -> dict:
 
 _KNOWN_LIMITATIONS = [
     "agent cost_usd is always null — only complete/embed track cost",
-    "traces are purged after 30 days on server startup",
+    "runs are purged on startup per [purge] run_retention_days "
+    "(default 30); events and terminal webhook deliveries age out via "
+    "the background purge worker",
 ]
 
 
@@ -2096,19 +2153,10 @@ def _normalize_maxrss(raw: int) -> int:
 
 
 async def _count_pending_webhooks(store) -> int:
-    """Best-effort pending-webhook count. The InMemoryStore exposes the
-    backing dict directly; PostgresStore has no count method today, so we
-    fall back to claiming and immediately re-queuing — expensive but
-    bounded by the small limit and only runs on /v1/metrics requests.
-    Returns 0 if the count probe fails for any reason."""
+    """Best-effort pending-webhook count for /v1/metrics. Failures yield 0
+    rather than 5xx-ing a metrics endpoint."""
     try:
-        backing = getattr(store, "_webhooks", None)
-        if isinstance(backing, dict):
-            return sum(
-                1 for d in backing.values()
-                if getattr(d, "state", None) == "pending"
-            )
-        return 0
+        return await store.count_pending_webhooks()
     except Exception:
         return 0
 
@@ -2284,11 +2332,9 @@ async def delete_schedule_endpoint(schedule_id: str) -> dict:
 
 
 
-# --- Workflow consolidation: prepare → agent → artifacts ---
-#
-# Aitelier orchestrates SA primitives so consumers make one /v1/agent call.
-# These helpers are private — they're not exposed as endpoints. Edge cases
-# beyond this workflow use SA directly via the URL in /v1/discovery.
+# Workflow helpers (run_prepare, stop_sidecars, fetch_artifacts,
+# prepare_failed_result) live in aitelier.sandbox_proxy and are imported
+# at the top of this file.
 
 
 # Sandbox-agent workflow helpers (run_prepare, stop_sidecars, fetch_artifacts,

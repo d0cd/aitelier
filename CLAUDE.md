@@ -101,16 +101,21 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
 ## Project structure
 
 - `core/src/aitelier/` — Python core
-  - `server.py` — FastAPI app + endpoint handlers
+  - `server.py` — FastAPI app + endpoint handlers + middleware
   - `openai_compat.py` — request/response models + OpenAI ↔ aitelier translation
   - `providers/` — `llm.py` (LiteLLM passthrough), `sandbox_agent.py` (ACP client)
   - `storage/` — `Store` protocol + `PostgresStore` + `InMemoryStore`, migrations, dataclasses
-  - `runner.py`, `runs.py` — run id/dir utilities + state-machine recording
-  - `schedules.py`, `webhook_worker.py` — recurring jobs + durable webhook delivery
+  - `sandbox_proxy.py` — SA workflow choreography (install / commands / files / sidecars / artifacts)
+  - `purge_worker.py` — background trim of idempotency keys, terminal webhooks, old events
+  - `webhook_worker.py` — durable webhook delivery worker
+  - `schedules.py` — recurring / one-shot job tick loop
+  - `runner.py`, `runs.py` — run id helper + state-machine recording (record_run, start_run)
   - `config.py`, `errors.py`, `security.py`, `cli.py`
 - `schemas/v1/` — JSON Schema source of truth for *control plane* wire format
 - `sdks/python/` — Python SDK (`aitelier_client`); inference via `Aitelier.openai()`
+- `sdks/python-mcp/` — MCP server (`aitelier-mcp`) exposing the control plane as tools
 - `sdks/typescript/` — TypeScript SDK (`aitelier`); inference via `Aitelier.openai()`
+- `examples/` — runnable recipes (fan-out, MCP orchestrator, scheduled audit, webhook receiver)
 - `docker/` — Postgres (always-on) + LiteLLM proxy + optional Ollama profile
 - `scripts/` — start.sh, stop.sh, release.sh, doctor.sh
 - `runs/` — gitignored agent run output (prompt, manifest); durable state lives in Postgres

@@ -87,6 +87,7 @@ class Store(Protocol):
                                        error: str | None,
                                        next_attempt_at: datetime | None) -> None: ...
     async def purge_old_webhook_deliveries(self, max_age_days: int = 7) -> int: ...
+    async def count_pending_webhooks(self) -> int: ...
 
     # Idempotency keys
     async def get_idempotent(self, key: str) -> IdempotencyRecord | None: ...
@@ -517,6 +518,14 @@ class PostgresStore:
         except ValueError:
             return 0
 
+    async def count_pending_webhooks(self) -> int:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT COUNT(*) AS n FROM webhook_deliveries "
+                "WHERE state = 'pending'",
+            )
+        return int(row["n"]) if row else 0
+
     async def purge_old_run_events(self, max_age_days: int = 30) -> int:
         cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
         async with self._pool.acquire() as conn:
@@ -854,6 +863,9 @@ class InMemoryStore:
         for wid in old:
             self._webhooks.pop(wid, None)
         return len(old)
+
+    async def count_pending_webhooks(self) -> int:
+        return sum(1 for w in self._webhooks.values() if w.state == "pending")
 
     # --- Idempotency keys ---
 

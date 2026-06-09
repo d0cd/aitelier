@@ -7,11 +7,14 @@ multiple call sites share.
 
 from __future__ import annotations
 
+import secrets
 from datetime import UTC, datetime
 
 
 def make_run_id(task_name: str) -> str:
-    # Microsecond precision avoids primary-key collisions when two requests
-    # land in the same wall-clock second (likely under any non-trivial load).
+    # Microsecond timestamp + 4 hex chars of entropy. Microseconds alone
+    # collide under tight async fan-outs (same wall-clock μs is plausible
+    # inside one event-loop tick); the suffix makes the PK collision-proof
+    # without giving up the chronological sort the timestamp provides.
     ts = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")
-    return f"{ts}_{task_name}"
+    return f"{ts}_{task_name}_{secrets.token_hex(2)}"

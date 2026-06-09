@@ -97,6 +97,8 @@ class ChatCompletionRequest(BaseModel):
 
 
 class EmbeddingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: str = "nomic-embed-text"
     input: str | list[str]
     encoding_format: str | None = None

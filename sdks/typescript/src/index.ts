@@ -3,7 +3,7 @@
  */
 
 export { Aitelier } from "./client.js";
-export type { AtelierOptions, SubmitRunOpts } from "./client.js";
+export type { AitelierOptions, AtelierOptions, SubmitRunOpts } from "./client.js";
 export { verifyWebhookSignature } from "./webhooks.js";
 export type {
   HealthResponse,

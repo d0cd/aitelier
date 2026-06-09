@@ -65,7 +65,9 @@ max_metadata_bytes = 65536
 
 [purge]
 # Background worker that trims expired idempotency keys, terminal webhook
-# deliveries, and old run events. Set interval_seconds = 0 to disable.
+# deliveries, and old run events. interval_seconds = 0 pauses the worker
+# without killing it (edits take effect on the next tick).
 interval_seconds = 3600
 webhook_retention_days = 7
 event_retention_days = 30
+run_retention_days = 30

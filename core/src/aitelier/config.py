@@ -104,6 +104,10 @@ class PurgeConfig:
     """Drop run_events older than this. Independent of the run row
     purge; events for runs that survive the purge window still age out
     on this clock."""
+    run_retention_days: int = 30
+    """Drop runs older than this on aitelier startup. Independent from
+    event retention so operators can keep events around longer for
+    auditing than the rows that pointed at them."""
 
 
 @dataclass
@@ -271,6 +275,9 @@ def load_config(path: Path | None = None) -> Config:
             ),
             event_retention_days=_section("purge").get(
                 "event_retention_days", PurgeConfig.event_retention_days,
+            ),
+            run_retention_days=_section("purge").get(
+                "run_retention_days", PurgeConfig.run_retention_days,
             ),
         ),
         runs_dir=raw.get("runs_dir", "runs"),

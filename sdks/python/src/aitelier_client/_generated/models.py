@@ -29,7 +29,11 @@ class TraceRecord(BaseModel):
     cost_usd: float | None = None
     system_prompt_hash: str | None = None
     trace_tag: str | None = None
+    parent_run_id: str | None = None
     status: str | None = None
+    error_type: str | None = None
+    error_msg: str | None = None
+    metadata: dict[str, Any] = {}
 
 
 class EndpointInfo(BaseModel):
