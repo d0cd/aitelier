@@ -42,15 +42,36 @@ services:
       timeout: 5s
       retries: 3
 
-  # sandbox-agent:
-  #   image: TBD  # no public image yet
-  #   ports:
-  #     - "8080:8080"
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock
-  #   env_file: .env
-  #   restart: unless-stopped
-  #   Uncomment when Sandbox Agent has a published image.
+  # Containerized Sandbox Agent. Off by default — start with:
+  #   docker compose --profile sa up -d
+  # or set `[sandbox_agent] mode = "docker"` in aitelier.toml so
+  # `make start` flips the profile for you (mirrors [ollama] mode).
+  #
+  # The agent inside SA inherits this container's permissions —
+  # filesystem reach is bounded by the `volumes` block below. Credential
+  # files (~/.claude, ~/.codex) are mounted read-only so SA can dispatch
+  # to claude-code / codex without baking secrets into the image.
+  #
+  # Workspace: aitelier passes `aitelier.workspace` as the agent's cwd.
+  # Mount any host paths the agent should be able to read/write under
+  # `/workspaces/<name>` and have callers reference that container path.
+  sandbox-agent:
+    profiles: ["sa"]
+    build:
+      context: .
+      dockerfile: sandbox-agent.Dockerfile
+    ports:
+      - "2468:2468"
+    volumes:
+      - "${HOME}/.claude:/root/.claude:ro"
+      - "${HOME}/.codex:/root/.codex:ro"
+      - aitelier_sa_workspaces:/workspaces
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:2468/v1/agents"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
 
   # Containerized Ollama. Off by default — start with:
   #   docker compose --profile ollama up -d
@@ -82,3 +103,4 @@ services:
 volumes:
   aitelier_pg_data: {}
   aitelier_ollama_models: {}
+  aitelier_sa_workspaces: {}

@@ -54,6 +54,26 @@ print("host")
     fi
 fi
 
+# Sandbox Agent mode: aitelier.toml [sandbox_agent] mode = "host" |
+# "docker" | "remote". "docker" flips the compose `sa` profile and skips
+# the host binary install. "remote" is auto-detected later by checking
+# whether base_url points off-localhost (preserves current behavior).
+SA_MODE="$(uv run python -c '
+import sys, tomllib
+from pathlib import Path
+for p in [Path("aitelier.toml"), Path.home()/".config"/"aitelier"/"config.toml"]:
+    if p.exists():
+        try:
+            print(tomllib.loads(p.read_text()).get("sandbox_agent", {}).get("mode", "host"))
+            sys.exit(0)
+        except Exception:
+            pass
+print("host")
+' 2>/dev/null || echo "host")"
+if [ "$SA_MODE" = "docker" ]; then
+    export AITELIER_SA_PROFILE=1
+fi
+
 # Sandbox Agent port resolution (in order):
 #   1. --sandbox-agent-port <N> CLI flag
 #   2. SANDBOX_AGENT_PORT env var
@@ -260,6 +280,9 @@ if [ "$MODE" = "ollama" ] || [ "${AITELIER_OLLAMA_PROFILE:-}" = "1" ]; then
     COMPOSE_PROFILE_ARGS+=("--profile" "ollama")
     MODE="full"  # ollama is a flavor of full, not a separate mode
 fi
+if [ "${AITELIER_SA_PROFILE:-}" = "1" ]; then
+    COMPOSE_PROFILE_ARGS+=("--profile" "sa")
+fi
 
 if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     echo ""
@@ -350,7 +373,21 @@ finally:
         session.write_text(backup)
 ' 2>/dev/null || echo "http://localhost:2468")"
 
-    if [[ "$RESOLVED_SANDBOX_URL" != *"localhost"* ]] \
+    if [ "${AITELIER_SA_PROFILE:-}" = "1" ]; then
+        echo "  Docker: SA runs in the compose `sa` profile container"
+        echo "  → docker compose --profile sa up -d (handled above)"
+        for i in {1..30}; do
+            if curl -sf "http://localhost:2468/v1/agents" >/dev/null 2>&1; then
+                echo "  ✓ sandbox-agent reachable on :2468 (docker)"
+                break
+            fi
+            sleep 1
+        done
+        if ! curl -sf "http://localhost:2468/v1/agents" >/dev/null 2>&1; then
+            echo "  ✗ docker sandbox-agent not responding after 30s"
+            echo "    Check: docker compose --profile sa logs sandbox-agent"
+        fi
+    elif [[ "$RESOLVED_SANDBOX_URL" != *"localhost"* ]] \
        && [[ "$RESOLVED_SANDBOX_URL" != *"127.0.0.1"* ]]; then
         echo "  Remote: $RESOLVED_SANDBOX_URL (skipping local install)"
         # Rewrite the session overlay so the remote URL wins over the

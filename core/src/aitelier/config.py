@@ -41,6 +41,21 @@ class LiteLLMConfig:
 
 @dataclass
 class SandboxAgentConfig:
+    mode: str = "host"
+    """How Sandbox Agent is hosted, for `scripts/start.sh`:
+      - "host":   install + run the SA binary locally (default; matches
+                  current behavior, no isolation).
+      - "docker": run SA inside the docker-compose `sa` profile container;
+                  the agent inherits the container's permissions, not
+                  the host's.
+      - "remote": SA runs elsewhere (E2B, Daytona, brig cell, another
+                  host); set `base_url` to the remote URL and `token`
+                  to the auth header. `start.sh` skips local install.
+
+    `base_url` is authoritative for the running aitelier service —
+    it's what we connect to. `mode` only steers `start.sh`'s
+    provisioning behavior.
+    """
     base_url: str = "http://localhost:2468"
     token: str | None = None
 
@@ -239,6 +254,7 @@ def load_config(path: Path | None = None) -> Config:
             api_key=litellm.get("api_key", LiteLLMConfig.api_key),
         ),
         sandbox_agent=SandboxAgentConfig(
+            mode=sandbox_agent.get("mode", SandboxAgentConfig.mode),
             base_url=sandbox_agent.get("base_url", SandboxAgentConfig.base_url),
             token=sandbox_agent.get("token", SandboxAgentConfig.token),
         ),

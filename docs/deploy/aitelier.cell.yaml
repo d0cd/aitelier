@@ -1,0 +1,104 @@
+# Example brig cell for aitelier + Sandbox Agent.
+#
+# Run with: brig run --file docs/deploy/aitelier.cell.yaml -d
+# Attach:   brig shell aitelier
+# Logs:     brig logs aitelier -f
+# Network:  brig network aitelier
+#
+# Architecture:
+#   - aitelier service + Sandbox Agent both run inside this cell.
+#   - SA's `mode = "host"` (within the cell — the cell IS the sandbox).
+#   - Workspaces are bind-mounted as declared in `volumes:` below.
+#   - LiteLLM and Postgres are reached via host_services routing.
+#   - Outbound network is allowlisted via Warden (`policy.allow`).
+#
+# For Docker-mode deployment outside brig, see docker/docker-compose.yml's
+# `sa` profile and set `[sandbox_agent] mode = "docker"` in aitelier.toml.
+
+name: aitelier
+image: localhost/aitelier:latest
+command: ["./scripts/start.sh"]
+memory: 8g
+cpus: 4
+pids_limit: 4096
+network: default
+detach: true
+workspace_quota: "20g"
+
+# --- Workspaces ---
+# Mount only the host paths the agent should be able to read/write.
+# Phase I's `service.allowed_workspace_roots` should reference these.
+volumes:
+  - host: ${HOME}/projects
+    cell: /work/projects
+    mode: ro              # read-only by default; flip to rw per project
+  # - host: ${HOME}/.brig/state/agent-workspaces/aitelier
+  #   cell: /work/workspaces
+  #   mode: rw
+
+# --- Credentials ---
+# brig secrets are mounted into the cell at /run/brig/secrets/<name>.
+# aitelier reads ~/.claude/.credentials.json + ~/.codex/auth.json via
+# start.sh's credential extraction step — symlink them in or set the
+# paths via env.
+secrets:
+  - aitelier-api-key            # service.api_key (hosted mode)
+  - aitelier-webhook-secret     # service.webhook_secret
+  - claude-credentials          # → /root/.claude/.credentials.json
+  - codex-credentials           # → /root/.codex/auth.json
+
+env:
+  # Aitelier reads only TOML; we point its config dir at the cell-mounted
+  # configuration we generate from the secrets above.
+  AITELIER_CONFIG_DIR: /work/config
+  # SA mode is "host" inside the cell (the cell is the sandbox).
+  AITELIER_SA_MODE: host
+  # Workspace allowlist matches the volumes above.
+  AITELIER_ALLOWED_WORKSPACE_ROOTS: /work/projects,/work/workspaces
+
+# --- Network policy ---
+# Warden enforces this; default deny + explicit allow.
+policy:
+  allow:
+    # LLM providers (uncomment what your routes need).
+    - "api.anthropic.com"
+    - "api.openai.com"
+    # - "generativelanguage.googleapis.com"
+
+    # Sandbox-agent install (one-time on first start).
+    - "releases.rivet.dev"
+
+    # Package managers if start.sh re-installs anything in-cell.
+    - "pypi.org"
+    - "*.pypi.org"
+    - "files.pythonhosted.org"
+
+    # MCP servers (allowlist per your consumers' configs).
+    # - "*.your-mcp-host.example"
+
+  deny: []
+
+# --- Ingress ---
+# aitelier serves on :7777 inside the cell. Expose to other cells via
+# `*.host.brig` routing — consumers like hermes hit
+# http://aitelier.host.brig from their own cells without needing the
+# real port.
+ingress:
+  - name: api
+    port: 7777
+    path_prefix: /v1
+    auth: token
+
+# --- Host services ---
+# Aitelier needs Postgres + LiteLLM. Either run them as additional
+# cells and route via host_services, or run them on the host and
+# expose via brig policy.
+# host_services:
+#   - name: postgres
+#     port: 5433
+#   - name: litellm
+#     port: 4000
+
+labels:
+  purpose: ai-runtime
+  consumers: hermes,dispatcher,deepread

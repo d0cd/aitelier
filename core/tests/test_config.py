@@ -17,8 +17,24 @@ def test_load_defaults(tmp_path, monkeypatch):
     assert cfg.litellm.api_key == "sk-litellm-local"
     assert cfg.sandbox_agent.base_url == "http://localhost:2468"
     assert cfg.sandbox_agent.token is None
+    assert cfg.sandbox_agent.mode == "host"
     assert cfg.service.port == 7777
     assert cfg.runs_dir == "runs"
+
+
+def test_sandbox_agent_mode_loaded_from_file(tmp_path, monkeypatch):
+    """`[sandbox_agent] mode = "docker"` opts the start.sh into the
+    compose `sa` profile; aitelier itself still talks to whatever
+    `base_url` points at."""
+    monkeypatch.chdir(tmp_path)
+    config_file = tmp_path / "config.toml"
+    config_file.write_text("""
+[sandbox_agent]
+mode = "docker"
+base_url = "http://localhost:2468"
+""")
+    cfg = load_config(config_file)
+    assert cfg.sandbox_agent.mode == "docker"
 
 
 def test_explicit_path_missing_raises():

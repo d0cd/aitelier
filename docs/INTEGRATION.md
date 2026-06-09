@@ -1069,6 +1069,47 @@ components with `O_NOFOLLOW`; SA needs to adopt it. Until that lands,
 the application-side defense here is the consumer's first layer; a
 mount-side `nosymfollow` (podman 5.x) closes the bug class entirely.
 
+### Where Sandbox Agent runs (isolation comes from the substrate)
+
+Rivet's Sandbox Agent is a control plane, not a sandbox. It's a
+15 MB Rust binary that gives a uniform HTTP/ACP API over claude-code /
+codex / opencode / cursor / amp / pi. **Isolation comes from wherever
+you run the binary** — SA itself doesn't add it. aitelier supports
+three deployment modes via `[sandbox_agent] mode`:
+
+```toml
+[sandbox_agent]
+mode = "host"    # bare host install; no isolation. Default. Dev only.
+# mode = "docker"  # SA inside the docker-compose `sa` profile container.
+# mode = "remote"  # SA elsewhere; set base_url + token.
+```
+
+- **`mode = "host"`** — `scripts/start.sh` installs the SA binary
+  with `curl ... install.sh | sh` and runs it as your user. The agent
+  inherits your user's full host permissions. Fine for personal dev,
+  unsafe for any deployment that exposes /v1/* to untrusted callers.
+
+- **`mode = "docker"`** — `start.sh` flips on the compose `sa` profile
+  (`docker/sandbox-agent.Dockerfile`). SA runs in an Alpine container
+  with credentials mounted read-only; the agent inherits the
+  container's permissions. For strongest isolation, use Docker Desktop
+  Sandboxes (Docker Desktop 4.60+ runs each container in a microVM —
+  hard hypervisor boundary; the agent can't see host paths at all).
+
+- **`mode = "remote"`** — aitelier connects to SA running elsewhere.
+  Set `base_url` to the remote URL and `token` to the auth header in
+  `aitelier.secrets.toml`. Common targets: E2B, Daytona, Modal, Vercel
+  Sandboxes, Cloudflare Containers, or a brig cell. `start.sh` detects
+  non-localhost URLs and skips the local install.
+
+For **brig-cell deployments**, the recommended shape is the cell
+itself as the sandbox — aitelier + SA both run inside one cell with
+`mode = "host"` (within the cell). The cell's podman boundary +
+Warden network policy provide isolation. A sample
+`docs/deploy/aitelier.cell.yaml` shows the layout, including
+workspace mount declarations, ingress on :7777, and the recommended
+`policy.allow` list.
+
 ## Cost tracking
 
 LLM-path calls go through LiteLLM, which exposes cost via the

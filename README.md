@@ -81,6 +81,9 @@ full surface; `docs/INTEGRATION.md` for the rationale.
   idempotency, correlation IDs, cost tracking.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture + tradeoffs.
 - [`docs/PLAN.md`](docs/PLAN.md) — what's built, directions worth exploring, what's deliberately out of scope.
+- [`docs/deploy/`](docs/deploy/) — sample deployment configs (brig cell yaml, Docker compose profile).
+- [`examples/`](examples/) — four runnable recipes (fan-out, MCP orchestrator, scheduled audit, webhook receiver).
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 - [`CLAUDE.md`](CLAUDE.md) — orientation for AI agents working in this repo.
 
 ## Project layout

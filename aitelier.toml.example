@@ -29,11 +29,20 @@ base_url = "http://localhost:4000"
 #   api_key = "sk-litellm-local"
 
 [sandbox_agent]
-# aitelier runs agents (claude-code, codex, etc.) through Rivet's sandbox-agent
-# binary. `make start` installs and supervises it locally and writes the
-# chosen port to runs/.session.toml. To run against a remote sandbox
-# (closed-laptop tolerance), set base_url here to the remote host and put
-# `token = "..."` in aitelier.secrets.toml.
+# Where Sandbox Agent runs. SA is Rivet's coding-agent control plane;
+# it doesn't provide isolation itself — its host environment does.
+#
+#   "host":   install + run the SA binary directly on the host (default;
+#             no isolation; appropriate for personal dev only).
+#   "docker": run SA inside the docker-compose `sa` profile container;
+#             the agent inherits the container's permissions, not the
+#             host's. See `docker/sandbox-agent.Dockerfile`. For
+#             strongest isolation, use Docker Desktop Sandboxes (microVM
+#             mode, Docker Desktop 4.60+).
+#   "remote": SA runs elsewhere (E2B, Daytona, Modal, a brig cell, …);
+#             set base_url to the remote URL and put `token = "..."` in
+#             aitelier.secrets.toml. `make start` skips local install.
+mode = "host"
 base_url = "http://localhost:2468"
 
 [ollama]
