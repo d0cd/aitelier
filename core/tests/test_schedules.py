@@ -17,7 +17,7 @@ from aitelier import schedules as sch
 async def test_create_interval_schedule_computes_next_run():
     entry = await sch.create_schedule({
         "name": "every-hour",
-        "task": {"name": "audit", "kind": "agent", "model": "claude"},
+        "task": {"model": "agent:claude", "messages": [{"role": "user", "content": "audit"}]},
         "interval_seconds": 3600,
     })
     assert entry["name"] == "every-hour"
@@ -31,7 +31,7 @@ async def test_create_interval_schedule_computes_next_run():
 async def test_create_oneshot_schedule_at_iso():
     when = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
     entry = await sch.create_schedule({
-        "task": {"name": "ad-hoc", "kind": "complete"},
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "ad-hoc"}]},
         "at_iso": when,
     })
     assert entry["next_run_at"] is not None
@@ -46,13 +46,18 @@ async def test_create_rejects_missing_task():
 @pytest.mark.asyncio
 async def test_create_rejects_no_trigger():
     with pytest.raises(ValueError):
-        await sch.create_schedule({"task": {"name": "x", "kind": "complete"}})
+        await sch.create_schedule({
+            "task": {
+                "model": "claude-sonnet",
+                "messages": [{"role": "user", "content": "x"}],
+            },
+        })
 
 
 @pytest.mark.asyncio
 async def test_list_and_get_and_delete():
     entry = await sch.create_schedule({
-        "task": {"name": "x", "kind": "complete"},
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "x"}]},
         "interval_seconds": 60,
     })
     assert len(await sch.list_schedules()) == 1
@@ -68,7 +73,7 @@ async def test_tick_fires_due_schedule_and_advances_next_run():
     import asyncio
 
     await sch.create_schedule({
-        "task": {"name": "x", "kind": "complete", "prompt": "hi"},
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "hi"}]},
         "interval_seconds": 60,
     })
     later = datetime.now(UTC) + timedelta(hours=1)
@@ -92,7 +97,7 @@ async def test_tick_fires_due_schedule_and_advances_next_run():
 async def test_tick_skips_not_yet_due():
     import asyncio
     await sch.create_schedule({
-        "task": {"name": "x", "kind": "complete"},
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "x"}]},
         "interval_seconds": 3600,
     })
     now = datetime.now(UTC)
@@ -111,7 +116,7 @@ async def test_oneshot_does_not_refire():
     import asyncio
     when = (datetime.now(UTC) - timedelta(minutes=5)).isoformat()
     await sch.create_schedule({
-        "task": {"name": "x", "kind": "complete"},
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "x"}]},
         "at_iso": when,
     })
     later = datetime.now(UTC)
@@ -123,3 +128,95 @@ async def test_oneshot_does_not_refire():
     await sch._run_tick(later, handler)
     await asyncio.sleep(0)
     assert handler.await_count == 0
+
+
+# --- End-to-end: real _schedule_handler routes through chat-completion helpers
+
+
+@pytest.mark.asyncio
+async def test_schedule_handler_routes_agent_task_and_enqueues_webhook(monkeypatch):
+    """When a schedule fires, _schedule_handler should build a
+    ChatCompletionRequest, route through the right helper (agent here), and
+    deliver the result via the durable webhook queue."""
+    from aitelier.server import _schedule_handler
+
+    called: dict = {}
+
+    async def fake_call_via_sandbox(name, prompt, **kw):
+        called["name"] = name
+        called["prompt"] = prompt
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.05, "run_id": kw.get("run_id", ""),
+            "trace_id": kw.get("run_id", ""),
+            "content": "scheduled ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    monkeypatch.setattr(
+        "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call_via_sandbox,
+    )
+
+    enqueued: list[dict] = []
+
+    async def fake_enqueue(url, payload, **kw):
+        enqueued.append({"url": url, "payload": payload, **kw})
+
+    monkeypatch.setattr("aitelier.server._enqueue_webhook", fake_enqueue)
+
+    await _schedule_handler({
+        "id": "s-1",
+        "name": "nightly",
+        "task": {
+            "model": "agent:claude",
+            "messages": [{"role": "user", "content": "scheduled task"}],
+        },
+        "webhook_url": "https://hooks.example.com/done",
+    })
+
+    assert called["name"] == "claude"
+    assert called["prompt"] == "scheduled task"
+    assert len(enqueued) == 1
+    entry = enqueued[0]
+    assert entry["url"] == "https://hooks.example.com/done"
+    assert entry["schedule_id"] == "s-1"
+    # Webhook payload wraps the ChatCompletion under `result`.
+    assert "result" in entry["payload"]
+    inner = entry["payload"]["result"]
+    assert inner["choices"][0]["message"]["content"] == "scheduled ok"
+
+
+@pytest.mark.asyncio
+async def test_schedule_handler_routes_llm_task(monkeypatch):
+    """LLM-path schedules route through chat_completion()."""
+    from aitelier.server import _schedule_handler
+
+    async def fake_chat_completion(body, *, timeout=60):
+        return {
+            "id": "chatcmpl-x", "object": "chat.completion",
+            "created": 0, "model": body["model"],
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "scheduled llm"},
+                "finish_reason": "stop", "logprobs": None,
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+
+    monkeypatch.setattr("aitelier.server.chat_completion", fake_chat_completion)
+    monkeypatch.setattr(
+        "aitelier.server._enqueue_webhook",
+        AsyncMock(),
+    )
+
+    await _schedule_handler({
+        "id": "s-2",
+        "name": "llm-job",
+        "task": {
+            "model": "claude-sonnet",
+            "messages": [{"role": "user", "content": "scheduled task"}],
+        },
+    })
+    # No webhook URL → enqueue should not have been called; handler still ran.

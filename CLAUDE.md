@@ -1,137 +1,261 @@
 # aitelier
 
-Personal AI runtime — inference primitives, agent delegation, and observability for personal projects.
+Personal AI runtime — an OpenAI-compatible HTTP service plus an aitelier-native
+control plane for durable run state, traces, schedules, and async agent runs.
 
-## API surface (three primitives + traces)
+## API surface
 
-- **`complete()`** — structured chat completion (messages, system prompt, temperature, response format incl. JSON schema)
-- **`embed()`** — batch embeddings via LiteLLM proxy (default: nomic-embed-text, 768-dim)
-- **`runAgent()`** — delegate to external agent (Claude Code, Codex) with passthrough of: system prompt, MCP servers, tool allowlist, response format, max turns
-- **`recentTraces()`** — query SQLite trace store by tag, status, time range
+aitelier speaks **OpenAI shape for inference** and an **aitelier-native control plane**
+for everything else. Two clean layers.
 
-Legacy fan-out task system (`execute`, `fanout`) still works on top of these.
+### Inference — OpenAI shape
+
+- `POST /v1/chat/completions` — sync + streaming (`stream: true`)
+- `POST /v1/embeddings`
+- `GET  /v1/models`
+
+Model routing is by the `model` field:
+
+| `model` value | Path |
+|---|---|
+| `claude-sonnet-4-6`, `nomic-embed-text`, `local`, … | LiteLLM (curated alias) |
+| `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (passthrough wildcard) |
+| `agent:<backend>` | Sandbox Agent, backend's default LLM |
+| `agent:<backend>/<inner-llm>` | Sandbox Agent + explicit inner LLM |
+
+Agent-specific options ride in `extra_body.aitelier.*`:
+
+```json
+{
+  "model": "agent:claude/claude-sonnet-4-5",
+  "messages": [{"role": "user", "content": "audit this repo"}],
+  "stream": true,
+  "aitelier": {
+    "workspace": "/path/to/repo",
+    "mcp_servers": [...],
+    "tool_allowlist": [...],
+    "max_turns": 25,
+    "prepare":  { "commands": [...], "files": [...], "sidecars": [...] },
+    "artifacts": { "fetch": ["/workspace/out.json"] },
+    "trace_tag": "audit-run-2026-05"
+  }
+}
+```
+
+The agent path **hard-rejects** OpenAI fields it can't honestly map:
+`tools`, `tool_choice`, `n>1`, `top_p`. Silent drops are an anti-pattern.
+
+### Control plane — aitelier-native
+
+- `POST /v1/runs` — submit a long-running async agent; webhook on completion
+- `GET  /v1/runs[/{id}[/events[/stream]]]` — durable runs + append-only event timeline
+- `GET  /v1/runs/active`, `POST /v1/runs/{id}/cancel` — in-flight registry + cancel
+- `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
+- `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
+- `GET  /v1/health`, `GET /v1/discovery` — liveness + endpoint inventory + dependency probes
+
+All requests accept `X-Correlation-Id` (generated if absent), echoed in
+response header + body field + SSE chunks + run metadata.
+
+`/v1/discovery` is the live source of truth at runtime.
+
+## SDKs
+
+Both SDKs share the same shape: a thin `Aitelier` client for the control
+plane plus a `.openai()` helper that returns a preconfigured OpenAI client
+for inference. The OpenAI SDK is an optional peer dependency.
+
+```python
+from aitelier_client import Aitelier
+
+ait = Aitelier(base_url="http://localhost:7777", api_key="...")
+
+# Inference: pass-through to OpenAI SDK
+openai = ait.openai()
+resp = await openai.chat.completions.create(
+    model="agent:claude",
+    messages=[{"role": "user", "content": "audit this repo"}],
+    extra_body={"aitelier": {"workspace": "/path/to/repo"}},
+)
+
+# Control plane: aitelier methods
+runs = await ait.list_runs(trace_tag="audit", limit=20)
+traces = await ait.recent_traces(status="error")
+```
+
+```typescript
+import { Aitelier } from "aitelier";
+
+const ait = new Aitelier({ baseUrl: "http://localhost:7777", apiKey: "..." });
+
+const openai = await ait.openai();
+const resp = await openai.chat.completions.create({
+  model: "agent:claude",
+  messages: [{ role: "user", content: "audit this repo" }],
+  extra_body: { aitelier: { workspace: "/path/to/repo" } },
+} as any);
+
+const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
+```
 
 ## Project structure
 
-- `core/src/aitelier/` — Python core: providers, runner, server, config, traces, errors
-- `core/tasks/` — named task definitions (audit, research, lint, implement, summarize)
-- `schemas/v1/` — JSON Schema source of truth for wire format
-- `sdks/python/` — Python SDK (`aitelier_client`)
-- `sdks/typescript/` — TypeScript SDK (`aitelier`)
-- `tests/contract/` — shared contract test corpus
-- `docker/` — docker-compose for LiteLLM proxy
-- `scripts/` — start.sh, stop.sh, release.sh, generate-types.sh
-- `runs/` — gitignored run output + traces.db
+- `core/src/aitelier/` — Python core
+  - `server.py` — FastAPI app + endpoint handlers
+  - `openai_compat.py` — request/response models + OpenAI ↔ aitelier translation
+  - `providers/` — `llm.py` (LiteLLM passthrough), `sandbox_agent.py` (ACP client)
+  - `storage/` — `Store` protocol + `PostgresStore` + `InMemoryStore`, migrations, dataclasses
+  - `runner.py`, `runs.py` — run id/dir utilities + state-machine recording
+  - `schedules.py`, `webhook_worker.py` — recurring jobs + durable webhook delivery
+  - `config.py`, `errors.py`, `security.py`, `cli.py`
+- `schemas/v1/` — JSON Schema source of truth for *control plane* wire format
+- `sdks/python/` — Python SDK (`aitelier_client`); inference via `Aitelier.openai()`
+- `sdks/typescript/` — TypeScript SDK (`aitelier`); inference via `Aitelier.openai()`
+- `docker/` — Postgres (always-on) + LiteLLM proxy + optional Ollama profile
+- `scripts/` — start.sh, stop.sh, release.sh, doctor.sh
+- `runs/` — gitignored agent run output (prompt, manifest); durable state lives in Postgres
 
 ## Infrastructure
 
-Dockerized LiteLLM proxy + host-installed aitelier + host-installed Sandbox Agent
-binary (Rivet's coding-agent runtime). Credentials are extracted from Claude Code
-and Codex CLI credential files (`~/.claude/.credentials.json`,
+Dockerized Postgres + LiteLLM proxy + host-installed aitelier service + host-installed
+Sandbox Agent binary (Rivet's coding-agent runtime). Credentials are extracted
+from Claude Code and Codex CLI credential files (`~/.claude/.credentials.json`,
 `~/.codex/auth.json`) — no manual API keys needed.
 
 ```bash
 claude login              # once — OAuth login
 make install              # one-time setup
-make start                # credentials + LiteLLM proxy + Sandbox Agent + aitelier service
+make start                # Postgres + LiteLLM + Sandbox Agent + aitelier
 make stop                 # stops everything
-make test                 # runs all tests (unit + smoke)
+make test                 # runs all tests
 ```
 
-- **LiteLLM proxy** on `localhost:4000` — model routing, caching, cost tracking
+- **Postgres** on `localhost:5433` — durable run/event/schedule/webhook state.
+- **LiteLLM proxy** on `localhost:4000` — model routing, caching, cost tracking.
 - **Sandbox Agent** on `localhost:2468` (or dynamic) — runs coding agents in isolation;
-  `scripts/start.sh` installs the Rust binary on first run
+  `scripts/start.sh` installs the Rust binary on first run.
+- **Ollama** — opt-in via `[ollama] mode = "docker"` in `aitelier.toml`. On macOS the
+  default is "host" because Docker Desktop has no Metal/MPS passthrough.
 
-Available models (via LiteLLM): `local`, `claude-sonnet`, `claude-haiku`, `nomic-embed-text`
-Available agent backends (via Sandbox Agent): `claude`, `codex`, `opencode`, `cursor`, `amp`, `pi` (live list at `GET /v1/discovery → dependencies.sandbox_agent.agents`)
+Available models (via LiteLLM): `local`, `claude-sonnet`, `claude-haiku`, `nomic-embed-text`,
+plus any `anthropic/*`, `openai/*`, `ollama/*` pass-through string.
+
+Available agent backends (via Sandbox Agent): `claude`, `codex`, `opencode`, `cursor`, `amp`, `pi`
+(live list at `GET /v1/discovery → dependencies.sandbox_agent.agents`).
 
 ## Configuration
 
-Single file: `aitelier.toml` (repo-local) or `~/.config/aitelier/config.toml` (global).
-Env vars override: `LITELLM_BASE_URL`, `LITELLM_API_KEY`, `SANDBOX_AGENT_BASE_URL`.
+**Zero env-var reads in app code.** All configuration is TOML. Layered in this order
+(each layer overrides keys in the prior one):
 
-## HTTP endpoints
+1. **Defaults** — dataclass fields in `core/src/aitelier/config.py`.
+2. **Base** — explicit `--config <path>`, else `./aitelier.toml`, else
+   `~/.config/aitelier/config.toml`.
+3. **Secrets overlay** — `aitelier.secrets.toml` next to the base config
+   (gitignored). Same TOML shape; keys here override base. Put API keys,
+   tokens, and webhook secrets here.
+4. **Session overlay** — `runs/.session.toml` (gitignored, ephemeral). Written
+   by `scripts/start.sh` for runtime-discovered values (chosen sandbox-agent
+   port, dev Postgres DSN). Removed by `scripts/stop.sh`.
+
+```toml
+# aitelier.toml — example
+[database]
+url = "postgresql://aitelier:aitelier_local@localhost:5433/aitelier"
+
+[litellm]
+base_url = "http://localhost:4000"
+
+[sandbox_agent]
+base_url = "http://localhost:2468"
+
+[service]
+host = "127.0.0.1"
+port = 7777
+log_format = "human"   # or "json" for aggregator-friendly logs
+
+[storage]
+max_metadata_bytes = 65536
+
+[ollama]
+mode = "host"          # or "docker"
+
+# Put secrets in aitelier.secrets.toml (gitignored), not here:
+# [litellm]       api_key = "..."
+# [service]      api_key = "..."    # enables hosted-mode Bearer auth
+# [service]      webhook_secret = "..."
+# [sandbox_agent] token = "..."
+```
+
+The SDK clients (Python + TypeScript) read `~/.config/aitelier/config.toml`'s
+`[service]` for their default `baseUrl`; pass an explicit `base_url` to override.
+
+## Run state machine
+
+Every inference call records a row in `runs` and transitions through:
 
 ```
-POST /v1/complete             — chat completion
-POST /v1/complete/stream      — chat completion via SSE (complete.delta / complete.done / complete.error)
-POST /v1/embed                — batch embeddings
-POST /v1/agent                — run agent with MCP/tool options
-POST /v1/agent/stream         — run agent via SSE (agent.delta / tool_call / tool_result / done / error)
-POST /v1/agent/preview        — dry-run resolve MCP servers + allowlist (catch typos before a real run)
-GET  /v1/traces               — query trace store
-GET  /v1/traces/{id}          — get single trace
-POST /v1/execute              — run a named task
-POST /v1/execute/stream       — run task with SSE streaming
-POST /v1/fanout               — fan-out across providers
-GET  /v1/runs/{id}            — get run record
-GET  /v1/runs/active          — list in-flight run_ids in this process
-POST /v1/runs/{id}/cancel     — cancel an in-flight run
-GET  /v1/health               — cheap liveness probe (status, version, known_limitations)
-GET  /v1/discovery            — capability + endpoint inventory (live dependency probes)
-GET  /v1/schemas/{name}       — fetch a JSON Schema by name (task, result, events)
-GET  /v1/litellm/models       — proxy to LiteLLM /v1/models (lists every routable model)
-GET  /v1/sandbox/agents/{id}  — proxy to Sandbox Agent /v1/agents/{id} (capability info)
-GET  /v1/runs                 — list runs from durable store, with filters
-GET  /v1/runs/{id}/events     — paginated run event timeline
-GET  /v1/runs/{id}/events/stream — SSE: live event feed for one run
+pending → running → {completed | failed | cancelled | orphaned}
 ```
 
-All requests accept `X-Correlation-Id` (generated if absent), echoed in
-response header + body field + SSE events + trace metadata.
+`orphaned` is set on aitelier startup for any row left in `pending`/`running` from a
+previous process — Sandbox Agent has no session-resume API today, so those sessions
+are unrecoverable. Dashboards should treat `orphaned` as a terminal failure mode.
 
 ## Error types
 
-Errors are classified via `core/src/aitelier/errors.py`:
-
-| error_type | Triggers |
-|---|---|
-| `ProviderUnavailable` | ConnectError, ConnectionError, OSError |
-| `Timeout` | TimeoutException, TimeoutError, agent timeout |
-| `SchemaViolation` | JSONDecodeError, ValidationError |
-| `RateLimited` | HTTP 429 |
-| `AuthError` | HTTP 401/403 |
-| `ProviderError` | Other HTTP errors |
-| `NonZeroExit` | Agent CLI exited with error |
-| `Cancelled` | Run cancelled via `/v1/runs/{id}/cancel` (or asyncio.CancelledError) |
+Classification lives in `core/src/aitelier/errors.py`. Full table with consumer
+guidance: [`docs/INTEGRATION.md`](docs/INTEGRATION.md) → "Error handling".
 
 ## Key decisions
 
-- Python core, TypeScript + Python SDKs
-- LiteLLM proxy for LLM calls (not library mode)
-- Agent delegation via **Rivet's Sandbox Agent** (speaks ACP); all coding agents run isolated.
-  No direct subprocess invocation of `claude` / `codex` from aitelier anymore.
-- Schema-driven type generation — `schemas/v1/*.schema.json` is the source of truth
-- SQLite trace store in runs/ dir (queryable by trace_tag, status, time; purged after 30 days)
-- Dicts in core, typed models in SDKs
-- Agent `cost_usd` is always `null` by design: agent LLM calls happen inside
-  the Sandbox Agent process and go directly to Anthropic/OpenAI, bypassing
-  LiteLLM. Token usage *is* captured when the backend surfaces it. See
-  `docs/INTEGRATION.md` → "Cost tracking" for workarounds.
+- **OpenAI shape as the inference contract.** LiteLLM (LLM path) and Sandbox Agent
+  (agent path) both surface through `/v1/chat/completions` + `/v1/embeddings`.
+  Consumers point any OpenAI SDK at aitelier and get full ecosystem leverage
+  (eval frameworks, notebooks, tutorials, drop-in replacements).
+- **Aitelier-native control plane** for durable run state, traces, schedules.
+  These have no OpenAI equivalent and stay as first-class aitelier endpoints.
+- Python core, TypeScript + Python SDKs.
+- LiteLLM proxy for LLM calls (not library mode).
+- Agent delegation via **Rivet's Sandbox Agent** (speaks ACP); all coding agents
+  run isolated. No direct subprocess invocation of `claude` / `codex`.
+- **Postgres** for durable run/event/schedule/webhook state; `InMemoryStore`
+  fallback for tests and `[database] url`-less dev.
+- Webhook delivery is durable: queued in Postgres, retried with exponential
+  backoff (1s / 5s / 30s / 5min / 1hr, 5 attempts).
+- **Agent workflow consolidation**: `aitelier.prepare` + `aitelier.artifacts` lets one
+  HTTP call orchestrate install → commands → file seed → sidecars → agent → artifacts.
+  Edge cases beyond this workflow hit Sandbox Agent directly via the URL in
+  `/v1/discovery`.
+- Agent `cost_usd` is always `null` by design: agent LLM calls happen inside the
+  Sandbox Agent process and go directly to Anthropic/OpenAI, bypassing LiteLLM.
+  Token usage *is* captured when the backend surfaces it.
 
 ## Conventions
 
-- Task definitions in `core/tasks/` — one file per task, discovered by name
 - Generated types in `_generated/` dirs — never hand-edit
-- Run directories: `runs/{ISO-timestamp}_{task}/`
+- Run directories on disk: `runs/{ISO-timestamp}_{task}/` (prompt, manifest)
+- Durable state in Postgres tables: `runs`, `run_events`, `schedules`,
+  `webhook_deliveries`, `schema_version`
 - API versioning: `/v1/` prefix
 - Lockstep versioning across all packages
-- Kind values: `complete`, `embed`, `agent` (legacy `llm` mapped to `complete`)
+- Kind values: `complete`, `embed`, `agent` (internal — runs.kind)
 
 ## Build & run
 
 ```bash
 make install              # install all deps (Python + TypeScript)
-make test                 # run all tests (Python unit + smoke, TypeScript type check)
+make test                 # run all tests (Python unit + smoke, TypeScript)
 make test-py              # Python tests only
-make test-ts              # TypeScript type check only
+make test-ts              # TypeScript only
 make lint                 # ruff + tsc
 make start                # start infra + service
 make stop                 # stop everything
+make restart              # restart just the service (after editing core/)
+make logs                 # tail service + sandbox-agent logs
+make status               # what's running + log paths + dep healthchecks
+make doctor               # preflight: ports, tools, creds, docker
+make reset                # nuclear: stop + drop Postgres volume + wipe runs/
 make clean                # remove venv, build artifacts
 ./scripts/release.sh X.Y.Z  # lockstep version bump
 ```
-
-## Consumer contract (deepread)
-
-deepread is the first consumer. It depends on `complete()`, `embed()`, `runAgent()`, and `recentTraces()`. The contract is documented in deepread's repo. Breaking changes to these four primitives require coordinated updates. See `docs/INTEGRATION.md` for the consumer-facing guide.

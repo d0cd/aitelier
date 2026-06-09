@@ -8,12 +8,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from aitelier.storage.models import (
+    IdempotencyRecord,
     Run,
     RunEvent,
     RunFilter,
@@ -26,6 +26,14 @@ from aitelier.storage.models import (
 )
 
 logger = logging.getLogger("aitelier.storage")
+
+# Valid `group_by` values for aggregate_runs. Both PostgresStore (which maps
+# them to SQL expressions) and InMemoryStore (which maps them to attribute
+# lookups) reference this single set so the two impls can't drift.
+AGGREGATE_GROUP_KEYS = frozenset({
+    "trace_tag", "kind", "model", "agent_id",
+    "status", "error_type", "day",
+})
 
 
 class Store(Protocol):
@@ -41,8 +49,13 @@ class Store(Protocol):
     async def list_runs(self, flt: RunFilter) -> list[Run]: ...
     async def update_run_state(self, run_id: str, new_state: RunState,
                                  *, ended_at: datetime | None = None) -> None: ...
+    async def update_run_sandbox(self, run_id: str, *,
+                                   sandbox_url: str | None = None,
+                                   sandbox_server_id: str | None = None,
+                                   sandbox_backend: str | None = None) -> None: ...
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None: ...
+    async def mark_orphaned_running_runs(self) -> int: ...
     async def aggregate_runs(self, *, group_by: str = "trace_tag",
                               since: datetime | None = None,
                               until: datetime | None = None,
@@ -72,6 +85,11 @@ class Store(Protocol):
                                        status_code: int | None,
                                        error: str | None,
                                        next_attempt_at: datetime | None) -> None: ...
+
+    # Idempotency keys
+    async def get_idempotent(self, key: str) -> IdempotencyRecord | None: ...
+    async def record_idempotent(self, rec: IdempotencyRecord) -> None: ...
+    async def purge_expired_idempotency_keys(self) -> int: ...
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +223,41 @@ class PostgresStore:
                     new_state, ended, run_id,
                 )
 
+    async def update_run_sandbox(self, run_id: str, *,
+                                   sandbox_url: str | None = None,
+                                   sandbox_server_id: str | None = None,
+                                   sandbox_backend: str | None = None) -> None:
+        """Stamp the run row with the live SA endpoint + server_id (+ backend
+        classification) so a restart-time recovery step can find the session
+        it was bound to and dashboards can distinguish local vs remote runs.
+        Only fields passed as non-None are written — COALESCE preserves any
+        column already set."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE runs SET
+                  sandbox_url       = COALESCE($1, sandbox_url),
+                  sandbox_server_id = COALESCE($2, sandbox_server_id),
+                  sandbox_backend   = COALESCE($3, sandbox_backend)
+                WHERE run_id = $4
+                """,
+                sandbox_url, sandbox_server_id, sandbox_backend, run_id,
+            )
+
+    async def mark_orphaned_running_runs(self) -> int:
+        """Sweep on startup: any run still in `running` from a previous
+        aitelier process is unrecoverable (SA has no session-resume API yet).
+        Flip to `orphaned` so dashboards stop treating it as live."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE runs SET state = 'orphaned', ended_at = COALESCE(ended_at, now()) "
+                "WHERE state IN ('pending', 'running')"
+            )
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
+
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None:
         """Single transaction: update result columns + transition to terminal state."""
@@ -239,6 +292,8 @@ class PostgresStore:
                     run_id,
                 )
 
+    # SQL projections for AGGREGATE_GROUP_KEYS. Postgres-only; the in-memory
+    # store uses getattr on the same key set.
     _AGGREGATE_GROUP_EXPRS = {
         "trace_tag":  "COALESCE(trace_tag, '<none>')",
         "kind":       "COALESCE(kind, '<none>')",
@@ -253,10 +308,10 @@ class PostgresStore:
                               since: datetime | None = None,
                               until: datetime | None = None,
                               trace_tag: str | None = None) -> dict:
-        if group_by not in self._AGGREGATE_GROUP_EXPRS:
+        if group_by not in AGGREGATE_GROUP_KEYS:
             raise ValueError(
                 f"group_by must be one of: "
-                f"{', '.join(sorted(self._AGGREGATE_GROUP_EXPRS))}"
+                f"{', '.join(sorted(AGGREGATE_GROUP_KEYS))}"
             )
         expr = self._AGGREGATE_GROUP_EXPRS[group_by]
         where: list[str] = []
@@ -445,6 +500,49 @@ class PostgresStore:
                 status_code, error, next_attempt_at, new_state, delivery_id,
             )
 
+    # --- Idempotency keys ---
+
+    async def get_idempotent(self, key: str) -> IdempotencyRecord | None:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM idempotency_keys "
+                "WHERE key = $1 AND expires_at > now()",
+                key,
+            )
+        if row is None:
+            return None
+        return IdempotencyRecord(
+            key=row["key"], body_hash=row["body_hash"],
+            endpoint=row["endpoint"], status_code=row["status_code"],
+            response=_as_dict(row["response_json"]),
+            run_id=row["run_id"], created_at=row["created_at"],
+            expires_at=row["expires_at"],
+        )
+
+    async def record_idempotent(self, rec: IdempotencyRecord) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO idempotency_keys
+                  (key, body_hash, endpoint, status_code, response_json,
+                   run_id, expires_at)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)
+                ON CONFLICT (key) DO NOTHING
+                """,
+                rec.key, rec.body_hash, rec.endpoint, rec.status_code,
+                json.dumps(rec.response), rec.run_id, rec.expires_at,
+            )
+
+    async def purge_expired_idempotency_keys(self) -> int:
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM idempotency_keys WHERE expires_at <= now()",
+            )
+        try:
+            return int(result.rsplit(" ", 1)[-1])
+        except ValueError:
+            return 0
+
 
 # ---------------------------------------------------------------------------
 # In-memory implementation — for tests + when DATABASE_URL is unset
@@ -461,6 +559,7 @@ class InMemoryStore:
         self._events: dict[str, list[RunEvent]] = {}
         self._schedules: dict[str, Schedule] = {}
         self._webhooks: dict[int, WebhookDelivery] = {}
+        self._idempotency: dict[str, IdempotencyRecord] = {}
         self._next_webhook_id = 1
         self._next_event_id = 1
 
@@ -521,6 +620,30 @@ class InMemoryStore:
         if is_terminal(new_state):
             run.ended_at = ended_at or datetime.now(UTC)
 
+    async def update_run_sandbox(self, run_id: str, *,
+                                   sandbox_url: str | None = None,
+                                   sandbox_server_id: str | None = None,
+                                   sandbox_backend: str | None = None) -> None:
+        run = self._runs.get(run_id)
+        if run is None:
+            raise KeyError(f"Run not found: {run_id}")
+        if sandbox_url is not None:
+            run.sandbox_url = sandbox_url
+        if sandbox_server_id is not None:
+            run.sandbox_server_id = sandbox_server_id
+        if sandbox_backend is not None:
+            run.sandbox_backend = sandbox_backend
+
+    async def mark_orphaned_running_runs(self) -> int:
+        n = 0
+        now = datetime.now(UTC)
+        for run in self._runs.values():
+            if run.state in ("pending", "running"):
+                run.state = "orphaned"
+                run.ended_at = run.ended_at or now
+                n += 1
+        return n
+
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None:
         run = self._runs.get(run_id)
@@ -546,11 +669,10 @@ class InMemoryStore:
                               since: datetime | None = None,
                               until: datetime | None = None,
                               trace_tag: str | None = None) -> dict:
-        valid = {"trace_tag", "kind", "model", "agent_id",
-                  "status", "error_type", "day"}
-        if group_by not in valid:
+        if group_by not in AGGREGATE_GROUP_KEYS:
             raise ValueError(
-                f"group_by must be one of: {', '.join(sorted(valid))}"
+                f"group_by must be one of: "
+                f"{', '.join(sorted(AGGREGATE_GROUP_KEYS))}"
             )
 
         def _matches(r: Run) -> bool:
@@ -680,6 +802,27 @@ class InMemoryStore:
         elif next_attempt_at is None:
             w.state = "failed"
 
+    # --- Idempotency keys ---
+
+    async def get_idempotent(self, key: str) -> IdempotencyRecord | None:
+        rec = self._idempotency.get(key)
+        if rec is None:
+            return None
+        if rec.expires_at <= datetime.now(UTC):
+            self._idempotency.pop(key, None)
+            return None
+        return rec
+
+    async def record_idempotent(self, rec: IdempotencyRecord) -> None:
+        self._idempotency.setdefault(rec.key, rec)
+
+    async def purge_expired_idempotency_keys(self) -> int:
+        now = datetime.now(UTC)
+        expired = [k for k, r in self._idempotency.items() if r.expires_at <= now]
+        for k in expired:
+            self._idempotency.pop(k, None)
+        return len(expired)
+
 
 # ---------------------------------------------------------------------------
 # Module-level singleton — chosen by env at startup
@@ -689,12 +832,15 @@ _store: Store | None = None
 
 
 def _build_store() -> Store:
-    dsn = os.environ.get("DATABASE_URL")
+    from aitelier.config import get_config
+
+    dsn = get_config().database.url
     if dsn:
         return PostgresStore(dsn)
     logger.warning(
-        "DATABASE_URL unset — falling back to InMemoryStore. "
-        "Run with docker compose up postgres for durable state."
+        "[database] url unset in aitelier.toml — falling back to InMemoryStore "
+        "(no persistence). Set [database] url for durable state, or use "
+        "`make start` which writes runs/.session.toml with the dev DSN."
     )
     return InMemoryStore()
 

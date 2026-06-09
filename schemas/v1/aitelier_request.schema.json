@@ -1,0 +1,114 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/aitelier_request.schema.json",
+  "title": "AitelierRequestExtension",
+  "description": "The `aitelier` block accepted on /v1/chat/completions (and /v1/runs) when `model` starts with `agent:`. Carries agent-execution knobs that don't fit OpenAI's request shape.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "workspace": {
+      "type": ["string", "null"],
+      "description": "Path inside the sandbox the agent should operate on. Maps to ACP `session/new.cwd`."
+    },
+    "mcp_servers": {
+      "type": ["array", "null"],
+      "maxItems": 32,
+      "description": "MCP servers exposed to the agent. Maps to ACP `session/new.mcpServers`. Each entry is an MCP server descriptor (name, transport, url/command).",
+      "items": {"type": "object"}
+    },
+    "tool_allowlist": {
+      "type": ["array", "null"],
+      "maxItems": 256,
+      "description": "Tools the agent is allowed to invoke. Sent as `session/set_config_option allowedTools`. Best-effort: backends may interpret differently.",
+      "items": {"type": "string"}
+    },
+    "max_turns": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "Cap on agent reasoning turns. Sent as `session/set_config_option maxTurns`."
+    },
+    "prepare": {
+      "type": ["object", "null"],
+      "description": "Pre-flight sandbox setup. Shape: {install_agents, commands, files, sidecars}. Each phase runs in order; a failure aborts before the agent starts.",
+      "properties": {
+        "install_agents": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Agent backends to JIT-install before the run."
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cmd": {"type": "string"},
+              "args": {"type": "array", "items": {"type": "string"}},
+              "cwd": {"type": "string"},
+              "env": {"type": "object"}
+            },
+            "required": ["cmd"]
+          }
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {"type": "string"},
+              "content": {"type": "string"},
+              "encoding": {"type": "string", "enum": ["utf-8", "base64"]}
+            },
+            "required": ["path", "content"]
+          }
+        },
+        "sidecars": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {"type": "string"},
+              "cmd": {"type": "string"},
+              "args": {"type": "array", "items": {"type": "string"}},
+              "env": {"type": "object"}
+            },
+            "required": ["name", "cmd"]
+          },
+          "description": "Long-lived processes started before the agent runs and torn down after."
+        }
+      }
+    },
+    "artifacts": {
+      "type": ["object", "null"],
+      "description": "Post-flight file fetch from the sandbox.",
+      "properties": {
+        "fetch": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "Paths to pull back after the agent finishes. Returned under `aitelier_artifacts` keyed by path."
+        }
+      }
+    },
+    "trace_tag": {
+      "type": ["string", "null"],
+      "description": "Free-form tag stamped on the run row. Query via `/v1/runs?trace_tag=...`."
+    },
+    "examples": {
+      "type": ["array", "null"],
+      "maxItems": 100,
+      "description": "Few-shot examples. Each `{user, assistant}` pair is folded into the system prompt under `## Examples`.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "user": {"type": "string"},
+          "assistant": {"type": "string"}
+        },
+        "required": ["user", "assistant"]
+      }
+    },
+    "allow_tool_drop": {
+      "type": "boolean",
+      "default": false,
+      "description": "Escape hatch: when true, OpenAI `tools` / `tool_choice` are silently dropped on the agent path instead of 400ing. For consumers whose transport sends `tools` per global config and can't suppress per-profile (e.g. Hermes)."
+    }
+  }
+}

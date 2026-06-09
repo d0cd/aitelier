@@ -5,8 +5,11 @@ services:
       POSTGRES_USER: aitelier
       POSTGRES_PASSWORD: aitelier_local
       POSTGRES_DB: aitelier
+    # Host port 5433 (not 5432) so aitelier coexists with other local
+    # Postgres instances (e.g. deepread). Container-internal port is still
+    # 5432. Override DATABASE_URL if you change this.
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - aitelier_pg_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -17,7 +20,12 @@ services:
       retries: 10
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    # Pin to an explicit release tag. `main-latest` lags PyPI by weeks; we
+    # need at least v1.84.0 for Ollama's `message.thinking` to round-trip
+    # to `message.reasoning_content` in OpenAI shape (older builds dropped
+    # it, breaking deepread's `local`-model smoke). Bump deliberately and
+    # re-verify against the live test suite.
+    image: ghcr.io/berriai/litellm:v1.84.0
     ports:
       - "4000:4000"
     volumes:
@@ -25,8 +33,11 @@ services:
     env_file: .env
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     restart: unless-stopped
+    # The litellm image has no `curl` on PATH, so use Python (which ships
+    # with the image) to probe the no-auth liveness endpoint. /health is a
+    # deep check that hits every backend and would flap on upstream 429s.
     healthcheck:
-      test: ["CMD", "curl", "-f", "-H", "Authorization: Bearer sk-litellm-local", "http://localhost:4000/health"]
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveness', timeout=3).status==200 else 1)"]
       interval: 30s
       timeout: 5s
       retries: 3

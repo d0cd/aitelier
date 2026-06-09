@@ -1,90 +1,79 @@
-# aitelier — implementation plan
+# aitelier — current state
 
-Extracted from [DESIGN.md](./DESIGN.md). Each phase gates on the previous.
+Snapshot of what's built and what's deliberately out of scope. For
+phase-by-phase history, read the code or `git log`.
 
-## Phase 0: validation — COMPLETE
+## Built
 
-- [x] Write one real task in `core/tasks/` (audit + 4 others)
-- [x] Implement `call_llm` using LiteLLM proxy
-- [x] Wire up CLI entry point (`aitelier run <task> [args]`)
-- [ ] **Run H1** — fan-out audit across Claude Code, Codex, Sonnet on 3 repos
-- [ ] **Run H2** — agent vs LLM for multi-file context
-- [ ] **Run H3** — provider differences on text-only tasks
+### OpenAI-shape inference
 
-## Phase 1: schemas and core — COMPLETE
+- `POST /v1/chat/completions` — sync + streaming (`stream: true`).
+  Routes by `model` prefix: `agent:*` → Sandbox Agent, anything else →
+  LiteLLM. Hard-rejects `tools` / `tool_choice` / `n>1` / `top_p` on the
+  agent path. `aitelier.*` namespace in `extra_body` carries
+  agent-specific options (workspace, MCP servers, prepare, artifacts).
+- `POST /v1/embeddings` — OpenAI passthrough via LiteLLM.
+- `GET  /v1/models` — model list + per-model `response_format` capabilities.
 
-- [x] Define `schemas/v1/task.schema.json`
-- [x] Define `schemas/v1/result.schema.json`
-- [x] Define `schemas/v1/events.schema.json`
-- [x] Implement `call_agent` (CLI subprocess with passthrough: system prompt, MCP, tools, response format)
-- [x] Implement task runner: workspace prep, dispatch, diffing
-- [x] Implement run directory format and `manifest.json`
-- [x] Implement `--fanout` with `asyncio.gather` + `Semaphore`
-- [x] Implement `complete()` — structured chat completion (deepread contract)
-- [x] Implement `embed()` — batch embeddings
-- [x] Implement trace store (SQLite) with `recentTraces()` and `purge_traces()`
-- [x] Implement typed error classification (`errors.py`)
-- [ ] Set up type generation pipeline (`scripts/generate-types.sh`)
-- [ ] **Run H4** — rate limits with bounded fan-out
-- [ ] **Run H9** — parallel runs don't corrupt state
+### Durable run state (control plane)
 
-## Phase 2: HTTP service — COMPLETE
+- `POST /v1/runs` — async agent submission with webhook delivery.
+- `GET /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/events`,
+  `GET /v1/runs/{id}/events/stream`, `GET /v1/runs/active`,
+  `POST /v1/runs/{id}/cancel`.
+- State machine: `pending → running → {completed | failed | cancelled | orphaned}`.
+- Append-only `run_events` timeline.
+- `mark_orphaned_running_runs()` startup sweep — prevents ghost rows after a crash.
+- `sandbox_url` / `sandbox_server_id` / `sandbox_backend` stamped on every agent run.
 
-- [x] FastAPI app: `POST /v1/complete`
-- [x] `POST /v1/embed`
-- [x] `POST /v1/agent`
-- [x] `GET /v1/traces` and `GET /v1/traces/{id}`
-- [x] `POST /v1/execute`
-- [x] `POST /v1/execute/stream` (SSE)
-- [x] `POST /v1/fanout`
-- [x] `GET /v1/runs/{id}` (with path traversal protection)
-- [x] `GET /v1/health` (with known_limitations)
-- [x] Startup health check for LiteLLM proxy
-- [x] Trace purge on startup (30-day retention)
-- [ ] **Run H5** — HTTP overhead measurement
+### Observability
 
-## Phase 3: SDKs — COMPLETE
+- `GET /v1/traces`, `GET /v1/traces/{id}`, `GET /v1/traces/aggregates`.
+- Correlation-ID middleware: echo header, body field, every SSE chunk, run.metadata.
+- Structured logging (`[service] log_format = "json"`) — aggregator-friendly.
 
-- [x] Python SDK (`sdks/python/`): Pydantic models, async client, streaming, sync wrapper
-- [x] TypeScript SDK (`sdks/typescript/`): TS types, async fetch client, streaming
-- [x] Both SDKs expose `complete()`, `embed()`, `runAgent()`, `recentTraces()`
-- [ ] Contract test corpus in `tests/contract/` (JSON files exist, not wired to both SDKs)
-- [ ] **Run H6** — SSE event ordering
-- [ ] **Run H10** — result-dict shape across both SDKs
+### Schedules + webhooks
 
-## Phase 4: Sandbox Agent client — COMPLETE
+- `GET/POST/DELETE /v1/schedules*` — recurring + one-shot.
+- Schedule `task` shape is the chat-completions request body — same code
+  path on fire.
+- Durable webhook delivery (Postgres queue, exponential backoff 1s/5s/30s/5min/1hr).
+- Optional HMAC signing — `X-Aitelier-Signature: sha256=<hmac>` when
+  `service.webhook_secret` is set.
 
-- [x] Sandbox Agent (rivet-dev/sandbox-agent v0.4.x) installed + supervised by `scripts/start.sh`
-- [x] Port resolution: `--sandbox-agent-port` CLI arg → `SANDBOX_AGENT_PORT` env → 2468 with dynamic fallback if taken
-- [x] `providers/sandbox_agent.py` — ACP (Agent Client Protocol) client over HTTP/SSE
-- [x] `providers/agent.py` reduced to a thin compat shim; direct subprocess paths deleted
-- [x] `/v1/discovery` probes the sandbox agent server; reports available agent backends
-- [x] All agent calls now isolated by Sandbox Agent (sandboxing, env scoping, MCP wiring delegated)
+### SDKs
 
-## Phase 5: ralphx integration
+- Python (`aitelier_client`) and TypeScript (`aitelier`) — same surface.
+- Inference via `Aitelier.openai()` — returns a preconfigured OpenAI client.
+- Control plane methods on `Aitelier` directly.
+- OpenAI SDK is an **optional peer dependency**; consumers using only the
+  control plane install only aitelier.
 
-Not started.
+### Discovery + capability surface
 
-## Phase 6: as friction demands
+- `GET /v1/health` — cheap liveness.
+- `GET /v1/discovery` — endpoint inventory + dependency probes + per-model
+  `response_format` capabilities.
 
-No items scheduled. Each built when it becomes the thing that's annoying.
+### Config
 
-## Infrastructure — COMPLETE
+- TOML-only, layered: defaults → `aitelier.toml` → `aitelier.secrets.toml`
+  → `runs/.session.toml` (start.sh-managed runtime overlay).
+- No `os.environ` reads in app code — single principled load path.
 
-- [x] Docker compose for LiteLLM proxy
-- [x] Credential extraction from CLI logins (Claude Code OAuth, Codex OAuth)
-- [x] `scripts/start.sh` — idempotent startup (credentials + infra + service)
-- [x] `scripts/stop.sh`
-- [x] `Makefile` — install, test, start, stop, lint, clean
-- [x] Config system (`aitelier.toml` / env vars)
-- [x] Security fixes (temp file cleanup, TOML injection, path traversal)
+### Tooling
 
-## Continuous hypotheses
+- `make start/stop/restart/logs/status/doctor/reset/test/test-live`.
+- `scripts/doctor.sh` — preflight checks (ports, tools, creds, docker).
+- Live test suite (`core/tests/live/`) — gated on `AITELIER_LIVE_URL`.
 
-Track throughout all phases:
+## Deliberately out of scope
 
-- **H7** — LiteLLM retry behavior in real use (2 weeks observation)
-- **H12** — schema-driven type gen keeps SDKs in sync (first month)
-- **H13** — daily AI costs stay under $10/day (one week)
-- **H14** — fan-out usefulness in practice (one month)
-- **H15** — task taxonomy covers 80% of actual work (one month)
+- **Multi-tenancy** — single-developer use; in-process run registry is fine.
+- **Authentication / authorization beyond Bearer** — hosted mode is for
+  trusted access; SSO/RBAC isn't justified.
+- **Cost budgets / rate limiting per consumer** — let the LLM provider enforce.
+- **A web dashboard** — structured logs + `/v1/traces*` cover the current need.
+- **Bridging inner-agent tool calls to consumer-side OpenAI tools** — the
+  inner agent runs its own tools; consumers can't fulfill them via OpenAI's
+  `tools` parameter.

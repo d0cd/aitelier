@@ -6,12 +6,35 @@ These are the in-process representation.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+
+def _max_metadata_bytes() -> int:
+    """Read [storage] max_metadata_bytes from config at call time.
+
+    Lazy lookup (rather than module-level constant) so we don't read
+    config at import — keeps the import graph clean and lets tests
+    override config without import-order tricks.
+    """
+    from aitelier.config import get_config
+    return get_config().storage.max_metadata_bytes
+
 RunState = Literal["pending", "running", "completed", "failed", "cancelled", "orphaned"]
 """Valid states for a run. State machine enforced by `update_run_state`."""
+
+RunKind = Literal["complete", "embed", "agent"]
+"""Wire-format kinds for the three primitives."""
+
+RunEventKind = Literal[
+    "start", "delta", "tool_call", "tool_result",
+    "finish", "error", "cancelled", "orphaned",
+    # Open extension point — backends may emit additional kinds. Listed
+    # values are the ones aitelier itself emits via _RunEventEmitter.
+]
+"""Kinds emitted by the run-event timeline. Open-ended for forward-compat."""
 
 _TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "orphaned"})
 _VALID_TRANSITIONS: dict[str, frozenset[str]] = {
@@ -48,6 +71,19 @@ class RunSpec:
     environment: dict[str, Any] = field(default_factory=dict)
     system_prompt_hash: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Defense against persisting unboundedly large metadata blobs.
+        # JSON-encoded size is what hits Postgres; `default=str` lets
+        # callers include datetimes/UUIDs without first serializing them.
+        if self.metadata:
+            size = len(json.dumps(self.metadata, default=str))
+            limit = _max_metadata_bytes()
+            if size > limit:
+                raise ValueError(
+                    f"metadata too large: {size} bytes "
+                    f"(limit {limit}). Trim before passing."
+                )
 
 
 @dataclass
@@ -116,6 +152,24 @@ class Schedule:
     next_run_at: datetime | None
     last_run_at: datetime | None
     created_at: datetime
+
+
+@dataclass
+class IdempotencyRecord:
+    """Cached response for a previously-seen Idempotency-Key.
+
+    The SDK auto-attaches the same key on retries; the server returns the
+    cached response (instead of re-executing) when the body matches. A
+    different body under the same key signals consumer error (HTTP 422).
+    """
+    key: str
+    body_hash: str
+    endpoint: str
+    status_code: int
+    response: dict[str, Any]
+    expires_at: datetime
+    run_id: str | None = None
+    created_at: datetime | None = None
 
 
 @dataclass

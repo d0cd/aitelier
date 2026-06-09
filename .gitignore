@@ -29,6 +29,11 @@ Thumbs.db
 docker/.env
 !*.example
 
+# Secrets — same shape as aitelier.toml but holds api_keys, langfuse creds, etc.
+# Loaded by config.py as an overlay on top of the base config. Never commit.
+aitelier.secrets.toml
+**/aitelier.secrets.toml
+
 # Generated (tracked separately)
 # sdks/python/src/aitelier_client/_generated/
 # sdks/typescript/src/_generated/

@@ -16,6 +16,18 @@ def _mock_http_response(status_code: int, text: str = "ok"):
     return resp
 
 
+@pytest.fixture(autouse=True)
+def _bypass_ssrf_check(monkeypatch):
+    """Webhook-worker tests target delivery logic (retry, signing,
+    state-machine transitions) rather than the SSRF guard's behavior.
+    Force the guard to pass so the placeholder `https://example/` URLs
+    these tests use don't get rejected for DNS-resolution failure."""
+    async def _always_public(_url):
+        return True
+    monkeypatch.setattr("aitelier.webhook_worker.is_public_url", _always_public, raising=False)
+    monkeypatch.setattr("aitelier.security.is_public_url", _always_public)
+
+
 @pytest.mark.asyncio
 async def test_worker_delivers_2xx_and_marks_delivered():
     store = await get_store()

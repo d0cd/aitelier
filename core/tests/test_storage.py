@@ -26,6 +26,47 @@ def store():
     return InMemoryStore()
 
 
+def test_runspec_rejects_oversized_metadata():
+    """64KB cap is enforced at construction so no caller can sneak a giant
+    blob into Postgres."""
+    huge = {"x": "a" * (70 * 1024)}
+    with pytest.raises(ValueError, match="too large"):
+        RunSpec(run_id="r", kind="agent", metadata=huge)
+
+
+def test_build_store_reads_dsn_from_config(monkeypatch):
+    """_build_store consults get_config().database.url — not os.environ.
+    Setting DATABASE_URL in env without a config value yields InMemoryStore."""
+    from aitelier import config as cfg_mod
+    from aitelier.storage._store import _build_store
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://from-env-ignored/db")
+
+    cfg_mod.reset_config()
+    cfg_mod.set_config(cfg_mod.Config())  # database.url stays at default None
+    store = _build_store()
+    assert isinstance(store, InMemoryStore), (
+        "env should be ignored; with no [database] url in config, "
+        "we expect the InMemoryStore fallback"
+    )
+
+    # Now point config.database.url at a (bogus) DSN and confirm PostgresStore
+    # is chosen. We don't connect — just verify the dispatch.
+    cfg_mod.set_config(cfg_mod.Config(
+        database=cfg_mod.DatabaseConfig(url="postgresql://from-config/db"),
+    ))
+    store = _build_store()
+    assert isinstance(store, PostgresStore)
+    assert store.dsn == "postgresql://from-config/db"
+    cfg_mod.reset_config()
+
+
+def test_runspec_accepts_typical_metadata():
+    # Typical: correlation_id + a couple of tags. Well under the cap.
+    RunSpec(run_id="r", kind="agent",
+            metadata={"correlation_id": "abc", "trace_tag": "ingest", "n": 1})
+
+
 @pytest.mark.asyncio
 async def test_create_and_get_run(store):
     spec = RunSpec(
@@ -33,7 +74,7 @@ async def test_create_and_get_run(store):
         model="claude", trace_tag="curator",
         sandbox_backend="local", sandbox_url="http://localhost:2468",
         sandbox_server_id="srv-abc",
-        environment={"mcp_servers": [{"name": "deepread"}]},
+        environment={"mcp_servers": [{"name": "example-mcp"}]},
     )
     created = await store.create_run(spec)
     assert created.state == "pending"
@@ -41,7 +82,7 @@ async def test_create_and_get_run(store):
 
     fetched = await store.get_run("run-1")
     assert fetched is not None
-    assert fetched.environment == {"mcp_servers": [{"name": "deepread"}]}
+    assert fetched.environment == {"mcp_servers": [{"name": "example-mcp"}]}
 
 
 @pytest.mark.asyncio
@@ -80,6 +121,71 @@ async def test_finalize_run_sets_result_and_state(store):
     assert run.total_tokens == 30
     assert run.cost_usd == 0.05
     assert run.tool_call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_record_run_stamps_status_ok_on_success(_fresh_store):
+    """Successful runs land in the store with status='ok' even when the
+    awaitable's result dict doesn't mention status — so /v1/traces can
+    report success vs error without consumers cross-referencing `state`."""
+    from aitelier.runs import record_run
+
+    async def work():
+        return {"finish_reason": "stop", "usage": {"total_tokens": 12}}
+
+    await record_run(RunSpec(run_id="r-ok", kind="complete"), work())
+    run = await _fresh_store.get_run("r-ok")
+    assert run.state == "completed"
+    assert run.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_record_run_preserves_explicit_status(_fresh_store):
+    """A caller-supplied status survives — record_run only fills None."""
+    from aitelier.runs import record_run
+
+    async def work():
+        return {"status": "error", "error_type": "Boom", "error_msg": "x"}
+
+    await record_run(RunSpec(run_id="r-bad", kind="complete"), work())
+    run = await _fresh_store.get_run("r-bad")
+    assert run.state == "failed"
+    assert run.status == "error"
+
+
+@pytest.mark.asyncio
+async def test_record_run_marks_cancellation_distinct_from_error(_fresh_store):
+    """Cancellation is user-initiated; failure is server-side. They share
+    a terminal lifecycle but the outcome category is different — consumers
+    filtering for `status="error"` should not see cancelled runs."""
+    import asyncio as _asyncio
+
+    from aitelier.runs import record_run
+
+    async def work():
+        raise _asyncio.CancelledError()
+
+    with pytest.raises(_asyncio.CancelledError):
+        await record_run(RunSpec(run_id="r-cancel", kind="complete"), work())
+    run = await _fresh_store.get_run("r-cancel")
+    assert run.state == "cancelled"
+    assert run.status == "cancelled"
+    assert run.error_type == "Cancelled"
+
+
+@pytest.mark.asyncio
+async def test_record_run_marks_unexpected_exception_as_error(_fresh_store):
+    from aitelier.runs import record_run
+
+    async def work():
+        raise RuntimeError("boom")
+
+    with pytest.raises(RuntimeError):
+        await record_run(RunSpec(run_id="r-exc", kind="complete"), work())
+    run = await _fresh_store.get_run("r-exc")
+    assert run.state == "failed"
+    assert run.status == "error"
+    assert run.error_type == "RuntimeError"
 
 
 @pytest.mark.asyncio
@@ -138,6 +244,37 @@ async def test_schedule_crud(store):
 
 
 @pytest.mark.asyncio
+async def test_update_run_sandbox_stamps_fields(store):
+    await store.create_run(RunSpec(run_id="r", kind="agent"))
+    await store.update_run_sandbox(
+        "r", sandbox_url="http://sa.example.com",
+        sandbox_server_id="srv-123", sandbox_backend="remote",
+    )
+    run = await store.get_run("r")
+    assert run.sandbox_url == "http://sa.example.com"
+    assert run.sandbox_server_id == "srv-123"
+    assert run.sandbox_backend == "remote"
+
+
+@pytest.mark.asyncio
+async def test_mark_orphaned_running_runs_sweeps_pending_and_running(store):
+    await store.create_run(RunSpec(run_id="a", kind="agent"))               # pending
+    await store.create_run(RunSpec(run_id="b", kind="agent"))
+    await store.update_run_state("b", "running")                            # running
+    await store.create_run(RunSpec(run_id="c", kind="agent"))
+    await store.update_run_state("c", "running")
+    await store.update_run_state("c", "completed")                          # terminal
+
+    swept = await store.mark_orphaned_running_runs()
+    assert swept == 2
+    assert (await store.get_run("a")).state == "orphaned"
+    assert (await store.get_run("b")).state == "orphaned"
+    assert (await store.get_run("c")).state == "completed"   # untouched
+    # Orphaned rows get an ended_at stamp so dashboards can render duration.
+    assert (await store.get_run("a")).ended_at is not None
+
+
+@pytest.mark.asyncio
 async def test_webhook_enqueue_claim_record(store):
     wid = await store.enqueue_webhook("https://x/", {"foo": 1}, run_id="r")
     due = await store.claim_pending_webhooks(limit=10)
@@ -179,4 +316,48 @@ async def test_postgres_round_trip():
         # Cleanup so reruns work
         async with store._pool.acquire() as conn:
             await conn.execute("DELETE FROM runs WHERE run_id = $1", "pg-test-1")
+        await store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.environ.get("AITELIER_TEST_DATABASE_URL"),
+    reason="set AITELIER_TEST_DATABASE_URL to run Postgres integration tests",
+)
+async def test_postgres_update_run_sandbox_and_orphan_sweep():
+    """Verify the Postgres-specific COALESCE semantics on update_run_sandbox
+    and the startup orphan sweep — these don't exercise on InMemoryStore."""
+    store = PostgresStore(os.environ["AITELIER_TEST_DATABASE_URL"])
+    await store.connect()
+    try:
+        # Partial updates: only url first, then only server_id; both should
+        # be present afterward thanks to COALESCE.
+        await store.create_run(RunSpec(run_id="pg-sandbox-1", kind="agent"))
+        await store.update_run_sandbox(
+            "pg-sandbox-1", sandbox_url="https://sa.example.com",
+        )
+        await store.update_run_sandbox(
+            "pg-sandbox-1", sandbox_server_id="srv-xyz",
+            sandbox_backend="remote",
+        )
+        run = await store.get_run("pg-sandbox-1")
+        assert run.sandbox_url == "https://sa.example.com"
+        assert run.sandbox_server_id == "srv-xyz"
+        assert run.sandbox_backend == "remote"
+
+        # Orphan sweep: a row in `running` from a notional prior process
+        # flips to `orphaned`.
+        await store.create_run(RunSpec(run_id="pg-orphan-1", kind="agent"))
+        await store.update_run_state("pg-orphan-1", "running")
+        swept = await store.mark_orphaned_running_runs()
+        assert swept >= 1
+        run = await store.get_run("pg-orphan-1")
+        assert run.state == "orphaned"
+        assert run.ended_at is not None
+    finally:
+        async with store._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM runs WHERE run_id IN ($1, $2)",
+                "pg-sandbox-1", "pg-orphan-1",
+            )
         await store.close()

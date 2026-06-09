@@ -117,9 +117,12 @@ class TestAitelierService:
         assert "known_limitations" in data
 
     @litellm_available
-    def test_complete(self):
+    def test_chat_completions(self):
+        """OpenAI-shape chat completion through the LiteLLM path. Replaces
+        the retired `/v1/complete` smoke test — aitelier moved to
+        `/v1/chat/completions` with OpenAI response shape."""
         resp = httpx.post(
-            f"{AITELIER_URL}/v1/complete",
+            f"{AITELIER_URL}/v1/chat/completions",
             json={
                 "model": "claude-haiku",
                 "messages": [{"role": "user", "content": "Say 'pong'"}],
@@ -130,26 +133,43 @@ class TestAitelierService:
         resp.raise_for_status()
         data = resp.json()
 
-        assert data["kind"] == "complete", f"kind={data['kind']}"
-        assert data["status"] == "ok", f"status={data['status']}, error={data.get('error_msg')}"
-        assert data.get("content"), "Empty content"
-        assert data.get("usage"), "Missing usage"
-        assert "input_tokens" in data["usage"]
+        assert data.get("choices"), f"missing choices: {list(data.keys())}"
+        msg = data["choices"][0]["message"]
+        assert msg.get("content"), "empty content"
+        usage = data.get("usage", {})
+        assert "prompt_tokens" in usage
+        assert "completion_tokens" in usage
+        # OpenAI invariant: aitelier preserves it on LLM and agent paths.
+        assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
 
     @litellm_available
-    def test_embed(self):
+    def test_embeddings_via_aitelier(self):
+        """`/v1/embeddings` is the canonical embeddings endpoint. The old
+        aitelier-native `/v1/embed` is retired (404s)."""
         resp = httpx.post(
-            f"{AITELIER_URL}/v1/embed",
-            json={"texts": ["hello world"]},
+            f"{AITELIER_URL}/v1/embeddings",
+            json={"model": "nomic-embed-text", "input": "hello world"},
             timeout=30,
         )
         resp.raise_for_status()
         data = resp.json()
+        assert "data" in data, f"missing data: {list(data.keys())}"
+        emb = data["data"][0]["embedding"]
+        assert isinstance(emb, list) and len(emb) == 768, (
+            f"expected 768-float vector, got len={len(emb) if hasattr(emb, '__len__') else 'n/a'} "
+            f"type={type(emb).__name__}"
+        )
 
-        assert data["kind"] == "embed", f"kind={data['kind']}"
-        assert data["status"] == "ok", f"status={data['status']}, error={data.get('error_msg')}"
-        assert data.get("embeddings"), "Missing embeddings"
-        assert data.get("dimensions") == 768, f"dimensions={data.get('dimensions')}"
+    def test_metrics(self):
+        """Runtime counters endpoint added in the CPU-leak audit. Sanity-
+        checks that operators can hit it without auth and see shape."""
+        resp = httpx.get(f"{AITELIER_URL}/v1/metrics", timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        assert data["uptime_seconds"] >= 0
+        assert "rss_mb" in data["process"]
+        assert "in_flight" in data["runs"]
+        assert "pending" in data["webhooks"]
 
     def test_traces(self):
         resp = httpx.get(f"{AITELIER_URL}/v1/traces?limit=1", timeout=5)

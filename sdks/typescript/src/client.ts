@@ -1,560 +1,338 @@
 /**
- * Async HTTP client for the aitelier service.
+ * aitelier TypeScript SDK.
+ *
+ * aitelier speaks OpenAI shape for inference and an aitelier-native control
+ * plane for runs/traces/schedules/discovery. The client splits along that
+ * line:
+ *
+ *   - `client.openai()` → a preconfigured `OpenAI` instance (dynamic import;
+ *     install `openai` as a peer dependency). Use it for chat completions,
+ *     embeddings, models, streaming, structured outputs, retries.
+ *
+ *   - everything else on `Aitelier` is the control plane: submitRun (async
+ *     agents), cancelRun, listRuns, listTraces, discovery, schedules.
  */
+
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type {
   ActiveRuns,
   CancelAck,
-  CompleteOpts,
-  CompleteStreamEvent,
+  CreateScheduleOpts,
   Discovery,
-  EmbedOpts,
   HealthResponse,
-  Result,
-  RunAgentOpts,
-  TaskSpec,
+  Run,
+  RunEvent,
+  Schedule,
   TraceRecord,
-} from "./_generated/types.js";
+  TracesAggregate,
+} from "./types.js";
 
-/** Convert camelCase to snake_case for the wire format. */
-function toSnake(obj: Record<string, unknown>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(obj)) {
-    if (value === undefined || value === null) continue;
-    const snakeKey = key.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-    result[snakeKey] = value;
+// `openai` is an optional peer dependency. We `import type` only so consumers
+// who don't install it still get a clean compile of the rest of the SDK.
+import type { OpenAI } from "openai";
+
+const DEFAULT_BASE_URL = "http://localhost:7777";
+
+/**
+ * Best-effort lookup of `[service] host`/`port` in ~/.config/aitelier/config.toml.
+ * Returns undefined if the file doesn't exist, can't be read, or doesn't
+ * declare a usable host+port. No env-var reads.
+ */
+function discoverBaseUrl(): string | undefined {
+  try {
+    const home = homedir();
+    if (!home) return undefined;
+    const cfgPath = join(home, ".config", "aitelier", "config.toml");
+    if (!existsSync(cfgPath)) return undefined;
+    const text = readFileSync(cfgPath, "utf8");
+    const blockMatch = text.match(/\[service\]([\s\S]*?)(?:\n\[|\s*$)/);
+    if (!blockMatch) return undefined;
+    const block = blockMatch[1];
+    const hostMatch = block.match(/^\s*host\s*=\s*["']([^"']+)["']/m);
+    const portMatch = block.match(/^\s*port\s*=\s*(\d+)/m);
+    if (hostMatch && portMatch) {
+      return `http://${hostMatch[1]}:${portMatch[1]}`;
+    }
+  } catch {
+    // node:fs unavailable (browser), permission denied, malformed TOML —
+    // all roads lead to "use the default and let the consumer override".
   }
-  return result;
-}
-
-/** Convert snake_case result from wire to camelCase Result. */
-function fromWireResult(data: Record<string, unknown>): Result {
-  return {
-    kind: data.kind as Result["kind"],
-    provider: data.provider as string,
-    status: data.status as Result["status"],
-    durationS: data.duration_s as number,
-    runId: data.run_id as string,
-    traceId: (data.trace_id as string) ?? undefined,
-    content: (data.content as string | null) ?? undefined,
-    parsed: data.parsed ?? undefined,
-    usage: data.usage
-      ? {
-          inputTokens: (data.usage as any).input_tokens ?? 0,
-          outputTokens: (data.usage as any).output_tokens ?? 0,
-          totalTokens: (data.usage as any).total_tokens ?? 0,
-        }
-      : undefined,
-    finishReason: (data.finish_reason as Result["finishReason"]) ?? undefined,
-    costUsd: (data.cost_usd as number | null) ?? undefined,
-    embeddings: (data.embeddings as number[][] | null) ?? undefined,
-    dimensions: (data.dimensions as number | null) ?? undefined,
-    toolCalls: data.tool_calls
-      ? (data.tool_calls as any[]).map((tc) => ({
-          server: tc.server,
-          tool: tc.tool,
-          input: tc.input,
-          output: tc.output,
-          elapsedMs: tc.elapsed_ms,
-        }))
-      : undefined,
-    sessionId: (data.session_id as string | null) ?? undefined,
-    filesChanged: (data.files_changed as string[] | null) ?? undefined,
-    errorType: (data.error_type as string | null) ?? undefined,
-    errorMsg: (data.error_msg as string | null) ?? undefined,
-  };
-}
-
-function fromWireTrace(data: Record<string, unknown>): TraceRecord {
-  return {
-    traceId: data.trace_id as string,
-    startedAt: data.started_at as string,
-    endedAt: (data.ended_at as string) ?? undefined,
-    model: (data.model as string) ?? undefined,
-    kind: (data.kind as string) ?? undefined,
-    finishReason: (data.finish_reason as string) ?? undefined,
-    toolCallCount: (data.tool_call_count as number) ?? 0,
-    inputTokens: (data.input_tokens as number) ?? 0,
-    outputTokens: (data.output_tokens as number) ?? 0,
-    totalTokens: (data.total_tokens as number) ?? 0,
-    costUsd: (data.cost_usd as number) ?? undefined,
-    systemPromptHash: (data.system_prompt_hash as string) ?? undefined,
-    traceTag: (data.trace_tag as string) ?? undefined,
-    status: (data.status as string) ?? undefined,
-  };
+  return undefined;
 }
 
 export interface AtelierOptions {
   baseUrl?: string;
-  timeout?: number;
-  /** Optional default X-Correlation-Id sent with every request. */
-  defaultCorrelationId?: string;
-  /** API key for hosted-mode aitelier (sent as Authorization: Bearer …). */
   apiKey?: string;
+  /** Per-request timeout in milliseconds. Default 60s. */
+  timeoutMs?: number;
 }
 
-/** Per-call request options (transport-level, not schema). */
-export interface RequestOpts {
-  /** Override the client's default correlation ID for this call. */
+export interface SubmitRunOpts {
+  model: string;                       // must start with `agent:`
+  messages: Array<Record<string, unknown>>;
+  webhookUrl?: string;
+  aitelier?: Record<string, unknown>;  // workspace, mcpServers, prepare, ...
+  timeout?: number;                    // seconds — server-side limit
+  idempotencyKey?: string;
   correlationId?: string;
 }
 
 export class Aitelier {
-  private baseUrl: string;
-  private timeout: number;
-  private defaultCorrelationId: string | undefined;
-  private apiKey: string | undefined;
+  readonly baseUrl: string;
+  readonly apiKey?: string;
+  readonly timeoutMs: number;
+  // Cached OpenAI client; lazy and dynamic so consumers without `openai`
+  // installed can still use the control plane.
+  private _openai?: OpenAI;
 
-  constructor(options: AtelierOptions = {}) {
-    this.baseUrl = (options.baseUrl ?? "http://localhost:7777").replace(
-      /\/$/,
-      ""
-    );
-    this.timeout = options.timeout ?? 600_000;
-    this.defaultCorrelationId = options.defaultCorrelationId;
-    this.apiKey = options.apiKey;
+  constructor(opts: AtelierOptions = {}) {
+    this.baseUrl = (
+      opts.baseUrl ?? discoverBaseUrl() ?? DEFAULT_BASE_URL
+    ).replace(/\/$/, "");
+    this.apiKey = opts.apiKey;
+    this.timeoutMs = opts.timeoutMs ?? 60_000;
   }
 
-  private cidHeader(correlationId: string | undefined): Record<string, string> {
-    const cid = correlationId ?? this.defaultCorrelationId;
-    const headers: Record<string, string> = {};
-    if (cid) headers["X-Correlation-Id"] = cid;
-    if (this.apiKey) headers["Authorization"] = `Bearer ${this.apiKey}`;
-    return headers;
+  // --- OpenAI client for inference ----------------------------------------
+
+  /**
+   * Return a preconfigured OpenAI client pointed at this aitelier service.
+   *
+   * Requires the `openai` peer dependency. Use it for `chat.completions.create`,
+   * `embeddings.create`, `models.list`, streaming, structured outputs,
+   * tool-call semantics. Aitelier-specific options (`workspace`, MCP servers,
+   * `prepare`, `artifacts`) ride in `extra_body.aitelier.*` and are accepted
+   * only when `model` starts with `agent:`.
+   */
+  async openai(): Promise<OpenAI> {
+    if (this._openai) return this._openai;
+    let Ctor: new (init: Record<string, unknown>) => OpenAI;
+    try {
+      const mod = await import("openai");
+      // openai v4+ exports OpenAI as named; older versions used default.
+      const candidate = (mod as { OpenAI?: unknown; default?: unknown }).OpenAI
+        ?? (mod as { default?: unknown }).default;
+      if (typeof candidate !== "function") {
+        throw new Error("Imported `openai` module did not export a constructor.");
+      }
+      Ctor = candidate as new (init: Record<string, unknown>) => OpenAI;
+    } catch (err) {
+      // ImportError vs malformed-package both surface here.
+      if (err instanceof Error && err.message.includes("did not export")) {
+        throw err;
+      }
+      throw new Error(
+        "The `openai` package is required for Aitelier.openai(). " +
+          "Install with `pnpm add openai` (or npm/yarn equivalent).",
+      );
+    }
+    this._openai = new Ctor({
+      baseURL: `${this.baseUrl}/v1`,
+      apiKey: this.apiKey ?? "no-auth",
+      timeout: this.timeoutMs,
+    });
+    return this._openai;
   }
 
-  /** Auth header for endpoints that don't go through cidHeader (GET methods). */
+  // --- HTTP helpers --------------------------------------------------------
+
   private authHeader(): Record<string, string> {
     return this.apiKey ? { Authorization: `Bearer ${this.apiKey}` } : {};
   }
 
-  // --- Primitives (deepread contract) ---
-
-  async complete(opts: CompleteOpts, reqOpts?: RequestOpts): Promise<Result> {
-    const body = toSnake({
-      model: opts.model,
-      systemPrompt: opts.systemPrompt,
-      messages: opts.messages,
-      temperature: opts.temperature,
-      maxTokens: opts.maxTokens,
-      responseFormat: opts.responseFormat,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-      traceTag: opts.traceTag,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/complete`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`complete failed: ${resp.status}`);
-    return fromWireResult(await resp.json());
+  private cidHeader(cid?: string): Record<string, string> {
+    return cid ? { "X-Correlation-Id": cid } : {};
   }
+
+  // --- Async agent runs ----------------------------------------------------
 
   /**
-   * Streaming chat completion (SSE).
-   * Yields events `complete.delta`, `complete.done`, or `complete.error`.
+   * Submit an async agent run via POST /v1/runs.
+   *
+   * Returns immediately with `{run_id, status: "accepted"}`. The final
+   * ChatCompletion (or error body) is delivered to `webhookUrl` when ready,
+   * if provided; otherwise consumers poll `getRun(run_id)` or
+   * `listRunEvents(run_id)`.
    */
-  async *completeStream(
-    opts: CompleteOpts,
-    reqOpts?: RequestOpts,
-  ): AsyncIterable<{ type: string; data: Record<string, unknown> }> {
-    const body = toSnake({
-      model: opts.model,
-      systemPrompt: opts.systemPrompt,
-      messages: opts.messages,
-      temperature: opts.temperature,
-      maxTokens: opts.maxTokens,
-      responseFormat: opts.responseFormat,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-      traceTag: opts.traceTag,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/complete/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`completeStream failed: ${resp.status}`);
-    if (!resp.body) throw new Error("No response body");
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let eventType = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.slice(7).trim();
-        } else if (line.startsWith("data: ") && eventType) {
-          try {
-            yield { type: eventType, data: JSON.parse(line.slice(6)) };
-          } catch {
-            // skip malformed
-          }
-          eventType = "";
-        }
-      }
-    }
-  }
-
-  async embed(opts: EmbedOpts, reqOpts?: RequestOpts): Promise<Result> {
-    const body = toSnake({
-      texts: opts.texts,
-      model: opts.model,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/embed`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`embed failed: ${resp.status}`);
-    return fromWireResult(await resp.json());
-  }
-
-  async runAgent(opts: RunAgentOpts, reqOpts?: RequestOpts): Promise<Result> {
-    const body = toSnake({
-      model: opts.model,
-      agentModel: opts.agentModel,
-      systemPrompt: opts.systemPrompt,
-      initialMessage: opts.initialMessage,
-      examples: opts.examples,
-      prepare: opts.prepare,
-      artifacts: opts.artifacts,
-      mcpServers: opts.mcpServers?.map((s) => toSnake(s as any)),
-      toolAllowlist: opts.toolAllowlist,
-      responseFormat: opts.responseFormat,
-      maxTurns: opts.maxTurns,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-      workspace: opts.workspace,
-      workspaceMode: opts.workspaceMode,
-      traceTag: opts.traceTag,
-      metadata: opts.metadata,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/agent`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`runAgent failed: ${resp.status}`);
-    return fromWireResult(await resp.json());
-  }
-
-  async recentTraces(filter?: {
-    since?: string;
-    traceTag?: string;
-    status?: string;
-    limit?: number;
-  }): Promise<TraceRecord[]> {
-    const params = new URLSearchParams();
-    if (filter?.since) params.set("since", filter.since);
-    if (filter?.traceTag) params.set("trace_tag", filter.traceTag);
-    if (filter?.status) params.set("status", filter.status);
-    if (filter?.limit) params.set("limit", String(filter.limit));
-
-    const url = `${this.baseUrl}/v1/traces${params.toString() ? "?" + params : ""}`;
-    const resp = await fetch(url, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`recentTraces failed: ${resp.status}`);
-    const data = await resp.json();
-    return (data as Record<string, unknown>[]).map(fromWireTrace);
-  }
-
-  // --- Task runner endpoints (legacy/fan-out) ---
-
-  async execute(task: TaskSpec): Promise<Result> {
-    const resp = await fetch(`${this.baseUrl}/v1/execute`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(toSnake(task as any)),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`execute failed: ${resp.status}`);
-    return fromWireResult(await resp.json());
-  }
-
-  async *executeStream(
-    task: TaskSpec
-  ): AsyncIterable<{ type: string; data: Record<string, unknown> }> {
-    const resp = await fetch(`${this.baseUrl}/v1/execute/stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(toSnake(task as any)),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`executeStream failed: ${resp.status}`);
-    if (!resp.body) throw new Error("No response body");
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-
-      let eventType = "";
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.slice(7).trim();
-        } else if (line.startsWith("data: ") && eventType) {
-          try {
-            const data = JSON.parse(line.slice(6));
-            yield { type: eventType, data };
-          } catch {
-            // skip malformed
-          }
-          eventType = "";
-        }
-      }
-    }
-  }
-
-  async fanOut(
-    task: TaskSpec,
-    options: { providers: string[]; maxConcurrent?: number }
-  ): Promise<Result[]> {
-    const body = {
-      task: toSnake(task as any),
-      providers: options.providers,
-      max_concurrent: options.maxConcurrent ?? 4,
+  async submitRun(opts: SubmitRunOpts): Promise<Record<string, unknown>> {
+    const body: Record<string, unknown> = {
+      model: opts.model, messages: opts.messages,
     };
-    const resp = await fetch(`${this.baseUrl}/v1/fanout`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`fanOut failed: ${resp.status}`);
-    return ((await resp.json()) as Record<string, unknown>[]).map(
-      fromWireResult
-    );
-  }
-
-  async getRun(runId: string): Promise<Record<string, unknown>> {
-    const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`getRun failed: ${resp.status}`);
-    return resp.json();
-  }
-
-  async health(): Promise<HealthResponse> {
-    const resp = await fetch(`${this.baseUrl}/v1/health`, {
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`health failed: ${resp.status}`);
-    const data = await resp.json();
-    return {
-      status: data.status,
-      version: data.version,
-      timestamp: data.timestamp,
+    if (opts.webhookUrl !== undefined) body.webhook_url = opts.webhookUrl;
+    if (opts.aitelier !== undefined) body.aitelier = opts.aitelier;
+    if (opts.timeout !== undefined) body.timeout = opts.timeout;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...this.authHeader(),
+      ...this.cidHeader(opts.correlationId),
     };
+    if (opts.idempotencyKey) headers["Idempotency-Key"] = opts.idempotencyKey;
+    const resp = await fetch(`${this.baseUrl}/v1/runs`, {
+      method: "POST",
+      headers, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`submitRun failed: ${resp.status} ${await resp.text()}`);
+    return snakeToCamelDeep(await resp.json()) as Record<string, unknown>;
   }
 
-  async aggregateTraces(opts: {
-    groupBy?: "trace_tag" | "kind" | "model" | "status" | "error_type" | "day";
-    since?: string;
-    until?: string;
-    traceTag?: string;
-  } = {}): Promise<Record<string, unknown>> {
+  // --- Control plane: runs + events ----------------------------------------
+
+  async getRun(runId: string): Promise<Run> {
+    return this.getJson<Run>(`/v1/runs/${runId}`);
+  }
+
+  async listRuns(opts: {
+    traceTag?: string; state?: string; correlationId?: string; limit?: number;
+  } = {}): Promise<Run[]> {
     const params = new URLSearchParams();
-    if (opts.groupBy) params.set("group_by", opts.groupBy);
-    if (opts.since) params.set("since", opts.since);
-    if (opts.until) params.set("until", opts.until);
+    params.set("limit", String(opts.limit ?? 50));
     if (opts.traceTag) params.set("trace_tag", opts.traceTag);
-    const url = `${this.baseUrl}/v1/traces/aggregates${params.toString() ? "?" + params : ""}`;
-    const resp = await fetch(url, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`aggregateTraces failed: ${resp.status}`);
-    return resp.json();
+    if (opts.state) params.set("state", opts.state);
+    if (opts.correlationId) params.set("correlation_id", opts.correlationId);
+    return this.getJson<Run[]>(`/v1/runs?${params}`);
   }
 
-  // --- Cancellation ---
+  async listRunEvents(runId: string): Promise<RunEvent[]> {
+    return this.getJson<RunEvent[]>(`/v1/runs/${runId}/events`);
+  }
 
   async listActiveRuns(): Promise<ActiveRuns> {
-    const resp = await fetch(`${this.baseUrl}/v1/runs/active`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`listActiveRuns failed: ${resp.status}`);
-    const data = (await resp.json()) as { active?: string[] };
-    return { active: data.active ?? [] };
+    return this.getJson<ActiveRuns>("/v1/runs/active");
   }
 
   async cancelRun(runId: string): Promise<CancelAck> {
     const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/cancel`, {
       method: "POST",
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
+      headers: { ...this.authHeader() },
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
     if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status}`);
-    const data = (await resp.json()) as { run_id: string; cancelled: boolean };
-    return { runId: data.run_id, cancelled: data.cancelled };
+    return snakeToCamelDeep(await resp.json()) as CancelAck;
   }
 
-  /**
-   * Streaming agent run (SSE).
-   * Yields events `agent.delta` / `agent.tool_call` / `agent.tool_result` /
-   * `agent.done` / `agent.error`.
-   */
-  async *runAgentStream(
-    opts: RunAgentOpts,
-    reqOpts?: RequestOpts,
-  ): AsyncIterable<{ type: string; data: Record<string, unknown> }> {
-    const body = toSnake({
-      model: opts.model,
-      agentModel: opts.agentModel,
-      systemPrompt: opts.systemPrompt,
-      initialMessage: opts.initialMessage,
-      examples: opts.examples,
-      prepare: opts.prepare,
-      artifacts: opts.artifacts,
-      mcpServers: opts.mcpServers?.map((s) => toSnake(s as any)),
-      toolAllowlist: opts.toolAllowlist,
-      responseFormat: opts.responseFormat,
-      maxTurns: opts.maxTurns,
-      timeout: opts.timeoutMs ? Math.ceil(opts.timeoutMs / 1000) : undefined,
-      workspace: opts.workspace,
-      workspaceMode: opts.workspaceMode,
-      traceTag: opts.traceTag,
-      metadata: opts.metadata,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/agent/stream`, {
+  // --- Control plane: traces ----------------------------------------------
+
+  async recentTraces(opts: {
+    traceTag?: string; status?: string; since?: string; limit?: number;
+  } = {}): Promise<TraceRecord[]> {
+    const params = new URLSearchParams();
+    params.set("limit", String(opts.limit ?? 50));
+    if (opts.traceTag) params.set("trace_tag", opts.traceTag);
+    if (opts.status) params.set("status", opts.status);
+    if (opts.since) params.set("since", opts.since);
+    return this.getJson<TraceRecord[]>(`/v1/traces?${params}`);
+  }
+
+  async getTrace(traceId: string): Promise<TraceRecord> {
+    return this.getJson<TraceRecord>(`/v1/traces/${traceId}`);
+  }
+
+  async aggregateTraces(opts: {
+    groupBy?: string; since?: string; traceTag?: string; limit?: number;
+  } = {}): Promise<TracesAggregate> {
+    const params = new URLSearchParams();
+    params.set("group_by", opts.groupBy ?? "model");
+    if (opts.since) params.set("since", opts.since);
+    if (opts.traceTag) params.set("trace_tag", opts.traceTag);
+    if (opts.limit !== undefined) params.set("limit", String(opts.limit));
+    return this.getJson<TracesAggregate>(`/v1/traces/aggregates?${params}`);
+  }
+
+  // --- Control plane: schedules -------------------------------------------
+
+  async listSchedules(): Promise<Schedule[]> {
+    return this.getJson<Schedule[]>("/v1/schedules");
+  }
+
+  async createSchedule(opts: CreateScheduleOpts): Promise<Schedule> {
+    const resp = await fetch(`${this.baseUrl}/v1/schedules`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", ...this.cidHeader(reqOpts?.correlationId) },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
+      headers: { "Content-Type": "application/json", ...this.authHeader() },
+      body: JSON.stringify({
+        name: opts.name,
+        task: opts.task,
+        interval_seconds: opts.intervalSeconds,
+        at_iso: opts.atIso,
+        webhook_url: opts.webhookUrl,
+      }),
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`runAgentStream failed: ${resp.status}`);
-    if (!resp.body) throw new Error("No response body");
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let eventType = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.slice(7).trim();
-        } else if (line.startsWith("data: ") && eventType) {
-          try {
-            yield { type: eventType, data: JSON.parse(line.slice(6)) };
-          } catch {
-            // skip malformed
-          }
-          eventType = "";
-        }
-      }
-    }
+    if (!resp.ok) throw new Error(`createSchedule failed: ${resp.status}`);
+    return snakeToCamelDeep(await resp.json()) as Schedule;
   }
 
-  // --- Agent preview ---
-
-  async agentPreview(opts: {
-    mcpServers?: unknown[];
-    toolAllowlist?: string[];
-  }): Promise<Record<string, unknown>> {
-    const body = toSnake({
-      mcpServers: opts.mcpServers,
-      toolAllowlist: opts.toolAllowlist,
-    });
-    const resp = await fetch(`${this.baseUrl}/v1/agent/preview`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`agentPreview failed: ${resp.status}`);
-    return resp.json();
+  async getSchedule(scheduleId: string): Promise<Schedule> {
+    return this.getJson<Schedule>(`/v1/schedules/${scheduleId}`);
   }
 
-  // --- Model + agent discovery ---
-
-  async litellmModels(): Promise<Array<Record<string, unknown>>> {
-    const resp = await fetch(`${this.baseUrl}/v1/litellm/models`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
+  async deleteSchedule(scheduleId: string): Promise<Record<string, unknown>> {
+    const resp = await fetch(`${this.baseUrl}/v1/schedules/${scheduleId}`, {
+      method: "DELETE",
+      headers: { ...this.authHeader() },
+      signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`litellmModels failed: ${resp.status}`);
-    return (await resp.json()) as Array<Record<string, unknown>>;
+    if (!resp.ok) throw new Error(`deleteSchedule failed: ${resp.status}`);
+    return snakeToCamelDeep(await resp.json()) as Record<string, unknown>;
   }
 
-  async sandboxAgentInfo(agent: string): Promise<Record<string, unknown>> {
-    const resp = await fetch(`${this.baseUrl}/v1/sandbox/agents/${agent}`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`sandboxAgentInfo failed: ${resp.status}`);
-    return resp.json();
-  }
-
-  // --- Discovery ---
+  // --- Discovery / meta ----------------------------------------------------
 
   async discovery(): Promise<Discovery> {
-    const resp = await fetch(`${this.baseUrl}/v1/discovery`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`discovery failed: ${resp.status}`);
-    const data = (await resp.json()) as Record<string, unknown>;
-    // Wire is snake_case; surface camelCase for nested deps and top-level
-    const deps = data.dependencies as any;
-    return {
-      service: data.service as "aitelier",
-      version: data.version as string,
-      apiVersion: data.api_version as string,
-      timestamp: data.timestamp as string,
-      endpoints: data.endpoints as Discovery["endpoints"],
-      capabilities: data.capabilities as Discovery["capabilities"],
-      dependencies: {
-        litellm: {
-          reachable: deps?.litellm?.reachable,
-          baseUrl: deps?.litellm?.base_url,
-          models: deps?.litellm?.models,
-          reason: deps?.litellm?.reason,
-        },
-        sandboxAgent: {
-          reachable: deps?.sandbox_agent?.reachable,
-          baseUrl: deps?.sandbox_agent?.base_url,
-          agents: deps?.sandbox_agent?.agents,
-          reason: deps?.sandbox_agent?.reason,
-        },
-      },
-      schemas: data.schemas as Record<string, string>,
-      knownLimitations: data.known_limitations as string[],
-    };
+    return this.getJson<Discovery>("/v1/discovery");
+  }
+
+  async health(): Promise<HealthResponse> {
+    return this.getJson<HealthResponse>("/v1/health");
   }
 
   async getSchema(name: string): Promise<Record<string, unknown>> {
-    const resp = await fetch(`${this.baseUrl}/v1/schemas/${name}`, {
-      headers: this.authHeader(),
-      signal: AbortSignal.timeout(this.timeout),
-    });
-    if (!resp.ok) throw new Error(`getSchema failed: ${resp.status}`);
-    return resp.json();
+    return this.getJson<Record<string, unknown>>(`/v1/schemas/${name}`);
   }
+
+  // ------------------------------------------------------------------------
+
+  private async getJson<T>(path: string): Promise<T> {
+    const resp = await fetch(`${this.baseUrl}${path}`, {
+      headers: { ...this.authHeader() },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`GET ${path} failed: ${resp.status}`);
+    return snakeToCamelDeep(await resp.json()) as T;
+  }
+}
+
+// Wire ↔ SDK casing converter. Aitelier's HTTP responses are snake_case
+// (lockstep with the Python SDK + JSON Schemas); the TS SDK exposes
+// camelCase to match idiomatic JS. Conversion is keys-only and recursive
+// — except inside user-data fields like `metadata`, `environment`,
+// `payload`, and `task`, whose contents are opaque and must round-trip
+// byte-for-byte. Without that carve-out a consumer who submits
+// `{my_key: ...}` into metadata would read back `{myKey: ...}` and the
+// SDK would have silently mutated their data.
+const PRESERVE_VALUE_KEYS = new Set([
+  "metadata",
+  "environment",
+  "payload",
+  "task",
+]);
+
+function snakeToCamelDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(snakeToCamelDeep);
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const ck = snakeToCamelKey(k);
+      out[ck] = PRESERVE_VALUE_KEYS.has(k) ? v : snakeToCamelDeep(v);
+    }
+    return out;
+  }
+  return value;
+}
+
+function snakeToCamelKey(key: string): string {
+  return key.replace(/_([a-z0-9])/g, (_, c: string) => c.toUpperCase());
 }

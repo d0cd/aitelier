@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/run_event.schema.json",
+  "title": "RunEvent",
+  "description": "One row from the append-only run_events table. Returned by GET /v1/runs/{run_id}/events and streamed by /events/stream.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "seq", "kind"],
+  "properties": {
+    "event_id": {
+      "type": ["integer", "null"],
+      "description": "Monotonically-increasing per-process insert order. Not stable across stores."
+    },
+    "run_id": { "type": "string" },
+    "seq": {
+      "type": "integer",
+      "description": "Per-run monotonic sequence. Use with ?since_seq= to paginate without re-fetching."
+    },
+    "kind": {
+      "type": "string",
+      "description": "Event family. Common: start, delta, tool_call, tool_result, finish, error, cancelled. Open-ended; new kinds may appear without a schema bump."
+    },
+    "ts": { "type": ["string", "null"], "format": "date-time" },
+    "payload": {
+      "type": "object",
+      "description": "Event-specific fields. delta: {content}. tool_call: {server, tool, input}. tool_result: {tool, output, elapsed_ms}. start: {agent, sandbox, workspace} where sandbox is the symbolic 'local'|'remote' rather than an internal URL."
+    }
+  }
+}

@@ -11,6 +11,8 @@ Retry delays: 1s, 5s, 30s, 5min, 1hr. Then `state='failed'`.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -33,22 +35,57 @@ def _next_attempt_at(attempts: int) -> datetime | None:
 
 async def _deliver_once(delivery) -> None:
     """Try one delivery. Updates state via store.record_webhook_attempt."""
+    from aitelier.config import get_config
     from aitelier.providers.llm import get_shared_client
+    from aitelier.security import is_public_url
     from aitelier.storage import get_store
 
     status_code: int | None = None
     error: str | None = None
 
+    # Re-validate the URL at delivery time, not just at enqueue time.
+    # An operator may have flipped `allow_loopback_webhooks` off after
+    # the row was queued, or DNS may have rebinding-shifted what the
+    # hostname resolves to. If the URL no longer passes the SSRF guard,
+    # mark this delivery failed instead of firing the request.
+    if not get_config().service.allow_loopback_webhooks:
+        if not await is_public_url(delivery.url):
+            store = await get_store()
+            await store.record_webhook_attempt(
+                delivery.id, status_code=None,
+                error="SSRF guard: URL is loopback/private/link-local",
+                next_attempt_at=None,
+            )
+            logger.warning(
+                "Webhook %s rejected at delivery: SSRF guard tripped on %s",
+                delivery.id, delivery.url,
+            )
+            return
+
+    # Sign the body so the receiver can verify it actually came from aitelier.
+    # Only active when service.webhook_secret is set — typically in hosted
+    # mode alongside api_key. Receiver verifies:
+    #   sha256_hex == hmac.new(secret.encode(), body, sha256).hexdigest()
+    body_bytes = json.dumps(delivery.payload, default=str).encode()
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    secret = get_config().service.webhook_secret
+    if secret:
+        sig = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
+        headers["X-Aitelier-Signature"] = f"sha256={sig}"
+
     try:
         client = await get_shared_client()
         resp = await client.post(
             delivery.url,
-            json=delivery.payload,
+            content=body_bytes,
+            headers=headers,
             timeout=10.0,
         )
         status_code = resp.status_code
         if status_code < 200 or status_code >= 300:
-            error = f"HTTP {status_code}: {resp.text[:200]}"
+            # Status only — webhook receivers may echo secrets/PII in their
+            # error bodies, and last_error is persisted to Postgres + logs.
+            error = f"HTTP {status_code}"
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
 
@@ -119,14 +156,8 @@ def stop_webhook_worker() -> None:
     _worker_task = None
 
 
-# --- Test helpers --------------------------------------------------------
-
 # Expose internal hooks for unit tests
 __all__ = [
     "start_webhook_worker", "stop_webhook_worker",
     "_worker_tick", "_next_attempt_at", "_MAX_ATTEMPTS",
 ]
-
-
-# Silence unused import when running ruff with json removed
-_ = json

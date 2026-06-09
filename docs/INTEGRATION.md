@@ -1,689 +1,885 @@
-# aitelier integration guide
+# aitelier — integration guide
 
-> For projects consuming aitelier as an AI runtime. Drop this into your
-> project or reference it from your CLAUDE.md.
+aitelier exposes an **OpenAI-compatible HTTP service** for inference, plus an
+**aitelier-native control plane** for durable run state, traces, schedules, and
+async agent runs.
+
+If you've used OpenAI's API before, the inference surface is exactly what you
+expect. The control plane is what makes aitelier interesting: durable Postgres-
+backed runs, append-only event timelines, schedules, webhook delivery,
+correlation-IDed traces.
 
 ## What aitelier is
 
-A local AI runtime at `~/projects/aitelier`. It owns inference, agent
-delegation, and observability. Your project owns prompts, tools, domain
-logic, and scheduling.
+A personal AI runtime that puts:
+
+- Any LLM behind LiteLLM (Anthropic, OpenAI, Ollama, …) and
+- Any coding agent behind Rivet's Sandbox Agent (Claude Code, Codex, OpenCode, …)
+
+…behind a single OpenAI-shaped HTTP API. Inference calls look like
+`chat.completions.create(...)`. The `model` field decides whether you hit an
+LLM or an agent.
+
+Aitelier-native concerns — durable run state, correlation tracking,
+schedules, webhooks, cancellation — live alongside but separate, as
+control-plane endpoints.
 
 ## Setup
 
-aitelier runs as a local HTTP service on `localhost:7777`. Credentials are
-extracted from Claude Code and Codex CLI logins — no manual API keys needed.
-
 ```bash
-cd ~/projects/aitelier
-claude login              # once — OAuth login for Anthropic
-make install              # one-time dependency setup
-make start                # credentials + LiteLLM proxy + Sandbox Agent + aitelier service
-make test                 # verify everything works (unit + smoke tests)
+git clone https://github.com/<you>/aitelier
+cd aitelier
+make install
+make start          # Postgres + LiteLLM + Sandbox Agent + aitelier service
 ```
 
-`make start` installs and supervises three things:
-- **LiteLLM proxy** on `localhost:4000` (Docker)
-- **Sandbox Agent** (Rivet) on `localhost:2468` — single Rust binary, auto-installed
-- **aitelier service** on `localhost:7777`
+The service binds to `127.0.0.1:7777` by default. The SDKs auto-discover this
+via `~/.config/aitelier/config.toml`'s `[service]` block.
 
-Sandbox Agent port can be overridden: `./scripts/start.sh --sandbox-agent-port 3000`
-or via `SANDBOX_AGENT_PORT` env. If 2468 is taken, a free port is picked dynamically
-and exported as `SANDBOX_AGENT_BASE_URL` for the aitelier service to pick up.
+## Quickstart
 
-### Ollama: host install or containerized?
-
-Set the choice in `aitelier.toml` — it's the single source of truth:
-
-```toml
-[ollama]
-mode = "host"     # macOS default: brew install ollama, ollama serve
-# mode = "docker" # Linux + NVIDIA, or reproducible containerized
-```
-
-- **host** — LiteLLM reaches host Ollama at `host.docker.internal:11434`.
-  Recommended on macOS. Docker Desktop has no GPU/Metal passthrough, so
-  containerized Ollama on Mac would be CPU-only and ~10× slower.
-- **docker** — brings up the `ollama` compose profile, sets
-  `OLLAMA_BASE_URL=http://ollama:11434` for LiteLLM, stores models in the
-  `aitelier_ollama_models` named volume. For NVIDIA passthrough on Linux,
-  uncomment the `deploy.resources` block in `docker/docker-compose.yml`
-  and install `nvidia-container-toolkit`.
-
-`make start ollama` is still accepted for backwards compat (forces docker
-mode for that run) but settling it in `aitelier.toml` is the cleaner pattern.
-
-### Remote sandbox-agent (closed-laptop tolerance)
-
-Sandbox Agent can run on a remote host instead of locally — useful when you
-want long agent runs to survive your laptop going to sleep. Point aitelier at
-the remote URL by setting two env vars before `make start`:
-
-```bash
-export SANDBOX_AGENT_BASE_URL="https://your-sandbox-host.example.com"
-export SANDBOX_TOKEN="<your token>"   # from `niteshift auth` / E2B / Daytona / Modal
-make start
-```
-
-`scripts/start.sh` detects a non-local `SANDBOX_AGENT_BASE_URL` and skips the
-local binary install. Health-checks the remote, then aitelier reads the URL
-from its env at boot. Agent runs go remote; LiteLLM + traces stay local.
-
-Tested against the Rust binary running on the same host. Public hosted
-backends (E2B, Daytona, Modal, Vercel Sandboxes) require their respective
-provisioning steps — see Sandbox Agent's docs for installing on each.
-
-Or use SDK mode (import directly, no HTTP service needed):
+### Python
 
 ```python
-from aitelier.providers.llm import complete, embed
-from aitelier.providers.agent import call_agent
-```
-
-## Three primitives
-
-### 1. `complete` — chat completion
-
-```python
-# Via HTTP (from any language)
-POST http://localhost:7777/v1/complete
-{
-  "model": "claude-sonnet",
-  "system_prompt": "You are a fact-checker.",
-  "messages": [
-    {"role": "user", "content": "Is the sky blue?"}
-  ],
-  "temperature": 0,
-  "max_tokens": 1000,
-  "response_format": {
-    "type": "json_schema",
-    "schema": {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]},
-    "strict": true
-  }
-}
-
-# Response
-{
-  "kind": "complete",
-  "provider": "claude-sonnet",
-  "status": "ok",
-  "content": "{\"answer\": \"yes\"}",
-  "parsed": {"answer": "yes"},
-  "usage": {"input_tokens": 25, "output_tokens": 10, "total_tokens": 35},
-  "finish_reason": "stop",
-  "cost_usd": 0.001,
-  "trace_id": "2026-05-07T10-00-00_complete",
-  ...
-}
-```
-
-```python
-# Via Python SDK
 from aitelier_client import Aitelier
 
-async with Aitelier() as ai:
-    result = await ai.complete(
-        model="claude-sonnet",
-        system_prompt="You are a fact-checker.",
-        messages=[{"role": "user", "content": "Is the sky blue?"}],
-        response_format={"type": "json_schema", "schema": {...}, "strict": True},
-    )
-    print(result.parsed)  # {"answer": "yes"}
+ait = Aitelier(api_key="optional-bearer-key")
+openai = ait.openai()    # pre-configured AsyncOpenAI client
+
+# LLM call
+resp = await openai.chat.completions.create(
+    model="claude-sonnet-4-6",
+    messages=[{"role": "user", "content": "Summarize today's news."}],
+)
+print(resp.choices[0].message.content)
+
+# Agent call — model prefix flips the routing
+resp = await openai.chat.completions.create(
+    model="agent:claude/claude-sonnet-4-5",
+    messages=[{"role": "user", "content": "Audit this repo for security issues."}],
+    extra_body={
+        "aitelier": {
+            "workspace": "/path/to/repo",
+            "tool_allowlist": ["github.search", "shell.run"],
+            "max_turns": 25,
+        },
+    },
+)
+
+# Control plane
+runs = await ait.list_runs(trace_tag="security-audit", limit=10)
 ```
 
+### TypeScript
+
 ```typescript
-// Via TypeScript SDK
 import { Aitelier } from "aitelier";
 
-const ai = new Aitelier();
-const result = await ai.complete({
-  model: "claude-sonnet",
-  systemPrompt: "You are a fact-checker.",
-  messages: [{ role: "user", content: "Is the sky blue?" }],
-  responseFormat: { type: "json_schema", schema: {...}, strict: true },
-});
-console.log(result.parsed); // { answer: "yes" }
+const ait = new Aitelier({ apiKey: "optional-bearer-key" });
+const openai = await ait.openai();
+
+const resp = await openai.chat.completions.create({
+  model: "agent:claude",
+  messages: [{ role: "user", content: "Audit this repo." }],
+  // Aitelier's TypeScript types don't extend OpenAI's, so cast extra_body.
+  extra_body: { aitelier: { workspace: "/path/to/repo" } },
+} as any);
+
+const runs = await ait.listRuns({ traceTag: "security-audit", limit: 10 });
+// → control-plane responses are camelCase (runId, startedAt, …) even
+//   though the wire is snake_case; the TS SDK normalizes at the
+//   boundary. Inference responses from `ait.openai()` keep OpenAI's
+//   snake_case (finish_reason, prompt_tokens, …) to match the broader
+//   ecosystem.
 ```
 
-#### Streaming variant
+## The inference surface
 
-```python
-POST http://localhost:7777/v1/complete/stream
-# Same request body as /v1/complete
-```
+Three OpenAI-shape endpoints. Use them directly with the OpenAI SDK, curl,
+or any tool that knows the protocol.
 
-Returns Server-Sent Events. Three event types:
+### `POST /v1/chat/completions`
 
-```
-event: complete.delta
-data: {"content": "Hello", "correlation_id": "..."}
+Standard OpenAI chat-completions request. Set `stream: true` for SSE.
 
-event: complete.delta
-data: {"content": " world", "correlation_id": "..."}
+Routing decided by `model`:
 
-event: complete.done
-data: {"content": "Hello world", "usage": {...}, "finish_reason": "stop",
-       "cost_usd": null, "trace_id": "", "correlation_id": "..."}
-```
-
-On failure a single `event: complete.error` is emitted instead of `complete.done`.
-No retries — once a token has been delivered, replay is unsafe.
-
-### 2. `embed` — batch embeddings
-
-```python
-POST http://localhost:7777/v1/embed
-{
-  "texts": ["first document", "second document"],
-  "model": "nomic-embed-text"     # optional, this is the default
-}
-
-# Response
-{
-  "kind": "embed",
-  "status": "ok",
-  "embeddings": [[0.1, 0.2, ...], [0.3, 0.4, ...]],
-  "dimensions": 768,
-  ...
-}
-```
-
-Default model is `nomic-embed-text` (768 dimensions). If dimensions don't
-match what you expect, treat it as an error.
-
-### 3. `runAgent` — agent with MCP tools
-
-This is the key primitive. Aitelier delegates to an external coding agent
-(Claude Code or Codex) and passes through your control options.
-
-```python
-POST http://localhost:7777/v1/agent
-{
-  "model": "claude",
-  "system_prompt": "You are a curator agent for a reading list app...",
-  "initial_message": "Process today's feeds and produce an inbox.",
-  "mcp_servers": [
-    {
-      "name": "myproject",
-      "transport": "http",
-      "url": "http://localhost:3001/mcp"
-    }
-  ],
-  "tool_allowlist": ["myproject.query_corpus", "myproject.add_item"],
-  "response_format": {
-    "type": "json_schema",
-    "schema": {
-      "type": "object",
-      "properties": {
-        "items": {"type": "array", "items": {"type": "object"}},
-        "summary": {"type": "string"}
-      },
-      "required": ["items", "summary"]
-    }
-  },
-  "max_turns": 25,
-  "timeout": 300,
-  "trace_tag": "curator-daily-2026-05-07"
-}
-
-# Response
-{
-  "kind": "agent",
-  "provider": "claude",
-  "status": "ok",
-  "content": "{\"items\": [...], \"summary\": \"...\"}",
-  "parsed": {"items": [...], "summary": "..."},
-  "finish_reason": "completed",    # or "max_turns", "timeout", "error"
-  "tool_calls": [...],             # when available from the agent
-  "trace_id": "2026-05-07T10-00-00_agent_run",
-  ...
-}
-```
-
-**What happens under the hood:**
-aitelier opens an ACP session against the local Sandbox Agent (rivet-dev/sandbox-agent)
-and runs the agent inside it. The flow is `initialize` → `session/new` (with cwd +
-MCP servers) → `session/prompt` (blocks until turn completes). Notifications
-(`session/update`) stream in over SSE during the prompt and contribute message
-chunks + tool calls to the final result. See `core/src/aitelier/providers/sandbox_agent.py`.
-
-### 4. `recentTraces` — query the trace store
-
-Every `complete`, `embed`, and `runAgent` call is recorded in a SQLite
-trace store. Query it for debugging:
-
-```python
-GET http://localhost:7777/v1/traces?trace_tag=curator-daily-2026-05-07&limit=10
-
-# Response: array of trace records
-[{
-  "trace_id": "2026-05-07T10-00-00_agent_run",
-  "started_at": "2026-05-07T10:00:00Z",
-  "ended_at": "2026-05-07T10:02:30Z",
-  "model": "claude",
-  "kind": "agent",
-  "finish_reason": "completed",
-  "tool_call_count": 5,
-  "total_tokens": 15000,
-  "cost_usd": 0.12,
-  "system_prompt_hash": "a1b2c3d4e5f6...",
-  "trace_tag": "curator-daily-2026-05-07",
-  "status": "ok"
-}]
-```
-
-Filter by: `trace_tag`, `status` ("ok"/"error"), `since` (ISO timestamp), `limit`.
-
-Or from the CLI:
-
-```bash
-aitelier traces                                            # latest 20
-aitelier traces --tag curator-daily-2026-05-07
-aitelier traces --status error --since 2026-05-01T00:00:00Z
-aitelier traces 2026-05-07T10-00-00_agent_run              # single trace detail
-aitelier traces --json                                     # JSON output for piping
-```
-
-## Available models
-
-These are the model names to use (routed by the LiteLLM proxy):
-
-| Name | What | Cost |
+| `model` value | Path | Notes |
 |---|---|---|
-| `claude-sonnet` | Claude Sonnet 4.6 | Cloud (Anthropic API) |
-| `claude-haiku` | Claude Haiku 4.5 | Cloud (Anthropic API) |
-| `local` | Qwen3 8B via Ollama | Free (local) |
-| `nomic-embed-text` | Nomic embeddings 768d | Free (local) |
+| `claude-sonnet-4-6`, `nomic-embed-text`, `local`, … | LiteLLM (alias) | Curated short names from `docker/litellm/config.yaml` |
+| `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (wildcard) | Pass-through; LiteLLM resolves the provider |
+| `agent:<backend>` | Sandbox Agent | Backend's default inner LLM |
+| `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM (e.g. `agent:claude/claude-opus-4-7`) |
 
-For agent calls, use agent names from `GET /v1/discovery → dependencies.sandbox_agent.agents` (currently: `claude`, `codex`, plus whatever other backends sandbox-agent advertises).
+### `POST /v1/embeddings`
 
-### Pass-through model strings
+OpenAI-shape batch embeddings via LiteLLM. Default model:
+`nomic-embed-text` (768-dim).
 
-Beyond the aliases above, aitelier accepts arbitrary provider-prefixed
-model strings and forwards them to LiteLLM directly:
-
-```python
-await ai.complete(model="anthropic/claude-opus-4-7", messages=[...])
-await ai.complete(model="openai/gpt-4o-2024-08-06", messages=[...])
-await ai.complete(model="ollama/llama3:70b", messages=[...])
-```
-
-LiteLLM resolves the provider from the prefix and uses the matching env
-var for credentials (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.).
-Listed in `docker/litellm/config.yaml` under the `*/*` wildcard entries.
-
-Discover what LiteLLM knows about:
-
-```python
-models = await ai.litellm_models()   # list of {id, ...}
-```
-
-### Agent workflow — prepare, run, fetch in one call
-
-`/v1/agent` is a consolidated workflow endpoint, not just an agent-run
-trigger. Pass `prepare` to set up the sandbox env before the agent
-starts, `artifacts.fetch` to pull files back after — all in one call:
-
-```python
-result = await ai.run_agent(
-    model="claude",
-    initial_message="Run the test suite and write the failures to /workspace/fail.json",
-    prepare={
-        "install_agents": ["claude"],                      # JIT-install CLI if missing
-        "commands": [                                       # env setup
-            {"cmd": "apt-get", "args": ["install", "-y", "jq"]},
-            {"cmd": "pip",     "args": ["install", "pytest"], "cwd": "/workspace"},
-        ],
-        "files": [                                          # seed inputs
-            {"path": "/workspace/conftest.py", "content": "..."},
-        ],
-        "sidecars": [                                       # long-lived for the run
-            {"name": "mockapi", "cmd": "python", "args": ["/sidecars/mock.py"]},
-        ],
-    },
-    artifacts={"fetch": ["/workspace/fail.json", "/workspace/diff.patch"]},
-)
-
-# result.prepare       — per-step outcomes (install_results, command_results, files, sidecars)
-# result.content       — agent output
-# result.tool_calls    — what the agent invoked
-# result.artifacts     — {path: content} for every requested file
-```
-
-What aitelier orchestrates internally on a single `/v1/agent` call:
-
-1. `install_agents` → sandbox-agent `POST /v1/agents/{a}/install` for each
-2. `commands` → `POST /v1/processes/run`, **first non-zero exit aborts** (finish_reason="prepare_failed", agent never starts)
-3. `files` → `PUT /v1/fs/file`
-4. `sidecars` → `POST /v1/processes`, PIDs tracked
-5. Run the agent via ACP (existing flow)
-6. `artifacts.fetch` → `GET /v1/fs/file` for each
-7. Stop sidecars (always — even if the agent errored)
-
-Consumers never touch sandbox-agent directly. For edge cases not covered
-by this workflow (browser testing, log tailing from a sidecar mid-flight,
-generic sandbox poking), the SA URL is exposed in `GET /v1/discovery →
-dependencies.sandbox_agent.base_url` — connect there with `SANDBOX_TOKEN`.
-
-### Agent model selection
-
-For `/v1/agent`, the `model` field selects the **agent backend** (claude,
-codex, opencode, …). To override which LLM the backend uses internally,
-pass `agent_model`:
-
-```python
-await ai.run_agent(
-    model="claude",                      # backend
-    agent_model="claude-opus-4-20250514", # LLM the backend uses
-    initial_message="…",
-)
-```
-
-Aitelier sends this as `session/set_config_option name=model` over ACP.
-Best-effort: if the backend doesn't recognize the key, it falls back to
-its default. Discover what a backend supports:
-
-```python
-info = await ai.sandbox_agent_info("claude")   # models, permissions, MCP flags
-```
-
-### Alias stability
-
-Model names above are **stable aliases**, not versioned model IDs. The
-underlying versions are pinned in `docker/litellm/config.yaml`
-(e.g. `claude-sonnet` currently → `anthropic/claude-sonnet-4-6`). aitelier
-may bump the underlying version under the same alias when there's a clear
-upgrade; behavior changes are noted in `PLAN.md`.
-
-If you need to pin a specific version, request that a versioned alias be
-added (e.g. `claude-sonnet-4-6` alongside `claude-sonnet`); aitelier can
-route both. Consumers that don't pin should expect alias behavior to track
-the current best version for the family.
-
-## Available agents
-
-All agents run through **Rivet's Sandbox Agent** (ACP-based). aitelier no longer
-spawns `claude` or `codex` as subprocesses directly — Sandbox Agent owns isolation,
-env scoping, and event normalization across all backends.
-
-| Name | Notes |
-|---|---|
-| `claude` | Anthropic Claude Code via ACP |
-| `codex` | OpenAI Codex CLI via ACP |
-| `opencode` | OpenCode via ACP |
-| `cursor` | Cursor's agent via ACP |
-| `amp` | Amp via ACP |
-| `pi` | Pi via ACP |
-
-Agent names are exactly what Sandbox Agent advertises — call `GET /v1/discovery`
-to see the live list (`dependencies.sandbox_agent.agents`). Don't assume a
-name; query it.
-
-## Security model
-
-Two modes:
-
-**Localhost-trust (default).** aitelier binds to `127.0.0.1`, no auth on any
-endpoint. Anyone who can reach the port can call any endpoint. Fine for a
-laptop-only personal runtime; do not bind to a public interface in this mode.
-
-**Hosted mode** — set `service.api_key` in `aitelier.toml` *or*
-`AITELIER_API_KEY` env. Every `/v1/*` endpoint (except `/v1/health`, kept
-public for liveness probes) requires `Authorization: Bearer <api_key>`.
-SDKs accept `api_key` / `apiKey` in the constructor and send the header
-automatically:
-
-```python
-async with Aitelier(base_url="https://aitelier.your-host.example.com",
-                    api_key="<your-key>") as ai: ...
-```
+**Note for TypeScript consumers**: OpenAI's JS SDK v6 defaults
+`encoding_format: "base64"` for embeddings. A 768-float vector arrives as
+a packed-byte string unless you pass `encoding_format: "float"`
+explicitly. Not aitelier-specific, but worth knowing — silent
+dimension-mismatches are no fun:
 
 ```typescript
-const ai = new Aitelier({ baseUrl: "https://aitelier.your-host.example.com",
-                          apiKey: "<your-key>" });
+const emb = await openai.embeddings.create({
+  model: "nomic-embed-text",
+  input: ["hello world"],
+  encoding_format: "float",  // ← explicit; JS SDK defaults to "base64"
+});
 ```
 
-Always combine hosted mode with TLS termination (e.g., Caddy/Traefik in
-front of the container) — Bearer over plain HTTP is unsafe.
+The Python SDK defaults to `"float"`, so no action needed there.
 
-Agents themselves run isolated by Sandbox Agent: file system scope, env
-scoping, no aitelier-side secrets leak in.
+### `GET /v1/models`
 
-### Container / Dockerfile
+OpenAI-shape model list. Two flavors of entry:
 
-`docker/Dockerfile` builds a minimal image running just the FastAPI
-service. Point it at remote LiteLLM and Sandbox Agent via env:
+- **LLM**: standard OpenAI shape — `{id, object: "model", owned_by, response_format}`. `response_format` lists the `json_object` / `json_schema` modes the provider supports. Anthropic / `claude-*` is `[]` because LiteLLM's adapter rejects OpenAI-shape `json_schema`; `local` / `ollama/*` is both (aitelier bypasses LiteLLM and maps to Ollama's native `format` field); OpenAI / `gpt-*` is both.
+- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_inner_llms: [...], aitelier_capabilities: {...}}` — lists the LLM IDs you can pair after `/` for `agent:<backend>/<inner-llm>` routing, plus the Sandbox Agent capability flags.
 
-```bash
-docker build -f docker/Dockerfile -t aitelier:latest .
-docker run -p 7777:7777 \
-    -e AITELIER_HOST=0.0.0.0 \
-    -e AITELIER_API_KEY=<your-key> \
-    -e LITELLM_BASE_URL=http://litellm:4000 \
-    -e SANDBOX_AGENT_BASE_URL=http://sandbox-agent:2468 \
-    -v aitelier-runs:/app/runs \
-    aitelier:latest
-```
-
-## Error handling
-
-Aitelier returns errors in the result dict, not as HTTP errors:
+Every entry also carries an `aitelier_request_caps` block declaring which
+OpenAI request fields the route honors:
 
 ```json
 {
-  "status": "error",
-  "error_type": "ProviderUnavailable",
-  "error_msg": "Connection refused",
-  "finish_reason": "error"
+  "id": "agent:claude",
+  "aitelier_request_caps": {
+    "tools":           false,
+    "tool_choice":     false,
+    "n_gt_1":          false,
+    "top_p":           false,
+    "streaming":       true,
+    "response_format": ["json_schema"]
+  }
 }
 ```
 
-| error_type | Meaning |
+Use it to pre-strip request fields in a model picker / proxy rather than
+hard-coding aitelier-specific quirks. The agent path enforces the same
+rules as 400 responses; consulting `aitelier_request_caps` lets the
+consumer avoid the round-trip:
+
+```python
+caps = catalog[model].get("aitelier_request_caps", {})
+for field in ("tools", "tool_choice"):
+    if not caps.get(field, True):
+        request.pop(field, None)
+```
+
+Consumers can validate `agent:<backend>/<inner-llm>` strings upfront
+rather than after a failed run.
+
+### Reasoning models on `local` / `ollama/*`
+
+`local` and `ollama/*` bypass LiteLLM entirely — aitelier calls Ollama's
+`/api/chat` directly and translates [Ollama's response shape](https://github.com/ollama/ollama/blob/main/docs/api.md)
+to OpenAI's:
+
+| Ollama field | OpenAI ChatCompletion field |
 |---|---|
-| `ProviderUnavailable` | Can't reach LiteLLM proxy or agent |
-| `Timeout` | Call exceeded timeout |
-| `RateLimited` | HTTP 429 from provider |
-| `AuthError` | HTTP 401/403 from provider |
-| `ProviderError` | Other HTTP errors from provider |
-| `SchemaViolation` | Structured output didn't parse |
-| `NonZeroExit` | Agent CLI exited with error |
-| `Cancelled` | Run was cancelled via `POST /v1/runs/{id}/cancel` |
+| `message.content` | `choices[0].message.content` |
+| `message.thinking` | `choices[0].message.reasoning_content` |
+| `message.tool_calls` | `choices[0].message.tool_calls` |
+| `done_reason: "length"` | `choices[0].finish_reason: "length"` |
+| `done_reason: "stop"` | `choices[0].finish_reason: "stop"` |
+| `prompt_eval_count` | `usage.prompt_tokens` |
+| `eval_count` | `usage.completion_tokens` |
 
-Your project should handle these by checking `result.status == "error"`.
+For Ollama reasoning models (qwen3, deepseek-r1, …), thinking is **off
+by default** — set OpenAI's `reasoning_effort` to enable it:
 
-## Cost tracking
-
-| Primitive | `cost_usd` | Why |
-|---|---|---|
-| `complete` | ✅ tracked | Routed through the LiteLLM proxy, which logs cost per call |
-| `embed` | ✅ tracked | Same |
-| `runAgent` / `runAgentStream` | ❌ `null` | Agent LLM calls happen *inside* the Sandbox Agent process, going directly to Anthropic/OpenAI — they bypass LiteLLM, so aitelier doesn't see them |
-
-Tokens (`usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens`)
-are captured on agent results **if** the backend surfaces them in the
-ACP `session/prompt` response. claude-code typically does; coverage of
-other backends varies.
-
-**Workarounds for per-run agent cost (none ideal yet):**
-
-1. **Route agent calls through LiteLLM.** Set `ANTHROPIC_BASE_URL` /
-   `OPENAI_BASE_URL` on the sandbox-agent process so its child CLIs send
-   to LiteLLM. Captures aggregate cost; per-run attribution would need
-   sandbox-agent to inject a `Aitelier-Run-Id` header per session,
-   which it doesn't expose today (upstream feature ask).
-2. **Estimate from tokens.** Multiply `usage` by your own price table.
-   Drifts as prices change; doesn't account for caching discounts.
-
-If you need per-run agent cost for budget alerting, file the upstream
-ask with [rivet-dev/sandbox-agent](https://github.com/rivet-dev/sandbox-agent)
-for per-session env injection. Until then, treat `cost_usd: null` on
-agent results as expected, not a bug.
-
-## Configuration
-
-Aitelier reads config from (in order):
-1. `aitelier.toml` in the current directory
-2. `~/.config/aitelier/config.toml`
-3. Environment variables: `LITELLM_BASE_URL`, `LITELLM_API_KEY`, `SANDBOX_AGENT_BASE_URL`, `SANDBOX_TOKEN`
-4. Defaults (`localhost:4000`, `sk-litellm-local`, `localhost:2468`)
-
-## SDK reference — new primitives
-
-The four "deepread contract" primitives (`complete`, `embed`, `runAgent`,
-`recentTraces`) are unchanged. The SDKs additionally expose:
-
-### `completeStream` — streaming chat completion
-
-```python
-async with Aitelier() as ai:
-    async for ev in ai.complete_stream(model="claude-sonnet",
-                                       messages=[{"role": "user", "content": "tell me a story"}]):
-        if ev["type"] == "complete.delta":
-            print(ev["data"]["content"], end="", flush=True)
-        elif ev["type"] == "complete.done":
-            print()  # final aggregated result with usage, finish_reason
-```
-
-```typescript
-const ai = new Aitelier();
-for await (const ev of ai.completeStream({ model: "claude-sonnet", messages: [...] })) {
-  if (ev.type === "complete.delta") process.stdout.write(ev.data.content as string);
-}
-```
-
-### `cancelRun` / `listActiveRuns`
-
-```python
-runs = await ai.list_active_runs()   # ActiveRuns(active=[run_id, ...])
-await ai.cancel_run("2026-05-12T..._agent_run")   # CancelAck(run_id=..., cancelled=True)
-```
-
-```typescript
-const { active } = await ai.listActiveRuns();
-await ai.cancelRun("2026-05-12T..._agent_run");   // { runId, cancelled: true }
-```
-
-### `runAgentStream` — streaming agent run
-
-For chat-style UIs where the user wants to watch the agent's reasoning + tool
-calls unfold instead of staring at a spinner:
-
-```python
-async for ev in ai.run_agent_stream(model="claude",
-                                     initial_message="Process today's feeds.",
-                                     mcp_servers=[...], tool_allowlist=[...]):
-    if ev["type"] == "agent.delta":
-        print(ev["data"]["content"], end="", flush=True)
-    elif ev["type"] == "agent.tool_call":
-        print(f"\n[tool] {ev['data']['server']}.{ev['data']['tool']}({ev['data']['input']})")
-    elif ev["type"] == "agent.done":
-        print()  # final Result is in ev["data"]
-```
-
-```typescript
-for await (const ev of ai.runAgentStream({ model: "claude", initialMessage: "...", mcpServers: [...] })) {
-  if (ev.type === "agent.delta") process.stdout.write(ev.data.content as string);
-  // ev.type also covers agent.tool_call / agent.tool_result / agent.done / agent.error
-}
-```
-
-### `agentPreview` — dry-run tool resolution
-
-```python
-preview = await ai.agent_preview(
-    mcp_servers=[{"name": "deepread", "transport": "http", "url": "http://localhost:3001/mcp"}],
-    tool_allowlist=["deepread.query_corpus", "deepread.fact_check"],
-)
-# preview["allowlist_misses"]  → names in the allowlist that match no tool (likely typos)
-# preview["unused_tools"]      → tools available but excluded by the allowlist
-# preview["servers"]           → per-server reachability + the tools it advertises
-```
-
-```typescript
-const preview = await ai.agentPreview({
-  mcpServers: [{ name: "deepread", transport: "http", url: "http://localhost:3001/mcp" }],
-  toolAllowlist: ["deepread.query_corpus", "deepread.fact_check"],
+```ts
+await openai.chat.completions.create({
+  model: "local",
+  messages: [...],
+  reasoning_effort: "medium",   // ← enables Ollama `think: true`
 });
 ```
 
-Use this when iterating on agent setups — it queries each HTTP MCP server's
-`tools/list` and shows which allowlist entries actually match. stdio MCP
-servers are marked `previewable: false` (can't query without spawning).
+Forcing `think` on unconditionally caused a class of bug where qwen3
+under a tight `max_tokens` budget consumed the entire budget on hidden
+thoughts and returned `content=""`. With the gate, default calls produce
+content; reasoning is opt-in via the standard OpenAI signal.
 
-### `discovery` / `getSchema`
+When thinking is enabled:
 
-```python
-d = await ai.discovery()
-# d.dependencies.litellm.reachable, d.capabilities["complete"].available, d.endpoints, ...
-task_schema = await ai.get_schema("task")
+- **Thinking surfaces as `reasoning_content`**. Even when a tight
+  `max_tokens` budget gets fully consumed by reasoning and `content` is
+  empty, you'll see what the model produced in
+  `choices[0].message.reasoning_content`. `finish_reason: "length"`
+  signals the budget was hit.
+
+- **`aitelier_exit: "empty"`** fires only when *neither* content *nor*
+  reasoning_content *nor* tool_calls landed despite `completion_tokens
+  > 0` — a true degenerate case rather than the normal reasoning-budget
+  exhaustion.
+
+Two consumer-side mitigations when you want visible content with
+reasoning enabled:
+
+1. **Use `max_completion_tokens`** (OpenAI's reasoning-model field) when
+   you want visible output regardless of reasoning size. Aitelier maps
+   it to Ollama's `num_predict`.
+
+2. **Set `max_tokens` generously** (e.g. 500+ for short responses).
+   Below ~100, reasoning models often won't reach visible output.
+
+**Structured outputs work natively** on `local` / `ollama/*`:
+`response_format: { type: "json_object" }` maps to Ollama's `format:
+"json"`, and `response_format: { type: "json_schema", json_schema: {...} }`
+maps to Ollama's schema-mode `format: <schema>`. No 400 — Ollama enforces
+the shape server-side.
+
+Configure the `local` alias target via `[ollama] default_model` in
+`aitelier.toml` (default: `qwen3:8b`).
+
+### Agent options — `extra_body.aitelier.*`
+
+Anything the agent path needs that doesn't fit OpenAI's request shape rides
+in `extra_body.aitelier`:
+
+```json
+{
+  "model": "agent:claude/claude-sonnet-4-5",
+  "messages": [...],
+  "aitelier": {
+    "workspace":      "/path/to/repo",
+    "mcp_servers":    [{"name": "github", "transport": "http", "url": "..."}],
+    "tool_allowlist": ["github.search", "shell.run"],
+    "max_turns":      25,
+    "prepare":   { /* install agents, run commands, seed files, start sidecars */ },
+    "artifacts": { "fetch": ["/workspace/out.json"] },
+    "trace_tag": "security-audit-2026-05",
+    "examples":  [{"user": "...", "assistant": "..."}]
+  }
+}
 ```
 
-```typescript
-const d = await ai.discovery();
-// d.dependencies.litellm.reachable, d.capabilities.complete.available, d.endpoints, ...
+The `aitelier` namespace is **only accepted when `model` starts with `agent:`** —
+400 otherwise.
+
+The `aitelier` block is `additionalProperties: false` — see
+[`/v1/schemas/aitelier_request`](http://localhost:7777/v1/schemas/aitelier_request)
+for the authoritative field list. The accepted properties are exactly:
+`workspace, mcp_servers, tool_allowlist, max_turns, prepare, artifacts,
+trace_tag, examples, allow_tool_drop`. Anything else (including
+common-misplacement candidates like `timeout`, `model`, `messages`,
+`stream`) is rejected.
+
+#### Request-body `timeout` lives at the top level, not under `aitelier`
+
+`timeout` is a server-side execution budget (integer seconds) and is a
+**top-level body field**, peer to `model` / `messages` / `stream` —
+exactly where the OpenAI client puts it. It is **not** an `aitelier.*`
+option, and putting it there errors out under the strict schema.
+
+```jsonc
+{
+  "model":    "agent:claude",
+  "messages": [...],
+  "timeout":  300,          // ← here
+  "aitelier": {             // ← NOT in here
+    "workspace": "/path",
+    "trace_tag": "..."
+  }
+}
 ```
 
-### Correlation IDs (per call or default)
+Both SDKs map this correctly: TS `submitRun({timeout: 300})` writes
+`body.timeout`, Python `submit_run(..., timeout=300)` writes
+`body["timeout"]`. If you handcraft requests, mirror that placement.
 
-```python
-# Default for all calls on this client
-async with Aitelier(default_correlation_id="job-123") as ai:
-    await ai.complete(model="claude-sonnet", messages=[...])
+#### Multi-turn history
 
-# Override per call
-await ai.complete(model="claude-sonnet", messages=[...], correlation_id="req-abc")
-```
-
-```typescript
-const ai = new Aitelier({ defaultCorrelationId: "job-123" });
-await ai.complete({ model: "claude-sonnet", messages: [...] }, { correlationId: "req-abc" });
-```
-
-## Correlation IDs
-
-Every request carries an `X-Correlation-Id` header. Supply your own ID to
-tie your application logs to aitelier's traces, or let aitelier generate one:
+A `messages` array with prior `assistant` turns is accepted on the agent
+path. Aitelier folds the conversation into a single inner-agent prompt
+with this structure:
 
 ```
-POST /v1/complete
-X-Correlation-Id: req-abc-123       # optional; generated as UUID if absent
+<conversation_history>
+  <message role="user">…</message>
+  <message role="assistant">…</message>
+  <message role="tool">…</message>     ← any non-system role is included verbatim
+</conversation_history>
+
+<current_task>
+…last user message…
+</current_task>
 ```
 
-The same value is:
-- echoed back in the response `X-Correlation-Id` header,
-- included in the response JSON as `correlation_id`,
-- included in every SSE event payload (for streaming endpoints),
-- persisted in `traces.metadata.correlation_id` for runner-routed calls
-  (`/v1/agent`, `/v1/execute`, `/v1/fanout`).
+System messages (any number) concatenate into the inner agent's system
+prompt. The last non-system message must be `role="user"` (400 otherwise).
+`role: "tool"` and `role: "function"` messages **are included** in
+`<conversation_history>` verbatim with their original role attribute —
+the inner agent decides whether to act on them.
+
+The agent runs in a fresh ACP session per call, so prior turns are
+replayed verbatim rather than persisted on the backend side. Cost
+scales linearly in `aitelier_inner_tokens` with conversation length.
+
+Cost implication: long histories grow linearly in `aitelier_inner_tokens`
+because the inner agent re-processes the same prefix each turn. For
+long-conversation deployments, lift stable prefixes into the system
+prompt and rely on Anthropic prompt caching (next section).
+
+#### Anthropic prompt caching (`cache_control`)
+
+`cache_control` markers on message content blocks are passed through to
+Anthropic. Aitelier auto-attaches the `anthropic-beta:
+prompt-caching-2024-07-31` header on `claude*` / `anthropic/*` routes
+whenever any message content block carries a `cache_control` marker —
+without that header LiteLLM strips the marker silently and cache hits
+go to zero.
+
+```jsonc
+{
+  "model": "claude-haiku",
+  "messages": [
+    {"role": "system", "content": [{
+      "type": "text",
+      "text": "...long stable prefix...",
+      "cache_control": {"type": "ephemeral"}
+    }]},
+    {"role": "user", "content": "..."}
+  ]
+}
+```
+
+Cache stats surface in `usage` on the response:
+
+```
+usage.cache_creation_input_tokens
+usage.cache_read_input_tokens
+usage.prompt_tokens_details.cached_tokens
+usage.prompt_tokens_details.cache_creation_tokens
+```
+
+### What the agent path rejects
+
+The agent path **hard-rejects** OpenAI fields it can't honestly honor:
+
+- `tools` / `tool_choice` — the inner agent runs its own tools; we don't bridge
+  them. Use `aitelier.tool_allowlist` to constrain which tools the agent uses.
+- `n > 1` — the inner agent produces one response.
+- `top_p` — the agent backend controls sampling.
+
+Silent drops would be the "worst category of bug." 400 with a clear message
+is the contract.
+
+**Escape hatch for `tools` / `tool_choice` only**: consumers whose transport
+sends `tools` per a global toolset config and can't suppress it per-profile
+(Hermes) can set `aitelier.allow_tool_drop: true`. With that flag, `tools`
+and `tool_choice` are silently dropped on the agent path. The opt-in is
+explicit so consumers can't accidentally lose tools without knowing.
+
+### Response identifiers
+
+Every non-streaming response (and every SSE chunk) carries three IDs:
+
+| Field | Meaning |
+|---|---|
+| `id` | OpenAI chat-completion id — `chatcmpl-<run_id>`. Set by aitelier so an OpenAI client's correlation logic works against aitelier responses. |
+| `aitelier_run_id` | The aitelier run id. Use this to fetch `/v1/runs/{id}`, `/v1/runs/{id}/events`, or `/v1/runs/{id}/cancel`. |
+| `aitelier_trace_id` | The trace id used in `/v1/traces` queries. Today this is always equal to `aitelier_run_id` — one trace per run. Kept as a separate field so future divergence (e.g., grouping retried runs under one trace) doesn't break consumers. |
+
+### aitelier-specific response signals
+
+Side-channel fields aitelier adds to OpenAI responses (consumers can
+ignore them; they don't break the OpenAI shape):
+
+- **`choices[i].message.reasoning_content`** — passed through verbatim from
+  LiteLLM (Anthropic extended-thinking, qwen3 reasoning, Bedrock thinking
+  all land here). Available in non-streaming responses for backends that
+  surface it; in streaming, individual chunks carry
+  `delta.reasoning_content` pieces.
+
+- **`choices[i].message.aitelier_parsed`** — when `response_format` is
+  `json_object` or `json_schema` and the model wrapped JSON in
+  ` ```json` fences or prose ("Here you go: {...}"), aitelier fence-strips
+  and parses. The raw text stays in `content`; the parsed value lands here.
+
+- **`choices[i].aitelier_exit: "empty"`** — when `completion_tokens > 0`
+  but `content == ""` and no `reasoning_content` and no `tool_calls`,
+  aitelier flags it. Diagnoses "reasoning model burned its budget on
+  hidden thinking" which OpenAI's `finish_reason` vocabulary can't
+  express. Streaming surfaces this on a synthetic terminal chunk emitted
+  just before `data: [DONE]`.
+
+- **`aitelier_tool_call_count`** (int) and **`aitelier_tool_names`**
+  (list of str) — present on every agent-path response, including the
+  terminal SSE chunk of streaming responses. The inner-agent tools that
+  fired during the run, so consumers can render "this run used Read,
+  Edit, Bash" in the UI without a follow-up `GET /v1/runs/{id}/events`.
+  Empty list / `0` when nothing fired.
+
+- **`usage.aitelier_inner_tokens`** (int, agent path only) — the inner
+  agent's hidden overhead (system prompt + tool schemas + intermediate
+  reasoning) measured in tokens. Aitelier preserves the OpenAI invariant
+  `total_tokens == prompt_tokens + completion_tokens` for user-visible
+  I/O; this field surfaces the rest so consumers who care about
+  subscription cost can sum the two. Omitted when zero (LLM path, or
+  agent backends that don't surface the breakdown).
+
+### Streaming
+
+Set `stream: true`. The response is OpenAI-compatible SSE.
+
+- **LLM path**: real token streaming via LiteLLM's SSE forwarding.
+- **Agent path**: ACP `session/update` notifications mapped to OpenAI
+  `delta.content` chunks. Tool-call / tool-result events from the inner
+  agent are **not** surfaced as OpenAI `tool_calls` (those imply the
+  consumer should respond) but the terminal SSE chunk carries
+  `aitelier_tool_call_count` and `aitelier_tool_names` so consumers know
+  what fired without a follow-up GET. The full event trace
+  (`tool_call`, `tool_result`, `thought`, …) lives at
+  `GET /v1/runs/{id}/events`.
+
+Every chunk carries `aitelier_run_id`, `aitelier_trace_id`, and `correlation_id`
+so consumers can correlate without parsing the body.
+
+**Keepalive cadence.** During silent agent-planning phases — including
+phases where the inner agent is emitting tool-call events that aitelier
+drops from the wire — an SSE comment frame `: keepalive` is emitted at
+most ~25 seconds since the last wire chunk. SSE parsers ignore comments,
+but reverse proxies and client read timeouts see traffic and don't tear
+down the connection. Consumers can safely set read timeouts ≥ 30s; for
+very long-planning inner agents we recommend ≥ 60s.
+
+## The control plane
+
+Everything that doesn't fit OpenAI's vocabulary — long-running async
+submissions, durable state queries, schedules, webhooks, cancellation —
+lives on aitelier-native endpoints.
+
+### `POST /v1/runs` — submit an async agent run
+
+Long-running agent runs can outlive an HTTP connection. Submit them via
+`/v1/runs`; aitelier returns a `run_id` immediately and webhook-delivers the
+final ChatCompletion when the run finishes:
+
+```bash
+curl -X POST http://localhost:7777/v1/runs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "agent:claude",
+    "messages": [{"role": "user", "content": "Long task..."}],
+    "webhook_url": "https://your.app/aitelier-callback"
+  }'
+# → {"run_id": "2026-05-14T...-chat_agent_async", "status": "accepted",
+#    "correlation_id": "...", "webhook_url": "https://..."}
+```
+
+The webhook receives the ChatCompletion (or an error body) when the run
+completes. Failed runs whose process died are flipped to `orphaned` on
+service restart (see [Run state machine](#run-state-machine)).
+
+LLM calls don't go here — they're short enough to stream synchronously.
+`/v1/runs` 400s on non-`agent:` models.
+
+### `GET /v1/runs[/{id}[/events[/stream]]]`
+
+Durable run state + append-only event timeline.
+
+```
+GET    /v1/runs                       # filter by trace_tag, state, correlation_id, ...
+GET    /v1/runs/{run_id}              # one run record
+GET    /v1/runs/{run_id}/events       # all events
+GET    /v1/runs/{run_id}/events/stream # SSE — tails events live
+```
+
+### `POST /v1/runs/{run_id}/cancel`
+
+Cancel an in-flight run by ID. Returns `{run_id, cancelled: true}` on
+success, 404 if the run isn't in the active registry (already finished or
+never started here).
+
+### `GET /v1/runs/active`
+
+Per-process registry of run IDs currently in flight. Useful for ops
+dashboards. **Per-process only** — if aitelier scales horizontally, this
+reflects only the contacted instance.
+
+### `GET /v1/traces[/{id}|/aggregates]`
+
+Trace-record summaries of runs (a narrower projection focused on
+observability: model, kind, tokens, cost, status, error_type). The
+`aggregates` endpoint groups by model, kind, or status for at-a-glance
+dashboards.
+
+### `/v1/schedules*`
+
+```
+GET    /v1/schedules                # list
+POST   /v1/schedules                # create (interval or one-shot)
+GET    /v1/schedules/{id}           # fetch
+DELETE /v1/schedules/{id}           # remove
+```
+
+A schedule's `task` field is the same shape as a `/v1/chat/completions`
+request body. When a schedule fires, aitelier builds the request and
+routes it through the same code path as a live HTTP call.
+
+```json
+POST /v1/schedules
+{
+  "name": "nightly-feed-curator",
+  "task": {
+    "model": "agent:claude",
+    "messages": [{"role": "user", "content": "Curate today's feeds."}]
+  },
+  "interval_seconds": 86400,
+  "webhook_url": "https://your.app/aitelier-callback"
+}
+```
+
+Set `at_iso` instead of `interval_seconds` for a one-shot trigger.
+Failures route through the durable webhook worker (see
+[Webhooks](#webhooks)).
+
+### `GET /v1/health` / `GET /v1/discovery` / `GET /v1/metrics`
+
+`/v1/health` is liveness only — does the process answer HTTP. No
+dependency probing, no caching needed. Cheap enough for k8s liveness
+probes on a tight cadence. Public (no auth required even in hosted mode).
+
+`/v1/discovery` is the runtime source of truth: endpoint inventory, live
+dependency probes (LiteLLM, Sandbox Agent, traces), per-model
+`response_format` capabilities, and the `schemas.*` map pointing at
+`GET /v1/schemas/{name}` (JSON Schema source for `aitelier_request`,
+`run`, `run_event`, `schedule`, `active_runs`, `cancel`,
+`traces_aggregate`, `discovery`). 5s response cache so consumers can
+poll without hammering downstreams.
+
+`/v1/metrics` is the operator endpoint for process-level health:
+
+```json
+{
+  "uptime_seconds":  3712.482,
+  "timestamp":       "2026-05-18T14:23:01Z",
+  "process":         { "rss_mb": 71.4, "cpu_user_seconds": 12.3,
+                       "cpu_system_seconds": 0.4 },
+  "runs":            { "in_flight": 0,
+                       "recent_5min": { "total": 50,
+                                        "by_status": { "ok": 48, "error": 2 } } },
+  "webhooks":        { "pending": 0 }
+}
+```
+
+Reach for it when investigating memory growth, runaway in-flight runs,
+or a webhook-delivery backlog. Never probes downstreams — use
+`/v1/discovery` for that.
+
+**Distinguishing aitelier-down from dep-down at call time.** When
+LiteLLM is unreachable, `POST /v1/chat/completions` returns
+`503 Service Unavailable` with `{"error": {"type": "ProviderUnavailable",
+"message": "..."}}` — that's the typed signal consumers should branch
+on rather than re-probing `/v1/discovery` per call. Other typed error
+shapes: `Timeout` (504), `RateLimited` (429), `AuthError` (401),
+`UnsupportedResponseFormat` (400), `ProviderError` (502, catch-all).
+
+## Run state machine
+
+Every inference call records a row in the `runs` table:
+
+```
+pending → running → {completed | failed | cancelled | orphaned}
+```
+
+| State | Meaning |
+|---|---|
+| `pending` | Spec inserted; awaitable hasn't started yet |
+| `running` | Awaitable started |
+| `completed` | Returned a non-error result |
+| `failed` | Threw an exception or returned `status="error"` |
+| `cancelled` | Caller cancelled via `POST /v1/runs/{id}/cancel` |
+| `orphaned` | Was `running` when the previous aitelier process died; flipped on startup |
+
+`orphaned` is set on aitelier startup for any row left in `pending`/`running`
+from a previous process — Sandbox Agent has no session-resume API today, so
+those sessions are unrecoverable. Dashboards should treat `orphaned` as a
+terminal failure mode.
+
+## Available models
+
+LiteLLM resolves both curated aliases (declared in `docker/litellm/config.yaml`)
+and pass-through wildcards (`anthropic/*`, `openai/*`, `ollama/*`). Aliases
+exist so the most common models have short, stable names; pass-through
+covers everything else without aitelier needing config changes.
+
+| Type | Examples |
+|---|---|
+| Curated alias | `claude-sonnet`, `claude-haiku`, `local`, `nomic-embed-text` |
+| Anthropic wildcard | `anthropic/claude-opus-4-7`, `anthropic/claude-haiku-3.5` |
+| OpenAI wildcard | `openai/gpt-4o`, `openai/gpt-4-turbo` |
+| Ollama wildcard | `ollama/qwen2.5-coder`, `ollama/llama3.2:8b` |
+| Agent (Claude Code) | `agent:claude`, `agent:claude/claude-sonnet-4-5` |
+| Agent (Codex) | `agent:codex`, `agent:codex/gpt-4o` |
+
+Capability discovery at runtime: `GET /v1/models` returns each model
+annotated with the `response_format` types it supports.
+
+### `response_format` normalization
+
+The LLM path honors OpenAI-spec `response_format` with per-provider gating:
+
+- `json_schema` on **OpenAI / `gpt-*`**: passthrough.
+- `json_schema` on **Anthropic / `claude-*`**: **hard-rejected** with
+  `UnsupportedResponseFormat`. LiteLLM's Anthropic adapter rejects
+  OpenAI-shape `json_schema` at its parameter-translation step; we
+  refuse up-front instead of returning the resulting 502 traceback.
+  Use `json_object` for soft JSON enforcement on claude models.
+- `json_schema` on **Ollama / `local`**: passes through to Ollama's
+  native schema-mode `format: <schema>`. Aitelier bypasses LiteLLM for
+  these models — Ollama enforces the shape server-side.
+- `json_object` on **Ollama / `local`**: passes through as Ollama's
+  `format: "json"`. Same bypass path.
+- `json_object` on **OpenAI / `gpt-*`**: passthrough.
+- `json_object` on **providers without native support** (including
+  Anthropic): format is stripped and a "return JSON only" system
+  directive is injected. The consumer still gets JSON, just via prompt
+  engineering. Documented soft fallback.
+
+Defense in depth: if upstream regresses and returns a 5xx whose body
+mentions the OpenAI `response_format` translation path, aitelier
+reclassifies it as `UnsupportedResponseFormat` (400) instead of letting
+the traceback leak to consumers.
+
+## Available agents
+
+Sandbox Agent advertises its backends at `GET /v1/discovery →
+dependencies.sandbox_agent.agents`. Typical list:
+
+`claude` (Claude Code), `codex` (OpenAI Codex CLI), `opencode`, `cursor`,
+`amp`, `pi`.
+
+Use `model: "agent:<backend>"` to route to one. Optional inner-LLM override:
+`model: "agent:<backend>/<inner-llm>"`.
+
+## Webhooks
+
+Async run completions and scheduled jobs route through a durable webhook
+worker:
+
+- **Queued** in Postgres (table `webhook_deliveries`).
+- **Retry policy**: exponential backoff `1s / 5s / 30s / 5min / 1hr`,
+  5 attempts.
+- **Optional HMAC signing**: set `[service] webhook_secret` to enable a
+  `X-Aitelier-Signature: sha256=<hmac>` header on every delivery.
+- **SSRF guard** (hosted mode only): when `[service] api_key` is set,
+  webhook URLs must resolve to a public, non-loopback host.
+
+The payload is the ChatCompletion (success) or
+`{error: {...}, aitelier_run_id}` (failure).
+
+**Orphan webhook**: if aitelier restarts while an async run is in flight,
+the run flips to `orphaned` on startup and a terminal webhook fires with
+`{error: {type: "Orphaned", ...}, aitelier_state: "orphaned"}`. Sandbox
+Agent has no session-resume API today, so the run itself is
+unrecoverable — but the consumer no longer polls forever.
+
+## Error handling
+
+aitelier returns OpenAI-shaped error responses:
+
+```json
+{
+  "error": {
+    "type":    "RateLimited",
+    "message": "...",
+    "code":    "error"
+  },
+  "aitelier_run_id": "..."
+}
+```
+
+Error types (classified in `core/src/aitelier/errors.py`):
+
+| `error_type` | Triggers | Retry? |
+|---|---|---|
+| `ProviderUnavailable` | ConnectError, NetworkError | Yes |
+| `Timeout` | Request timed out | Yes |
+| `RateLimited` | HTTP 429 from upstream | Yes (honor `Retry-After`) |
+| `AuthError` | HTTP 401/403 | No |
+| `ProviderError` | Other 4xx/5xx from upstream | No |
+| `UnsupportedResponseFormat` | `json_schema` on a provider without support | No (change model or drop the format) |
+| `PrepareFailed` | `aitelier.prepare` phase failed before the agent ran | No |
+| `NonZeroExit` | Agent CLI exited with error | No |
+| `Cancelled` | Run cancelled via `/v1/runs/{id}/cancel` or consumer disconnect | No |
+| `Orphaned` | Run was in-flight when aitelier restarted; finalised via orphan-sweep + terminal webhook (see "Run state machine" → `orphaned`) | No |
+| `SchemaViolation` | JSON parse / validation error | No |
+
+### Retries
+
+Retries are **the OpenAI SDK's responsibility** on the LLM path —
+configure them via the OpenAI client options. Aitelier doesn't add a
+second retry layer.
+
+For async agent submissions (`POST /v1/runs`), retries don't apply because
+the call returns immediately. Use the `Idempotency-Key` header to make
+re-submissions safe.
+
+## Idempotency
+
+`POST /v1/chat/completions` (agent path) and `POST /v1/runs` accept
+`Idempotency-Key: <uuid>` headers. On replay with the same key + body,
+aitelier returns the cached response (24h window). On the same key with a
+different body, 422.
+
+**Streaming is covered.** When `stream: true` plus an `Idempotency-Key`
+header, aitelier records the SSE chunks on successful completion and
+replays the same chunks (with the same `aitelier_run_id` on each) on a
+retry with the same key + body. The consumer sees a fresh SSE stream
+that's byte-identical to the original — no re-execution of inner-agent
+work or side effects.
+
+**Caching boundaries.** Only *successful* completions are cached.
+Streams that ended in an error frame, were cancelled, or had the
+producer task aborted are not stored — a retry produces a fresh attempt
+at success rather than locking the consumer into the failure.
+
+Useful for retried submissions where the agent path has side effects
+(`aitelier.prepare.commands`, sidecars, file writes).
 
 ## Cancellation
 
-Long-running runs (agent, execute, fanout) can be cancelled by `run_id`:
+In-flight runs can be cancelled by `run_id`:
 
 ```
-GET  /v1/runs/active            # → {"active": ["2026-05-11T...-agent_run", ...]}
+GET  /v1/runs/active            # → {"active": ["2026-05-14T...-chat_agent", ...]}
 POST /v1/runs/{run_id}/cancel   # → {"run_id": "...", "cancelled": true}
 ```
 
-The owning request returns a result with `status: "error"`,
-`error_type: "Cancelled"`, `finish_reason: "cancelled"`. For streaming
-`/v1/execute/stream`, a terminal `event: run.cancelled` is emitted instead
-of `run.completed`. Cancelling a run that has already finished returns 404.
+Cancelling a sync `/v1/chat/completions` call surfaces as an error response
+(`error_type: "Cancelled"`). Cancelling a stream emits a terminal error
+chunk. Cancelling a run that already finished returns 404.
 
-Note: the active-run registry is per-process; if you scale aitelier
-horizontally, this list reflects only the contacted instance.
+Get the `run_id`: sync responses include `aitelier_run_id` in the body;
+streaming chunks include it in each event; async submissions return it
+immediately.
 
-## Wire format
+The active-run registry is **per-process** — if aitelier scales horizontally,
+the list reflects only the contacted instance.
 
-Snake_case on the wire (HTTP JSON). The TypeScript SDK converts to camelCase.
-The Python SDK uses snake_case natively.
+## Correlation IDs
 
-Schemas at: `~/projects/aitelier/schemas/v1/*.schema.json`
+Every request accepts `X-Correlation-Id: <opaque-string>`. If absent,
+aitelier generates one.
+
+A correlation ID is:
+
+- echoed in `X-Correlation-Id` response header,
+- included in the response JSON as `correlation_id`,
+- included in every SSE chunk on streaming endpoints,
+- persisted as `runs.correlation_id` (and inside `runs.metadata`) for every
+  call, queryable via `GET /v1/runs?correlation_id=…`,
+- propagated to log lines emitted during the request via a contextvar.
+
+## Configuration
+
+**Aitelier reads zero env vars in app code.** All settings come from TOML,
+loaded in this layered order (later layers override earlier ones):
+
+1. **Defaults** — dataclass fields in `core/src/aitelier/config.py`.
+2. **Base config** — explicit `aitelier --config <path>`, else:
+   - `./aitelier.toml` (repo-local), or
+   - `~/.config/aitelier/config.toml` (user-global).
+3. **Secrets overlay** — `aitelier.secrets.toml` next to the base config
+   (gitignored). Same TOML shape; put API keys, OAuth tokens, and webhook
+   secrets here.
+4. **Session overlay** — `runs/.session.toml` (gitignored, ephemeral).
+   Written by `scripts/start.sh` for runtime-discovered values (chosen
+   sandbox-agent port, dev Postgres DSN). Cleaned up by `scripts/stop.sh`.
+
+| Section | Common fields |
+|---|---|
+| `[database]` | `url` (Postgres DSN; unset = InMemoryStore for dev) |
+| `[litellm]` | `base_url`; `api_key` lives in `aitelier.secrets.toml` |
+| `[sandbox_agent]` | `base_url`; `token` (remote mode) in secrets overlay |
+| `[service]` | `host`, `port`, `log_format` (`human` or `json`); `api_key` + `webhook_secret` in secrets overlay |
+| `[storage]` | `max_metadata_bytes` (default 65536) |
+| `[ollama]` | `mode` (`host` or `docker`), optional `base_url` |
+
+The SDK clients (Python + TypeScript) read `~/.config/aitelier/config.toml`'s
+`[service]` host/port for their default `baseUrl`; pass an explicit `base_url`
+to override.
+
+## Security model
+
+aitelier supports two modes:
+
+- **Localhost-trust** (default) — `127.0.0.1` bind, no auth required. Any
+  process on the host can call. SSRF guards are off for ergonomic dev.
+- **Hosted mode** — set `[service] api_key`. Every `/v1/*` except
+  `/v1/health` requires `Authorization: Bearer <key>`. SSRF guard activates
+  on webhook URLs (no loopback / private ranges / metadata services).
+
+Always combine hosted mode with TLS termination upstream. Bearer over
+plain HTTP is unsafe.
+
+## Cost tracking
+
+LLM-path calls go through LiteLLM, which exposes cost via the
+`response._hidden_params["response_cost"]` field. aitelier persists this
+on `runs.cost_usd` when LiteLLM reports it.
+
+Agent-path runs always have `cost_usd: null` by design: agent LLM calls
+happen inside the Sandbox Agent process and go directly to Anthropic /
+OpenAI, bypassing LiteLLM. Token usage *is* captured when the backend
+surfaces it (`runs.input_tokens` / `output_tokens` / `total_tokens`).
+
+## SDK reference
+
+Both SDKs share the same shape: a thin `Aitelier` client for the control
+plane plus a `.openai()` helper for inference.
+
+### Inference — `.openai()`
+
+Returns a preconfigured OpenAI client pointed at this aitelier service.
+Lazy import: requires the `openai` package as a peer dependency.
+
+```python
+ait = Aitelier(api_key="...")
+openai = ait.openai()                          # AsyncOpenAI
+resp = await openai.chat.completions.create(...)
+```
+
+```typescript
+const ait = new Aitelier({ apiKey: "..." });
+const openai = await ait.openai();             // OpenAI
+const resp = await openai.chat.completions.create(...);
+```
+
+Use the OpenAI SDK directly for: streaming, retries, structured outputs,
+tool semantics, embeddings, model listing.
+
+### Control plane
+
+| Method | Endpoint |
+|---|---|
+| `submit_run` / `submitRun` | `POST /v1/runs` |
+| `cancel_run` / `cancelRun` | `POST /v1/runs/{id}/cancel` |
+| `list_active_runs` / `listActiveRuns` | `GET /v1/runs/active` |
+| `get_run` / `getRun` | `GET /v1/runs/{id}` |
+| `list_runs` / `listRuns` | `GET /v1/runs` |
+| `list_run_events` / `listRunEvents` | `GET /v1/runs/{id}/events` |
+| `stream_run_events` (Python) | `GET /v1/runs/{id}/events/stream` (SSE) |
+| `recent_traces` / `recentTraces` | `GET /v1/traces` |
+| `get_trace` / `getTrace` | `GET /v1/traces/{id}` |
+| `aggregate_traces` / `aggregateTraces` | `GET /v1/traces/aggregates` |
+| `list_schedules` / `listSchedules` | `GET /v1/schedules` |
+| `create_schedule` / `createSchedule` | `POST /v1/schedules` |
+| `get_schedule` / `getSchedule` | `GET /v1/schedules/{id}` |
+| `delete_schedule` / `deleteSchedule` | `DELETE /v1/schedules/{id}` |
+| `discovery` | `GET /v1/discovery` |
+| `health` | `GET /v1/health` |
+| `get_schema` / `getSchema` | `GET /v1/schemas/{name}` |
 
 ## What aitelier does NOT do
 
-- **No prompts or domain logic** — your project owns those
-- **No scheduling** — your project runs cron/timers and calls aitelier
-- **No tool execution** — your project hosts MCP servers; aitelier brokers
-- **No memory** — your project decides what to persist
-- **No delivery** — your project handles email, messaging, etc.
+- **Multi-tenancy** — single-developer use; in-process active-run registry is fine.
+- **Authentication / authorization beyond Bearer** — hosted mode is for trusted access; SSO/RBAC isn't justified.
+- **Cost budgets / rate limiting per consumer** — let the LLM provider enforce.
+- **A web dashboard** — structured logs + `/v1/traces*` cover the current need.
+- **Bridge inner-agent tool calls to consumer-side tools** — the inner agent runs its own tools; consumers can't fulfill them via OpenAI's `tools` parameter.

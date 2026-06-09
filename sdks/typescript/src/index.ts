@@ -3,23 +3,9 @@
  */
 
 export { Aitelier } from "./client.js";
-export type { AtelierOptions, RequestOpts } from "./client.js";
-export { streamEvents } from "./streaming.js";
+export type { AtelierOptions, SubmitRunOpts } from "./client.js";
 export type {
-  // Core
-  TaskSpec,
-  Result,
-  AtelierEvent,
-  FanoutRequest,
   HealthResponse,
-  CompleteOpts,
-  EmbedOpts,
-  RunAgentOpts,
-  TraceRecord,
-  Message,
-  McpServer,
-  Usage,
-  ToolCall,
   // Discovery
   Discovery,
   EndpointInfo,
@@ -30,9 +16,16 @@ export type {
   // Cancellation
   ActiveRuns,
   CancelAck,
-  // Streaming events
-  CompleteStreamEvent,
-  CompleteStreamDelta,
-  CompleteStreamDone,
-  CompleteStreamError,
-} from "./_generated/types.js";
+  // Durable runs + events
+  Run,
+  RunState,
+  RunEvent,
+  // Schedules
+  Schedule,
+  CreateScheduleOpts,
+  // Traces
+  TraceRecord,
+  TracesAggregate,
+  TracesAggregateBucket,
+  TracesAggregateTotals,
+} from "./types.js";

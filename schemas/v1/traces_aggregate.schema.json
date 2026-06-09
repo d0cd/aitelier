@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/traces_aggregate.schema.json",
+  "title": "TracesAggregate",
+  "description": "Response from GET /v1/traces/aggregates — rollups of runs by a chosen dimension.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["group_by", "groups", "total"],
+  "properties": {
+    "group_by": {
+      "type": "string",
+      "enum": ["trace_tag", "kind", "model", "agent_id", "status", "error_type", "day"]
+    },
+    "groups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/Bucket" }
+    },
+    "total": { "$ref": "#/$defs/Totals" }
+  },
+  "$defs": {
+    "Bucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "count", "total_tokens", "cost_usd", "error_count"],
+      "properties": {
+        "key":          { "type": "string", "description": "The group value (e.g. trace_tag name, model id, or YYYY-MM-DD day)." },
+        "count":        { "type": "integer" },
+        "total_tokens": { "type": "integer" },
+        "cost_usd":     { "type": "number" },
+        "error_count":  { "type": "integer" }
+      }
+    },
+    "Totals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["count", "total_tokens", "cost_usd", "error_count"],
+      "properties": {
+        "count":        { "type": "integer" },
+        "total_tokens": { "type": "integer" },
+        "cost_usd":     { "type": "number" },
+        "error_count":  { "type": "integer" }
+      }
+    }
+  }
+}

@@ -51,7 +51,14 @@ general_settings:
   master_key: "os.environ/LITELLM_MASTER_KEY"
 
 litellm_settings:
-  cache: true
-  cache_params:
-    type: "local"
-    ttl: 3600
+  # No proxy-side retries. Retries belong in the SDK only — that's the
+  # consumer's contract. Silent LiteLLM retries would distort latency, cost,
+  # and observability for any SDK call that asked for `max_attempts=1`, and
+  # agent calls bypass LiteLLM entirely so the layering would be asymmetric.
+  num_retries: 0
+  # Cache disabled by default. The proxy has no per-caller scoping today, so
+  # in a multi-tenant deployment a consumer could extract another consumer's
+  # cached completion by replaying the same prompt. If you re-enable for a
+  # single-tenant install, set `cache_params.namespace` to a per-instance
+  # value so cache keys don't collide across deployments.
+  cache: false

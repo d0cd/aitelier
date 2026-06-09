@@ -22,6 +22,7 @@ from aitelier.storage._store import (
     get_store,
 )
 from aitelier.storage.models import (
+    IdempotencyRecord,
     Run,
     RunEvent,
     RunFilter,
@@ -37,6 +38,7 @@ __all__ = [
     "InMemoryStore",
     "get_store",
     "close_store",
+    "IdempotencyRecord",
     "Run",
     "RunEvent",
     "RunFilter",

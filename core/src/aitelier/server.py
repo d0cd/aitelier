@@ -5,20 +5,53 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import functools
+import hashlib
+import hmac
 import json
 import logging
+import re
+import resource
+import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
 
+from aitelier.config import get_config
+from aitelier.errors import classify_error
+from aitelier.openai_compat import (
+    AitelierAgentOpts,
+    ChatCompletionRequest,
+    EmbeddingsRequest,
+    agent_error_to_chat_completion_error,
+    agent_result_to_chat_completion,
+    agent_usage_to_openai,
+    chat_completion_chunk,
+    chat_completion_error_envelope,
+    normalize_response_extras,
+    parse_model_route,
+    stream_final_extras,
+    summarize_tool_calls,
+)
+from aitelier.providers.llm import (
+    LLMError,
+    UnsupportedResponseFormat,
+    chat_completion,
+    chat_completion_stream,
+    embeddings,
+    list_models,
+    model_response_format_capabilities,
+)
+from aitelier.runner import make_run_id
 from aitelier.runs import hash_system_prompt, record_run
+from aitelier.security import is_public_url
 from aitelier.storage import RunFilter, RunSpec, get_store
 
 logger = logging.getLogger("aitelier")
@@ -92,13 +125,13 @@ def _install_correlation_logging() -> None:
 
 
 def _active_formatter() -> logging.Formatter:
-    """Pick the formatter once based on AITELIER_LOG_FORMAT.
+    """Pick the formatter based on [service] log_format in aitelier.toml.
 
     `json` → one-line JSON per record (aggregator-friendly).
     anything else → human-readable with [correlation_id] prefix.
     """
-    import os
-    if os.environ.get("AITELIER_LOG_FORMAT", "").lower() == "json":
+    from aitelier.config import get_config
+    if get_config().service.log_format.lower() == "json":
         return _JsonFormatter()
     return logging.Formatter(_AITELIER_LOG_FORMAT)
 
@@ -117,29 +150,42 @@ _install_correlation_logging()
 
 
 async def _schedule_handler(entry: dict) -> None:
-    """Run one fired schedule. runner.execute() records the run durably."""
-    from aitelier.runner import execute as run_execute
-    from aitelier.runner import make_run_id
+    """Run one fired schedule. The schedule's `task` dict is the same shape
+    as `/v1/chat/completions` request body — we build a `ChatCompletionRequest`
+    and route through the same execution helpers as a live HTTP call.
+    """
+    from starlette.datastructures import State
 
     task = dict(entry.get("task") or {})
     run_id = make_run_id(entry.get("name", "scheduled"))
-    # Tag the run with its triggering schedule so dashboards can group.
-    meta = dict(task.get("metadata") or {})
-    meta["schedule_id"] = entry["id"]
-    task["metadata"] = meta
+
+    # Construct a minimal `Request`-like with the correlation_id the helpers
+    # expect. Schedules don't have a real client correlation id; mint one.
+    fake_req_state = State()
+    fake_req_state.correlation_id = f"sched-{entry['id']}-{run_id[-12:]}"
+
+    class _FakeRequest:
+        state = fake_req_state
+
     try:
-        result = await run_execute(task, run_id=run_id)
+        req = ChatCompletionRequest(**task)
+        route, agent_backend, inner_llm = parse_model_route(req.model)
+        if route == "agent":
+            result = await _agent_chat_completion(
+                req, _FakeRequest(),  # type: ignore[arg-type]
+                agent_backend=agent_backend, inner_llm=inner_llm,
+                run_id=run_id,
+            )
+        else:
+            result = await _llm_chat_completion(
+                req, _FakeRequest(),  # type: ignore[arg-type]
+                run_id=run_id,
+            )
     except Exception as exc:
         logger.warning("Scheduled run %s failed: %s", run_id, exc)
         result = {
-            "kind": task.get("kind", "agent"),
-            "provider": task.get("model", ""),
-            "status": "error",
-            "run_id": run_id,
-            "trace_id": run_id,
-            "error_type": type(exc).__name__,
-            "error_msg": str(exc),
-            "finish_reason": "error",
+            "error": {"type": classify_error(exc), "message": str(exc)},
+            "aitelier_run_id": run_id,
         }
     if entry.get("webhook_url"):
         await _enqueue_webhook(
@@ -159,8 +205,51 @@ async def lifespan(app: FastAPI):
     # *after* this module is imported, so the import-time tag misses them.
     _retag_uvicorn_handlers()
 
-    # Open the durable store (Postgres if DATABASE_URL is set, in-memory otherwise)
+    # Open the durable store (Postgres if [database] url is set, in-memory otherwise)
     store = await get_store()
+
+    # Recovery sweep: any run still marked running/pending was owned by a
+    # previous aitelier process. SA has no session-resume API today, so flip
+    # them to `orphaned` rather than leaving them stuck in dashboards.
+    orphaned = await store.mark_orphaned_running_runs()
+    if orphaned:
+        # Surface a sample of IDs so operators can investigate the cause
+        # without trawling Postgres.
+        sample = await store.list_runs(RunFilter(state="orphaned", limit=100))
+        logger.warning(
+            "Marked %d in-flight run(s) as orphaned on startup "
+            "(previous process did not finalize them). Sample: %s",
+            orphaned, ", ".join(r.run_id for r in sample[:10]) or "n/a",
+        )
+        # Async-mode callers registered a webhook_url and won't otherwise hear
+        # back that their run died. Fire a terminal `orphaned` webhook so the
+        # consumer can give up cleanly rather than poll forever.
+        for r in sample:
+            meta = r.metadata or {}
+            webhook_url = meta.get("webhook_url") if isinstance(meta, dict) else None
+            if not webhook_url:
+                continue
+            payload = {
+                "error": {
+                    "type": "Orphaned",
+                    "message": (
+                        "aitelier restarted while this run was in flight; "
+                        "Sandbox Agent has no session-resume API, so the "
+                        "run is unrecoverable."
+                    ),
+                },
+                "aitelier_run_id": r.run_id,
+                "aitelier_state": "orphaned",
+            }
+            try:
+                await store.enqueue_webhook(
+                    webhook_url, payload, run_id=r.run_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to enqueue orphan webhook for %s: %s",
+                    r.run_id, exc,
+                )
 
     # Purge old runs on startup
     deleted = await store.purge_old_runs(max_age_days=30)
@@ -175,15 +264,13 @@ async def lifespan(app: FastAPI):
     from aitelier.webhook_worker import start_webhook_worker, stop_webhook_worker
     start_webhook_worker()
 
-    # Health check LiteLLM proxy
-    from aitelier.config import get_config
+    # Health check LiteLLM proxy. /health/liveness — no auth, no upstream
+    # provider probing. /health would 5xx on transient backend issues (e.g.
+    # OpenAI 429) and falsely log the proxy as unreachable on startup.
     cfg = get_config()
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(
-                f"{cfg.litellm.base_url}/health",
-                headers={"Authorization": f"Bearer {cfg.litellm.api_key}"},
-            )
+            resp = await client.get(f"{cfg.litellm.base_url}/health/liveness")
             resp.raise_for_status()
             logger.info("LiteLLM proxy reachable at %s", cfg.litellm.base_url)
     except Exception as exc:
@@ -243,17 +330,32 @@ async def _auth_middleware(request: Request, call_next):
         configured = get_config().service.api_key
         if configured:
             auth = request.headers.get("Authorization") or ""
-            if not auth.startswith("Bearer ") or auth[7:] != configured:
+            # Constant-time compare so an attacker can't reconstruct the
+            # key byte-by-byte via response timing.
+            if not auth.startswith("Bearer ") or not hmac.compare_digest(
+                auth[7:], configured,
+            ):
                 return JSONResponse(
                     {"detail": "Unauthorized"}, status_code=401,
                 )
     return await call_next(request)
 
 
+_CORRELATION_ID_MAX_LEN = 128
+_CORRELATION_ID_CHARSET = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
+
+
 @app.middleware("http")
 async def _correlation_id_middleware(request: Request, call_next):
-    """Echo or generate X-Correlation-Id so consumers can tie their logs to ours."""
-    cid = request.headers.get("X-Correlation-Id") or str(uuid.uuid4())
+    """Echo or generate X-Correlation-Id so consumers can tie their logs
+    to ours. Untrusted input — length-cap and charset-restrict to keep
+    log lines parseable and to block log-injection / terminal-escape
+    vectors when the CID is rendered into structured log output."""
+    raw = request.headers.get("X-Correlation-Id")
+    if raw and _CORRELATION_ID_CHARSET.match(raw):
+        cid = raw
+    else:
+        cid = str(uuid.uuid4())
     request.state.correlation_id = cid
     token = _correlation_id_var.set(cid)
     try:
@@ -268,6 +370,31 @@ async def _correlation_id_middleware(request: Request, call_next):
 # Single-process assumption; if aitelier ever scales horizontally this
 # moves to a shared store.
 _active_runs: dict[str, asyncio.Task] = {}
+
+
+def _reject_if_saturated() -> None:
+    """Cap concurrent inference. Beyond `service.max_in_flight_runs`,
+    return 503 typed as `ProviderUnavailable` so SDK retry policies
+    treat overload as a transient failure rather than crashing the
+    consumer. Cap of 0 disables the check (single-tenant dev)."""
+    cap = get_config().service.max_in_flight_runs
+    if cap and len(_active_runs) >= cap:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"aitelier is at capacity ({len(_active_runs)} in-flight "
+                f"runs, cap={cap}). Retry after current runs drain."
+            ),
+        )
+
+# SSE comment cadence during silent agent-planning phases. SSE clients
+# ignore lines starting with `:`; the frame keeps reverse proxies and
+# consumer read timeouts from tearing down a connection mid-run.
+_SSE_KEEPALIVE_SECONDS = 25.0
+
+# Process boot time, captured at module import so `/v1/metrics` can
+# report uptime without needing /proc on Linux or sysctl on macOS.
+_PROCESS_STARTED_AT = time.monotonic()
 
 
 def _cancelled_result(run_id: str, kind: str) -> dict:
@@ -292,129 +419,136 @@ def _cancelled_result(run_id: str, kind: str) -> dict:
 # --- Request/Response models ---
 
 
-class TaskSpec(BaseModel):
-    name: str
-    kind: str
-    model: str | None = None
-    system_prompt: str | None = None
-    messages: list[dict] | None = None
-    prompt: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
-    response_format: dict | None = None
-    texts: list[str] | None = None
-    mcp_servers: list[dict] | None = None
-    tool_allowlist: list[str] | None = None
-    max_turns: int | None = None
-    workspace: str | None = None
-    workspace_mode: str = "copy"
-    preferred_providers: list[str] | None = None
-    timeout: int | None = None
-    trace_tag: str | None = None
-    metadata: dict[str, Any] | None = None
-
-
-class CompleteRequest(BaseModel):
-    model: str
-    system_prompt: str | None = None
-    messages: list[dict]
-    temperature: float | None = None
-    max_tokens: int | None = None
-    response_format: dict | None = None
-    timeout: int | None = None
-    trace_tag: str | None = None
-
-
-class EmbedRequest(BaseModel):
-    texts: list[str]
-    model: str | None = None
-    timeout: int | None = None
-
-
-class RunAgentRequest(BaseModel):
-    model: str
-    """Agent backend name (claude, codex, opencode, ...) — what Sandbox
-    Agent advertises in /v1/agents. NOT the underlying LLM version."""
-    agent_model: str | None = None
-    """Override the LLM the agent uses internally (e.g. claude-opus-4-20250514,
-    gpt-4o-2024-08-06). Sent as session/set_config_option name=model. Best-
-    effort: not all backends accept the same config key."""
-    system_prompt: str | None = None
-    initial_message: str | None = None
-    examples: list[dict] | None = None
-    """Few-shot examples as a list of {user, assistant} pairs. The server
-    folds them into the system prompt under an `## Examples` heading; the
-    underlying ACP protocol has no examples primitive yet."""
-    mcp_servers: list[dict] | None = None
-    tool_allowlist: list[str] | None = None
-    response_format: dict | None = None
-    max_turns: int | None = None
-    timeout: int | None = None
-    workspace: str | None = None
-    workspace_mode: str = "copy"
-    trace_tag: str | None = None
-    metadata: dict[str, Any] | None = None
-    mode: str = "sync"   # "sync" (block + return result) | "async" (return run_id, webhook on done)
+class AsyncRunRequest(ChatCompletionRequest):
+    """POST /v1/runs body. Same shape as /v1/chat/completions plus an
+    optional webhook_url that fires with the final ChatCompletion (or error)
+    when the run completes."""
     webhook_url: str | None = None
-
-    # Workflow consolidation: aitelier orchestrates SA primitives so consumers
-    # make ONE call. See server _run_prepare / _fetch_artifacts.
-    prepare: dict | None = None
-    """Optional pre-flight setup. Shape:
-        {
-          install_agents: ["claude", ...],          # JIT install if missing
-          commands: [{cmd, args, cwd?, env?}, ...], # env setup (apt install ...)
-          files:    [{path, content, encoding?}],   # seed inputs
-          sidecars: [{name, cmd, args, env?}, ...], # long-lived for the agent run
-        }
-    Each phase runs in order. A failing install/command aborts the run with
-    status="error" and finish_reason="prepare_failed" — the agent never starts.
-    Sidecars are torn down in `artifacts` phase even if the agent errored.
-    """
-
-    artifacts: dict | None = None
-    """Optional post-flight artifact fetch. Shape:
-        {
-          fetch: ["/workspace/out.json", "/workspace/diff.patch"]
-        }
-    Files pulled back from the sandbox after the agent completes. Returned
-    in the result's `artifacts` field keyed by path.
-    """
-
-
-class FanoutRequest(BaseModel):
-    task: TaskSpec
-    providers: list[str]
-    max_concurrent: int = Field(default=4, ge=1, le=16)
-
-
-class AgentPreviewRequest(BaseModel):
-    mcp_servers: list[dict] | None = None
-    tool_allowlist: list[str] | None = None
 
 
 class ScheduleRequest(BaseModel):
     name: str = "scheduled"
-    task: dict  # TaskSpec dict; validated downstream by the runner
+    # Same shape as a /v1/chat/completions request body; validated by the
+    # scheduler when it fires (built into a ChatCompletionRequest then).
+    task: dict
     interval_seconds: int | None = None
     at_iso: str | None = None
     webhook_url: str | None = None
 
 
-class TracesFilter(BaseModel):
-    since: str | None = None
-    trace_tag: str | None = None
-    status: str | None = None
-    limit: int = 50
-
-
-# --- Primitive endpoints (deepread contract) ---
+# --- Primitive endpoints ---
 
 
 def _merge_correlation(metadata: dict | None, cid: str) -> dict:
     out = dict(metadata or {})
     out["correlation_id"] = cid
     return out
+
+
+_IDEMPOTENCY_TTL = timedelta(hours=24)
+
+
+@dataclass
+class _IdempotencyContext:
+    """Carried between _check_idempotency and _record_idempotency. Cleaner
+    than stashing fields on request.state where intervening middleware
+    could shadow them."""
+    key: str
+    body_hash: str
+    endpoint: str
+    cached: dict | None
+
+
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,200}$")
+
+
+async def _check_idempotency(
+    request: Request, endpoint: str,
+) -> _IdempotencyContext | None:
+    """If the request carries `Idempotency-Key`, look up a prior response.
+
+    Returns None if no header (no idempotency in play). Otherwise returns
+    an `_IdempotencyContext`: `.cached` is the prior response on hit,
+    None on miss/expiry. Raises 422 if the same key was used for a
+    different body — almost always a consumer bug.
+
+    Keys are length-capped and charset-restricted at the boundary so a
+    misbehaving (or hostile) client can't flood the `idempotency_keys`
+    table with megabyte rows or inject control characters into error
+    messages that echo the key back.
+    """
+    key = request.headers.get("Idempotency-Key")
+    if not key:
+        return None
+    if not _IDEMPOTENCY_KEY_PATTERN.match(key):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Idempotency-Key must be 1–200 chars of "
+                "[A-Za-z0-9._:-]. UUIDs work; opaque tokens with that "
+                "charset work; arbitrary user input does not."
+            ),
+        )
+    body_bytes = await request.body()
+    body_hash = hashlib.sha256(body_bytes).hexdigest()
+    rec = await (await get_store()).get_idempotent(key)
+    if rec is None:
+        return _IdempotencyContext(key, body_hash, endpoint, cached=None)
+    if rec.body_hash != body_hash:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Idempotency-Key {key!r} was already used for a different "
+                f"request body. Use a fresh UUID for distinct requests."
+            ),
+        )
+    return _IdempotencyContext(key, body_hash, endpoint, cached=rec.response)
+
+
+async def _record_idempotency(
+    ctx: _IdempotencyContext | None, response: dict,
+) -> None:
+    """Persist the response under this Idempotency-Key. No-op if ctx is None.
+    Best-effort: storage failure shouldn't fail the call — we already have
+    the response in hand."""
+    if ctx is None:
+        return
+    from aitelier.storage import IdempotencyRecord
+    try:
+        store = await get_store()
+        await store.record_idempotent(IdempotencyRecord(
+            key=ctx.key, body_hash=ctx.body_hash, endpoint=ctx.endpoint,
+            status_code=200, response=response,
+            run_id=response.get("run_id"),
+            expires_at=datetime.now(UTC) + _IDEMPOTENCY_TTL,
+        ))
+    except Exception as exc:
+        logger.warning("Failed to record idempotency key %s: %s", ctx.key, exc)
+
+
+async def _check_webhook_url_or_die(url: str) -> None:
+    """SSRF guard on aitelier-initiated outbound URLs.
+
+    Always on unless the operator explicitly opts in to loopback
+    callbacks via `service.allow_loopback_webhooks = true`. Previously
+    this guard was gated on `service.api_key` (hosted mode); the result
+    was that a localhost caller in dev mode could POST `webhook_url`
+    values pointing at AWS IMDS (`169.254.169.254`) or arbitrary RFC1918
+    targets and the durable worker would dutifully fire at them. Default
+    is now "deny private/loopback"; the legacy convenience is a
+    deliberate opt-in.
+    """
+    if get_config().service.allow_loopback_webhooks:
+        return
+    if not await is_public_url(url):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "webhook_url must resolve to a public, non-loopback host. "
+                "For dev workflows where localhost callbacks are needed, "
+                "set [service] allow_loopback_webhooks = true in aitelier.toml."
+            ),
+        )
 
 
 async def _enqueue_webhook(
@@ -460,410 +594,1019 @@ def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> st
     return f"{system_prompt}\n\n{section}" if system_prompt else section
 
 
-@app.post("/v1/complete")
-async def complete_endpoint(req: CompleteRequest, request: Request) -> dict:
-    """Single-shot chat completion."""
-    from aitelier.providers.llm import complete
-    from aitelier.runner import make_run_id
+def _translate_messages(messages: list[dict]) -> tuple[str | None, str]:
+    """Map OpenAI `messages` → aitelier's (system_prompt, initial_message).
 
-    cid = request.state.correlation_id
-    run_id = make_run_id("complete")
-    spec = RunSpec(
-        run_id=run_id, kind="complete", model=req.model,
-        trace_tag=req.trace_tag, correlation_id=cid,
-        system_prompt_hash=hash_system_prompt(req.system_prompt),
-        metadata={"correlation_id": cid},
-    )
-    result = await record_run(spec, complete(
-        model=req.model,
-        messages=req.messages,
-        system_prompt=req.system_prompt,
-        temperature=req.temperature,
-        max_tokens=req.max_tokens,
-        response_format=req.response_format,
-        timeout=req.timeout or 60,
-        run_id=run_id,
-        trace_tag=req.trace_tag,
-    ))
-    result["correlation_id"] = cid
-    return result
+    Strategy:
+      - All `system` messages concatenated → system_prompt.
+      - Single trailing user message → initial_message.
+      - Multi-turn (user/assistant alternation) → history folded into an
+        `<conversation_history>` envelope, last user message wrapped in
+        `<current_task>`. The inner agent treats it as one prompt.
 
-
-@app.post("/v1/complete/stream")
-async def complete_stream_endpoint(req: CompleteRequest, request: Request):
-    """Streaming chat completion via Server-Sent Events.
-
-    Events:
-      complete.delta — incremental content piece
-      complete.done  — final aggregated result with usage, finish_reason
-      complete.error — terminal error
+    The last non-system message MUST be `role=user` — 400 otherwise.
     """
-    from aitelier.providers.llm import complete_stream
-    from aitelier.runner import make_run_id
+    system_msgs: list[str] = []
+    non_system: list[dict] = []
+    for m in messages:
+        role = m.get("role")
+        if role == "system":
+            system_msgs.append(str(m.get("content") or ""))
+        else:
+            non_system.append(m)
+    system_prompt = "\n\n".join(s for s in system_msgs if s) or None
+
+    if not non_system:
+        return system_prompt, ""
+
+    last = non_system[-1]
+    if last.get("role") != "user":
+        raise HTTPException(
+            status_code=400,
+            detail="last message must have role='user' on the agent path",
+        )
+
+    if len(non_system) == 1:
+        return system_prompt, str(last.get("content") or "")
+
+    parts = ["<conversation_history>"]
+    for m in non_system[:-1]:
+        role = m.get("role") or "user"
+        content = str(m.get("content") or "").replace("\n", "\n    ")
+        parts.append(f'  <message role="{role}">{content}</message>')
+    parts.append("</conversation_history>")
+    parts.append("")
+    parts.append("<current_task>")
+    parts.append(str(last.get("content") or ""))
+    parts.append("</current_task>")
+    return system_prompt, "\n".join(parts)
+
+
+def _reject_agent_incompatible_fields(req: ChatCompletionRequest) -> None:
+    """Hard-reject OpenAI fields that have no honest mapping to the agent
+    path. Silent drops are the bug class we explicitly fight.
+
+    Consumers whose transport can't suppress `tools` / `tool_choice`
+    per-profile can opt into a silent drop via
+    `aitelier.allow_tool_drop = true`. The drop is documented and audited;
+    that's the difference from a silent bug.
+    """
+    allow_tool_drop = bool(req.aitelier and req.aitelier.allow_tool_drop)
+    if req.tools and not allow_tool_drop:
+        raise HTTPException(
+            status_code=400,
+            detail="`tools` is not supported on the agent path — the inner "
+                   "agent runs its own tools. Use `aitelier.tool_allowlist` "
+                   "to constrain them, or set "
+                   "`aitelier.allow_tool_drop = true` to opt into silent drop.",
+        )
+    if req.tool_choice is not None and not allow_tool_drop:
+        raise HTTPException(
+            status_code=400,
+            detail="`tool_choice` is not supported on the agent path. Set "
+                   "`aitelier.allow_tool_drop = true` to opt into silent drop.",
+        )
+    if req.n is not None and req.n > 1:
+        raise HTTPException(
+            status_code=400, detail="`n` > 1 is not supported on the agent path.",
+        )
+    if req.top_p is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="`top_p` is not supported on the agent path — the inner "
+                   "agent controls sampling.",
+        )
+    if req.tools and allow_tool_drop:
+        logger.info(
+            "aitelier.allow_tool_drop active — dropping %d `tools` entries "
+            "and tool_choice on agent path",
+            len(req.tools),
+        )
+
+
+def _validate_aitelier_opts(req: ChatCompletionRequest, *, agent_path: bool) -> None:
+    """Refuse aitelier.* on the LLM path. The namespace is agent-specific."""
+    if req.aitelier is not None and not agent_path:
+        raise HTTPException(
+            status_code=400,
+            detail="`aitelier.*` options are only valid when model starts "
+                   "with `agent:`.",
+        )
+
+
+async def _agent_chat_completion(
+    req: ChatCompletionRequest, request: Request, *,
+    agent_backend: str, inner_llm: str | None, run_id: str,
+    webhook_url: str | None = None,
+) -> dict:
+    """Sync agent path: prepare → execute → artifacts → ChatCompletion.
+
+    Always returns a plain dict. On error, the dict carries an OpenAI-shape
+    `error` envelope plus an `aitelier_status_code` hint so the outer caller
+    (HTTP endpoint or async webhook deliverer) can render it consistently —
+    either as a 500-class JSONResponse or as a JSON webhook payload.
+
+    `webhook_url` (when set, async path) is persisted in run metadata so the
+    orphan-sweep on startup can deliver a terminal webhook if this process
+    dies mid-run.
+    """
+    from aitelier.providers.sandbox_agent import call_via_sandbox
 
     cid = request.state.correlation_id
-    run_id = make_run_id("complete_stream")
-    # Persist a run row up front so dashboards can see "running" mid-stream.
-    store = await get_store()
-    await store.create_run(RunSpec(
-        run_id=run_id, kind="complete", model=req.model,
-        trace_tag=req.trace_tag, correlation_id=cid,
-        system_prompt_hash=hash_system_prompt(req.system_prompt),
-        metadata={"correlation_id": cid},
-    ))
-    await store.update_run_state(run_id, "running")
+    _reject_agent_incompatible_fields(req)
+    opts = req.aitelier or AitelierAgentOpts()
 
-    async def event_generator():
-        final: dict | None = None
-        try:
-            async for event in complete_stream(
-                model=req.model,
-                messages=req.messages,
-                system_prompt=req.system_prompt,
-                temperature=req.temperature,
-                max_tokens=req.max_tokens,
-                response_format=req.response_format,
-                timeout=req.timeout or 60,
-                run_id=run_id,
-            ):
-                # Keep `type` in the payload so the data alone is a tagged
-                # union per schemas/v1/complete_stream_event.schema.json.
-                evt_type = event["type"]
-                event["correlation_id"] = cid
-                if evt_type == "done":
-                    final = {
-                        "kind": "complete",
-                        "provider": req.model,
-                        "status": "ok",
-                        **{k: v for k, v in event.items() if k != "type"},
-                    }
-                yield _sse_event(f"complete.{evt_type}", event)
-        except Exception as exc:
-            final = {
-                "kind": "complete",
-                "provider": req.model,
-                "status": "error",
-                "error_type": type(exc).__name__,
-                "error_msg": str(exc),
-                "finish_reason": "error",
-            }
-            yield _sse_event("complete.error", {
-                "type": "error",
-                "error_type": type(exc).__name__,
-                "error_msg": str(exc),
-                "correlation_id": cid,
-            })
-        finally:
-            if final is not None:
-                state = ("failed" if final.get("status") == "error"
-                         else "completed")
-                await store.finalize_run(run_id, final, state=state)
+    system_prompt, initial_message = _translate_messages(req.messages)
+    system_prompt = _fold_examples(system_prompt, opts.examples)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    prep_result = await _run_prepare(opts.prepare)
+    if prep_result.get("error"):
+        await _stop_sidecars(prep_result.get("sidecars") or [])
+        failed = _prepare_failed_result(run_id, prep_result, cid)
+        status, body = agent_error_to_chat_completion_error(failed)
+        body["aitelier_status_code"] = status
+        body["correlation_id"] = cid
+        return body
 
-
-@app.post("/v1/embed")
-async def embed_endpoint(req: EmbedRequest, request: Request) -> dict:
-    """Batch embedding."""
-    from aitelier.providers.llm import embed
-    from aitelier.runner import make_run_id
-
-    cid = request.state.correlation_id
-    run_id = make_run_id("embed")
+    run_metadata: dict[str, Any] = {"correlation_id": cid}
+    if webhook_url:
+        run_metadata["webhook_url"] = webhook_url
     spec = RunSpec(
-        run_id=run_id, kind="embed", model=req.model,
-        correlation_id=cid, metadata={"correlation_id": cid},
+        run_id=run_id, kind="agent",
+        agent_id=agent_backend, model=inner_llm,
+        trace_tag=opts.trace_tag, correlation_id=cid,
+        workspace=opts.workspace,
+        environment={
+            "mcp_servers": opts.mcp_servers or [],
+            "tool_allowlist": opts.tool_allowlist or [],
+        },
+        system_prompt_hash=hash_system_prompt(system_prompt),
+        metadata=run_metadata,
     )
-    result = await record_run(spec, embed(
-        texts=req.texts,
-        model=req.model,
-        timeout=req.timeout or 30,
-        run_id=run_id,
-    ))
-    result["correlation_id"] = cid
-    return result
 
+    async def _do() -> dict:
+        return await call_via_sandbox(
+            agent_backend, initial_message,
+            workspace=opts.workspace,
+            system_prompt=system_prompt,
+            mcp_servers=opts.mcp_servers,
+            tool_allowlist=opts.tool_allowlist,
+            response_format=req.response_format,
+            max_turns=opts.max_turns,
+            agent_model=inner_llm,
+            timeout=req.timeout or 600,
+            run_id=run_id,
+        )
 
-@app.post("/v1/agent")
-async def run_agent_endpoint(req: RunAgentRequest, request: Request) -> dict:
-    """Run an agent with MCP tool loop."""
-    from aitelier.runner import execute, make_run_id
-
-    cid = request.state.correlation_id
-    run_id = make_run_id("agent_run")
-    system_prompt = _fold_examples(req.system_prompt, req.examples)
-    task = {
-        "name": "agent_run",
-        "kind": "agent",
-        "model": req.model,
-        "agent_model": req.agent_model,
-        "prompt": req.initial_message or "",
-        "system_prompt": system_prompt,
-        "mcp_servers": req.mcp_servers,
-        "tool_allowlist": req.tool_allowlist,
-        "response_format": req.response_format,
-        "max_turns": req.max_turns,
-        "timeout": req.timeout,
-        "workspace": req.workspace,
-        "workspace_mode": req.workspace_mode,
-        "trace_tag": req.trace_tag,
-        "metadata": _merge_correlation(req.metadata, cid),
-    }
-
-    async def _orchestrate() -> dict:
-        """One full agent-run workflow: prepare → execute → artifacts."""
-        prep_result = await _run_prepare(req.prepare)
-        if prep_result.get("error"):
-            # Tear down anything we already started, then short-circuit.
-            await _stop_sidecars(prep_result.get("sidecars") or [])
-            return _prepare_failed_result(run_id, prep_result, cid)
-
-        run_task = asyncio.create_task(execute(task, run_id=run_id))
-        _active_runs[run_id] = run_task
-        try:
-            result = await run_task
-        except asyncio.CancelledError:
-            if not run_task.cancelled():
-                run_task.cancel()
-            result = _cancelled_result(run_id, "agent")
-        except Exception as exc:
-            # runner.execute already recorded the run as failed and re-raised.
-            # Surface as an error Result rather than a 500 so consumers can
-            # still see prepare/artifacts state on their single call.
-            result = {
-                "kind": "agent", "provider": req.model, "status": "error",
-                "duration_s": 0.0, "run_id": run_id, "trace_id": run_id,
-                "content": None, "parsed": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                "finish_reason": "error", "tool_calls": [],
-                "cost_usd": None,
-                "error_type": type(exc).__name__, "error_msg": str(exc),
-            }
-        finally:
-            _active_runs.pop(run_id, None)
-            # Sidecars always get cleaned up, even on cancel/error.
-            await _stop_sidecars(prep_result.get("sidecars") or [])
-
-        result["correlation_id"] = cid
-        if req.prepare:
-            result["prepare"] = prep_result
-        if req.artifacts:
-            result["artifacts"] = await _fetch_artifacts(req.artifacts)
-        return result
-
-    # --- Async mode: return run_id immediately, fire webhook on done ---
-    if req.mode == "async":
-        webhook_url = req.webhook_url
-
-        async def _run_and_callback() -> None:
-            result = await _orchestrate()
-            if webhook_url:
-                await _enqueue_webhook(webhook_url, result, run_id=run_id)
-
-        asyncio.create_task(_run_and_callback())
-        return {
-            "run_id": run_id,
-            "trace_id": run_id,
-            "status": "accepted",
-            "correlation_id": cid,
-            "webhook_url": webhook_url,
+    run_task = asyncio.create_task(record_run(spec, _do()))
+    _active_runs[run_id] = run_task
+    try:
+        result = await run_task
+    except asyncio.CancelledError:
+        if not run_task.cancelled():
+            run_task.cancel()
+        result = _cancelled_result(run_id, "agent")
+    except Exception as exc:
+        result = {
+            "kind": "agent", "provider": agent_backend, "status": "error",
+            "run_id": run_id, "trace_id": run_id,
+            "content": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "finish_reason": "error",
+            "error_type": classify_error(exc), "error_msg": str(exc),
         }
+    finally:
+        _active_runs.pop(run_id, None)
+        await _stop_sidecars(prep_result.get("sidecars") or [])
 
-    # --- Sync mode (default): block until done ---
-    return await _orchestrate()
+    if result.get("status") == "error":
+        status, body = agent_error_to_chat_completion_error(result)
+        body["aitelier_status_code"] = status
+        body["correlation_id"] = cid
+        return body
+
+    response = agent_result_to_chat_completion(
+        result, request_model=req.model, run_id=run_id,
+    )
+    if opts.artifacts:
+        response["aitelier_artifacts"] = await _fetch_artifacts(opts.artifacts)
+    response["correlation_id"] = cid
+    return response
 
 
-@app.post("/v1/agent/stream")
-async def run_agent_stream_endpoint(req: RunAgentRequest, request: Request):
-    """Streaming agent run via Server-Sent Events.
+def _render_chat_completion(payload: dict) -> dict | JSONResponse:
+    """Translate the dict returned by `_agent_chat_completion` (or LLM-path
+    helpers) into an HTTP response. Error dicts carry `aitelier_status_code`;
+    everything else is a success body."""
+    status = payload.pop("aitelier_status_code", None)
+    if status is not None:
+        return JSONResponse(status_code=status, content=payload)
+    return payload
 
-    Mirrors /v1/complete/stream. Events:
-      agent.delta       — incremental text chunk
-      agent.tool_call   — agent invoked an MCP tool (server + tool + input)
-      agent.tool_result — MCP tool returned (tool + output + elapsed_ms)
-      agent.done        — final aggregated Result dict
-      agent.error       — terminal error
+
+async def _agent_chat_completion_stream(
+    req: ChatCompletionRequest, request: Request, *,
+    agent_backend: str, inner_llm: str | None, run_id: str,
+    idem: _IdempotencyContext | None = None,
+):
+    """Streaming agent path. Maps ACP `session/update` deltas → OpenAI
+    chunks. Tool-call / tool-result events from the inner agent are *not*
+    surfaced as OpenAI tool_calls (those imply the consumer should respond);
+    consumers can fetch the full event trace via `/v1/runs/{id}/events`.
+
+    When `idem` is provided and the stream completes successfully, the
+    accumulated chunks are persisted under the Idempotency-Key so a retry
+    with the same key+body replays the exact same SSE stream instead of
+    re-running the inner agent (re-executing side effects, double-billing
+    the subscription). Failed or cancelled streams are NOT cached — the
+    consumer's retry should get a fresh attempt at success.
     """
     from aitelier.providers.sandbox_agent import call_via_sandbox_stream
-    from aitelier.runner import make_run_id
 
     cid = request.state.correlation_id
-    run_id = make_run_id("agent_stream")
-    system_prompt = _fold_examples(req.system_prompt, req.examples)
+    _reject_agent_incompatible_fields(req)
+    opts = req.aitelier or AitelierAgentOpts()
+
+    system_prompt, initial_message = _translate_messages(req.messages)
+    system_prompt = _fold_examples(system_prompt, opts.examples)
 
     store = await get_store()
     await store.create_run(RunSpec(
-        run_id=run_id, kind="agent", agent_id=req.model, model=req.model,
-        trace_tag=req.trace_tag, correlation_id=cid,
-        workspace=req.workspace,
+        run_id=run_id, kind="agent",
+        agent_id=agent_backend, model=inner_llm,
+        trace_tag=opts.trace_tag, correlation_id=cid,
+        workspace=opts.workspace,
         environment={
-            "mcp_servers": req.mcp_servers or [],
-            "tool_allowlist": req.tool_allowlist or [],
+            "mcp_servers": opts.mcp_servers or [],
+            "tool_allowlist": opts.tool_allowlist or [],
         },
         system_prompt_hash=hash_system_prompt(system_prompt),
         metadata={"correlation_id": cid},
     ))
     await store.update_run_state(run_id, "running")
 
-    async def event_generator():
-        final: dict | None = None
+    def _stamped(chunk: dict) -> dict:
+        chunk["aitelier_run_id"] = run_id
+        chunk["aitelier_trace_id"] = run_id
+        chunk["correlation_id"] = cid
+        return chunk
+
+    # Producer task pulls ACP events into a queue; the SSE generator drains
+    # the queue and translates to OpenAI chunks. Registering the producer
+    # in `_active_runs` makes the stream cancellable via POST /v1/runs/{id}/cancel.
+    queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+    SENTINEL: dict = {"_eof": True}
+    # Chunks collected for idempotency replay. Each entry is the dict we
+    # serialize into the SSE `data:` line, so replay is byte-identical
+    # modulo the trailing `[DONE]` marker (always appended on replay).
+    recorded_chunks: list[dict] = []
+
+    async def _producer() -> None:
         try:
             async for event in call_via_sandbox_stream(
-                req.model,
-                req.initial_message or "",
-                workspace=req.workspace,
+                agent_backend, initial_message,
+                workspace=opts.workspace,
                 system_prompt=system_prompt,
-                mcp_servers=req.mcp_servers,
+                mcp_servers=opts.mcp_servers,
+                tool_allowlist=opts.tool_allowlist,
                 response_format=req.response_format,
+                max_turns=opts.max_turns,
+                agent_model=inner_llm,
                 timeout=req.timeout or 600,
                 run_id=run_id,
             ):
-                evt_type = event["type"]
-                event["correlation_id"] = cid
-                event["run_id"] = run_id
-                if evt_type == "done":
-                    final = {k: v for k, v in event.items() if k != "type"}
-                yield _sse_event(f"agent.{evt_type}", event)
+                await queue.put(event)
+        except asyncio.CancelledError:
+            await queue.put({"type": "error",
+                              "error_type": "Cancelled",
+                              "error_msg": "run cancelled"})
+            raise
         except Exception as exc:
-            final = {
-                "kind": "agent",
-                "provider": req.model,
+            await queue.put({"type": "error",
+                              "error_type": classify_error(exc),
+                              "error_msg": str(exc)})
+        finally:
+            await queue.put(SENTINEL)
+
+    producer_task = asyncio.create_task(_producer())
+    _active_runs[run_id] = producer_task
+
+    async def event_generator():
+        import time as _time
+        final: dict | None = None
+        first = True
+        # Track time-since-last-wire-emission rather than relying on
+        # `queue.get()` timing out. Tool-call / tool-result events arrive
+        # frequently during agent planning but are dropped from the wire;
+        # without this counter, queue.get() never times out and the
+        # consumer sees no traffic until the next `delta`.
+        last_yield_at = _time.monotonic()
+        try:
+            while True:
+                remaining = _SSE_KEEPALIVE_SECONDS - (
+                    _time.monotonic() - last_yield_at
+                )
+                if remaining <= 0:
+                    yield ": keepalive\n\n"
+                    last_yield_at = _time.monotonic()
+                    continue
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+                    last_yield_at = _time.monotonic()
+                    continue
+                if event is SENTINEL:
+                    break
+                etype = event.get("type")
+                if etype == "delta":
+                    if first:
+                        c = _stamped(chat_completion_chunk(
+                            request_model=req.model, run_id=run_id,
+                            delta={"role": "assistant"},
+                        ))
+                        recorded_chunks.append(c)
+                        yield _sse_event("", c)
+                        last_yield_at = _time.monotonic()
+                        first = False
+                    c = _stamped(chat_completion_chunk(
+                        request_model=req.model, run_id=run_id,
+                        delta={"content": event.get("content") or ""},
+                    ))
+                    recorded_chunks.append(c)
+                    yield _sse_event("", c)
+                    last_yield_at = _time.monotonic()
+                elif etype == "done":
+                    final = {k: v for k, v in event.items() if k != "type"}
+                    # Route through the same translator as the non-streaming
+                    # path so the OpenAI invariant `total == prompt + completion`
+                    # holds and inner-agent overhead lands in
+                    # `aitelier_inner_tokens` on streaming responses too.
+                    chunk_usage = agent_usage_to_openai(final.get("usage")) or {
+                        "prompt_tokens": 0, "completion_tokens": 0,
+                        "total_tokens": 0,
+                    }
+                    tool_names, tool_count = summarize_tool_calls(final)
+                    c = _stamped(chat_completion_chunk(
+                        request_model=req.model, run_id=run_id,
+                        delta={},
+                        finish_reason="stop",
+                        usage=chunk_usage,
+                    ))
+                    # Mirror the non-streaming response shape so consumers
+                    # don't need a separate code path for "did the agent
+                    # use my tools?" on stream vs non-stream.
+                    c["aitelier_tool_call_count"] = tool_count
+                    c["aitelier_tool_names"] = tool_names
+                    recorded_chunks.append(c)
+                    yield _sse_event("", c)
+                    last_yield_at = _time.monotonic()
+                elif etype == "error":
+                    err_type = event.get("error_type") or "ProviderError"
+                    final = {
+                        "kind": "agent", "provider": agent_backend,
+                        "status": "error",
+                        "error_type": err_type,
+                        "error_msg": event.get("error_msg") or "stream error",
+                        "finish_reason": (
+                            "cancelled" if err_type == "Cancelled" else "error"
+                        ),
+                    }
+                    # Error frames are not recorded — idempotency only caches
+                    # successful completions so a retry after transient failure
+                    # gets a fresh attempt.
+                    last_yield_at = _time.monotonic()
+                    yield _sse_event("", {
+                        "error": {
+                            "type": err_type,
+                            "message": event.get("error_msg"),
+                        },
+                        "aitelier_run_id": run_id,
+                        "correlation_id": cid,
+                    })
+                # tool_call / tool_result intentionally dropped — see docstring.
+            yield "data: [DONE]\n\n"
+        finally:
+            _active_runs.pop(run_id, None)
+            if not producer_task.done():
+                producer_task.cancel()
+            # Consumer disconnect (FastAPI calls aclose() on the generator)
+            # raises GeneratorExit/CancelledError and skips straight to this
+            # finally with `final = None`. Without an explicit cancellation
+            # finalize the run stays in state=running forever, contaminating
+            # dashboards and /v1/metrics in_flight counts.
+            if final is None:
+                final = {
+                    "kind": "agent", "provider": agent_backend,
+                    "status": "cancelled",
+                    "error_type": "Cancelled",
+                    "error_msg": "consumer disconnected mid-stream",
+                    "finish_reason": "cancelled",
+                }
+            state = (
+                "cancelled" if final.get("error_type") == "Cancelled"
+                else "failed" if final.get("status") == "error"
+                else "completed"
+            )
+            # The current task may be mid-cancellation (uvicorn cancels the
+            # response task when the client disconnects), which would
+            # interrupt any `await` here and skip the storage write — that
+            # was the original bug. Detach to a background task so the
+            # finalize survives the cancellation.
+            should_cache = (
+                idem is not None
+                and state == "completed"
+                and final.get("status") != "error"
+            )
+            asyncio.create_task(_finalize_stream_run(
+                run_id=run_id,
+                final=final,
+                state=state,
+                idem=idem if should_cache else None,
+                recorded_chunks=recorded_chunks if should_cache else None,
+            ))
+
+    return _sse_response(event_generator())
+
+
+async def _finalize_stream_run(
+    *, run_id: str, final: dict, state: str,
+    idem: _IdempotencyContext | None, recorded_chunks: list[dict] | None,
+) -> None:
+    """Run the storage write + optional idempotency cache for a streaming
+    agent run in its own task. The caller (event_generator's finally) may
+    be in the middle of cancellation propagation from a client disconnect;
+    awaiting storage from that context raises CancelledError before the
+    write lands. Running here, in a fresh task spawned via
+    asyncio.create_task, decouples cleanup from request lifecycle."""
+    try:
+        store = await get_store()
+        try:
+            await store.finalize_run(run_id, final, state=state)
+        except (KeyError, ValueError):
+            # Race: cancel endpoint or another path already finalized.
+            pass
+        if idem is not None and recorded_chunks is not None:
+            await _record_idempotency(idem, {
+                "_aitelier_stream": True,
+                "chunks": recorded_chunks,
+                "run_id": run_id,
+            })
+    except Exception as exc:
+        logger.warning(
+            "background finalize for stream run %s failed: %s",
+            run_id, exc,
+        )
+
+
+def _replay_cached_stream(cached: dict) -> StreamingResponse:
+    """Replay a previously-recorded stream as a fresh SSE response. The
+    chunks were captured verbatim from the original `event_generator`, so
+    the consumer sees the same wire bytes (modulo HTTP framing) as the
+    first call. Same `aitelier_run_id` on every chunk per the original."""
+    chunks = cached.get("chunks") or []
+
+    async def generator():
+        for chunk in chunks:
+            yield _sse_event("", chunk)
+        yield "data: [DONE]\n\n"
+
+    return _sse_response(generator())
+
+
+async def _llm_chat_completion(
+    req: ChatCompletionRequest, request: Request, *, run_id: str,
+) -> dict:
+    """LLM path: passthrough to LiteLLM, stamp run state, return OpenAI shape."""
+    cid = request.state.correlation_id
+
+    # Pull a system prompt hash for the run record without rebuilding messages.
+    sys_msgs = [m for m in req.messages if m.get("role") == "system"]
+    sp_hash = hash_system_prompt(
+        "\n\n".join(str(m.get("content") or "") for m in sys_msgs) or None,
+    )
+
+    body = _llm_body_from_request(req)
+    spec = RunSpec(
+        run_id=run_id, kind="complete", model=req.model,
+        trace_tag=None, correlation_id=cid,
+        system_prompt_hash=sp_hash,
+        metadata={"correlation_id": cid},
+    )
+
+    async def _do() -> dict:
+        try:
+            resp = await chat_completion(body, timeout=req.timeout or 60)
+        except UnsupportedResponseFormat as exc:
+            return {
                 "status": "error",
-                "error_type": type(exc).__name__,
+                "error_type": "UnsupportedResponseFormat",
                 "error_msg": str(exc),
+                "_aitelier_http_status": 400,
+            }
+        except LLMError as exc:
+            return {
+                "status": "error",
+                "error_type": exc.error_type,
+                "error_msg": str(exc),
+                "_aitelier_http_status": _http_status_for_llm_error(exc),
+            }
+        normalize_response_extras(body, resp)
+        resp["aitelier_run_id"] = run_id
+        resp["aitelier_trace_id"] = run_id
+        resp["correlation_id"] = cid
+        return resp
+
+    result = await record_run(spec, _do())
+    if result.get("status") == "error":
+        return chat_completion_error_envelope(
+            result, run_id=run_id, correlation_id=cid,
+        )
+    return result
+
+
+def _http_status_for_llm_error(exc: LLMError) -> int:
+    """Map our LLMError taxonomy onto HTTP statuses the consumer can use.
+
+    Upstream-supplied status_code wins when present (rate limits, auth);
+    otherwise we fall back to error_type. Bad-gateway (502) is the catch-all
+    for opaque provider failures."""
+    if exc.status_code in (401, 403):
+        return 401
+    if exc.status_code == 429:
+        return 429
+    if exc.error_type == "Timeout":
+        return 504
+    if exc.error_type == "ProviderUnavailable":
+        return 503
+    return 502
+
+
+def _llm_body_from_request(req: ChatCompletionRequest) -> dict:
+    body: dict[str, Any] = {"model": req.model, "messages": req.messages}
+    if req.temperature is not None:
+        body["temperature"] = req.temperature
+    if req.max_tokens is not None:
+        body["max_tokens"] = req.max_tokens
+    if req.top_p is not None:
+        body["top_p"] = req.top_p
+    if req.n is not None:
+        body["n"] = req.n
+    if req.response_format is not None:
+        body["response_format"] = req.response_format
+    if req.tools:
+        body["tools"] = req.tools
+    if req.tool_choice is not None:
+        body["tool_choice"] = req.tool_choice
+    if req.user is not None:
+        body["user"] = req.user
+    return body
+
+
+async def _llm_chat_completion_stream(
+    req: ChatCompletionRequest, request: Request, *, run_id: str,
+):
+    """Streaming LLM path. LiteLLM emits OpenAI-shape chunks; we forward
+    them with `aitelier_run_id` stamped on each. Run state is finalized
+    when the stream completes (usage from the final chunk)."""
+    cid = request.state.correlation_id
+    sys_msgs = [m for m in req.messages if m.get("role") == "system"]
+    sp_hash = hash_system_prompt(
+        "\n\n".join(str(m.get("content") or "") for m in sys_msgs) or None,
+    )
+
+    store = await get_store()
+    await store.create_run(RunSpec(
+        run_id=run_id, kind="complete", model=req.model,
+        correlation_id=cid, system_prompt_hash=sp_hash,
+        metadata={"correlation_id": cid},
+    ))
+    await store.update_run_state(run_id, "running")
+
+    body = _llm_body_from_request(req)
+
+    async def event_generator():
+        final: dict | None = None
+        accumulated: list[str] = []
+        reasoning_accumulated: list[str] = []
+        tool_call_seen = False
+        usage: dict | None = None
+        try:
+            async for chunk in chat_completion_stream(
+                body, timeout=req.timeout or 60,
+            ):
+                chunk["aitelier_run_id"] = run_id
+                chunk["aitelier_trace_id"] = run_id
+                chunk["correlation_id"] = cid
+                if isinstance(chunk.get("usage"), dict):
+                    usage = chunk["usage"]
+                for ch in chunk.get("choices") or []:
+                    delta = ch.get("delta") or {}
+                    piece = delta.get("content")
+                    if piece:
+                        accumulated.append(piece)
+                    rpiece = (
+                        delta.get("reasoning_content")
+                        or delta.get("reasoning")
+                    )
+                    if rpiece:
+                        reasoning_accumulated.append(rpiece)
+                    if delta.get("tool_calls"):
+                        tool_call_seen = True
+                yield _sse_event("", chunk)
+
+            # Synthetic final chunk with aitelier extras: parsed JSON for
+            # response_format consumers and the empty-exit signal for
+            # reasoning-budget-burned cases. OpenAI clients ignore unknown
+            # fields, so this is safe drop-in even mid-spec.
+            extras = stream_final_extras(
+                body,
+                accumulated_content="".join(accumulated),
+                reasoning_seen="".join(reasoning_accumulated),
+                tool_call_seen=tool_call_seen,
+                completion_tokens=(usage or {}).get("completion_tokens", 0),
+            )
+            if extras:
+                yield _sse_event("", {
+                    "aitelier_run_id": run_id,
+                    "aitelier_trace_id": run_id,
+                    "correlation_id": cid,
+                    **extras,
+                })
+            yield "data: [DONE]\n\n"
+            final = {
+                "kind": "complete", "provider": req.model, "status": "ok",
+                "content": "".join(accumulated),
+                "usage": {
+                    "input_tokens": (usage or {}).get("prompt_tokens", 0),
+                    "output_tokens": (usage or {}).get("completion_tokens", 0),
+                    "total_tokens": (usage or {}).get("total_tokens", 0),
+                },
+                "finish_reason": "stop",
+            }
+        except (LLMError, UnsupportedResponseFormat) as exc:
+            err_type = (
+                "UnsupportedResponseFormat"
+                if isinstance(exc, UnsupportedResponseFormat)
+                else getattr(exc, "error_type", "ProviderError")
+            )
+            final = {
+                "kind": "complete", "provider": req.model, "status": "error",
+                "error_type": err_type, "error_msg": str(exc),
                 "finish_reason": "error",
             }
-            yield _sse_event("agent.error", {
-                "type": "error",
-                "error_type": type(exc).__name__,
-                "error_msg": str(exc),
-                "correlation_id": cid,
-                "run_id": run_id,
+            yield _sse_event("", {
+                "error": {"type": err_type, "message": str(exc)},
+                "aitelier_run_id": run_id,
             })
         finally:
             if final is not None:
-                state = ("failed" if final.get("status") == "error"
-                         else "completed")
+                state = "failed" if final.get("status") == "error" else "completed"
                 await store.finalize_run(run_id, final, state=state)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+    return _sse_response(event_generator())
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request):
+    """OpenAI-shape chat completions.
+
+    Routing:
+      - `model = "agent:<backend>[/<inner-llm>]"` → Sandbox Agent
+      - any other `model` → LiteLLM passthrough
+
+    `aitelier.*` options on the agent path; not accepted on the LLM path.
+    """
+    route, agent_backend, inner_llm = parse_model_route(req.model)
+    _validate_aitelier_opts(req, agent_path=(route == "agent"))
+    _reject_if_saturated()
+
+    if route == "agent":
+        idem = await _check_idempotency(request, "/v1/chat/completions")
+        if idem and idem.cached is not None:
+            cached = dict(idem.cached)
+            if cached.get("_aitelier_stream"):
+                return _replay_cached_stream(cached)
+            return _render_chat_completion(cached)
+        run_id = make_run_id("chat_agent")
+        if req.stream:
+            return await _agent_chat_completion_stream(
+                req, request,
+                agent_backend=agent_backend, inner_llm=inner_llm,
+                run_id=run_id, idem=idem,
+            )
+        result = await _agent_chat_completion(
+            req, request,
+            agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
+        )
+        await _record_idempotency(idem, result)
+        return _render_chat_completion(result)
+
+    # LLM path
+    run_id = make_run_id("chat_llm")
+    if req.stream:
+        return await _llm_chat_completion_stream(req, request, run_id=run_id)
+    result = await _llm_chat_completion(req, request, run_id=run_id)
+    return _render_chat_completion(result)
+
+
+@app.post("/v1/embeddings")
+async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
+    """OpenAI-shape embeddings (LiteLLM passthrough)."""
+    cid = request.state.correlation_id
+    run_id = make_run_id("embed")
+
+    body: dict[str, Any] = {"model": req.model, "input": req.input}
+    if req.encoding_format is not None:
+        body["encoding_format"] = req.encoding_format
+    if req.dimensions is not None:
+        body["dimensions"] = req.dimensions
+    if req.user is not None:
+        body["user"] = req.user
+
+    spec = RunSpec(
+        run_id=run_id, kind="embed", model=req.model,
+        correlation_id=cid, metadata={"correlation_id": cid},
     )
 
+    async def _do() -> dict:
+        try:
+            resp = await embeddings(body)
+        except LLMError as exc:
+            return {
+                "status": "error",
+                "error_type": exc.error_type, "error_msg": str(exc),
+                "_aitelier_http_status": _http_status_for_llm_error(exc),
+            }
+        if req.encoding_format == "base64":
+            _ensure_base64_embeddings(resp)
+        resp["aitelier_run_id"] = run_id
+        resp["aitelier_trace_id"] = run_id
+        resp["correlation_id"] = cid
+        return resp
 
-async def _query_mcp_tools(server: dict) -> dict:
-    """Hit one MCP server's tools/list. Returns {name, transport, tools|reason}."""
-    name = server.get("name", "")
-    transport = server.get("transport", "http")
-    base = {"name": name, "transport": transport}
+    result = await record_run(spec, _do())
+    if result.get("status") == "error":
+        return _render_chat_completion(chat_completion_error_envelope(
+            result, run_id=run_id, correlation_id=cid,
+        ))
+    return result
 
-    if transport != "http":
-        # stdio servers can't be previewed without spawning the process
-        return {**base, "previewable": False,
-                "reason": f"{transport} transport — preview unsupported"}
 
-    url = server.get("url")
-    if not url:
-        return {**base, "previewable": False, "reason": "no url"}
+def _ensure_base64_embeddings(resp: dict) -> None:
+    """Honor `encoding_format: "base64"` even when the upstream route
+    (Ollama-via-LiteLLM, today) ignored the field and returned floats.
+    OpenAI's contract is float32 little-endian packed bytes, base64-encoded.
+    Mutates `resp` in place; no-op for entries already encoded."""
+    import base64
+    import struct
+    for entry in resp.get("data") or []:
+        emb = entry.get("embedding")
+        if isinstance(emb, list) and emb and isinstance(emb[0], (int, float)):
+            packed = struct.pack(f"<{len(emb)}f", *emb)
+            entry["embedding"] = base64.b64encode(packed).decode("ascii")
 
+
+@app.get("/v1/models")
+async def list_models_endpoint() -> dict:
+    """OpenAI-shape model list. Entries fall into two flavors:
+
+    - **LLM**: standard OpenAI shape (`id`, `object: "model"`, `owned_by`).
+      `response_format` annotates which `json_object`/`json_schema` modes
+      the provider supports.
+    - **Agent**: `id = "agent:<backend>"`, `aitelier_agent: true`. Lists
+      `aitelier_inner_llms` (the LLM aliases the backend can drive) and
+      `aitelier_capabilities` (a subset of Sandbox Agent's capability
+      flags). Consumers can validate `agent:<backend>/<inner-llm>`
+      strings upfront rather than after a failed run.
+    """
+    try:
+        data = await list_models()
+    except LLMError as exc:
+        raise HTTPException(
+            status_code=exc.status_code or 502, detail=str(exc),
+        ) from None
+    cfg = get_config()
+    agents = await _list_agent_models(cfg, llm_ids=[m["id"] for m in data])
+    return {"object": "list", "data": data + agents}
+
+
+async def _list_agent_models(cfg, *, llm_ids: list[str]) -> list[dict]:
+    """Build agent-model entries by probing Sandbox Agent's /v1/agents.
+
+    Returns an empty list when SA is unreachable — `/v1/models` shouldn't
+    fail just because the sandbox is down; LLM models still work. Probe
+    failures are logged at WARN so consumers seeing zero agent rows can
+    diagnose without having to enable debug logging or read
+    `/v1/discovery` — which already carries the structured reason via
+    `_probe_sandbox_agent`.
+    """
     try:
         from aitelier.providers.llm import get_shared_client
         client = await get_shared_client()
-        resp = await client.post(
-            url,
-            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
-            headers={"Content-Type": "application/json"},
-            timeout=5,
+        headers = {}
+        if cfg.sandbox_agent.token:
+            headers["Authorization"] = f"Bearer {cfg.sandbox_agent.token}"
+        resp = await client.get(
+            f"{cfg.sandbox_agent.base_url}/v1/agents",
+            headers=headers, timeout=3,
         )
         if resp.status_code != 200:
-            return {**base, "previewable": True, "reachable": False,
-                    "reason": f"HTTP {resp.status_code}"}
-        data = resp.json()
-        if "error" in data:
-            err = data["error"]
-            return {**base, "previewable": True, "reachable": False,
-                    "reason": f"MCP error {err.get('code')}: {err.get('message','')}"}
-        tools = data.get("result", {}).get("tools") or []
-        # Prefix each tool name with the server name to match aitelier's
-        # allowlist convention: "server.tool"
-        tool_names = sorted(f"{name}.{t['name']}" for t in tools if t.get("name"))
-        return {**base, "previewable": True, "reachable": True, "tools": tool_names}
+            logger.warning(
+                "agent model enumeration: SA /v1/agents returned HTTP %s "
+                "from %s — /v1/models will omit agent rows. Check "
+                "/v1/discovery → dependencies.sandbox_agent for details.",
+                resp.status_code, cfg.sandbox_agent.base_url,
+            )
+            return []
+        raw = resp.json()
     except Exception as exc:
-        return {**base, "previewable": True, "reachable": False,
-                "reason": f"{type(exc).__name__}: {exc}"}
+        logger.warning(
+            "agent model enumeration: SA probe at %s failed (%s: %s) — "
+            "/v1/models will omit agent rows. Check /v1/discovery → "
+            "dependencies.sandbox_agent for details.",
+            cfg.sandbox_agent.base_url, type(exc).__name__, exc,
+        )
+        return []
+
+    agents_raw = raw if isinstance(raw, list) else raw.get("agents") or []
+    out: list[dict] = []
+    for a in agents_raw:
+        if not isinstance(a, dict) or not a.get("id"):
+            continue
+        if not a.get("installed", True):
+            # Don't advertise uninstalled backends; agent runs against them
+            # would fail with NotInstalled. Consumers calling `/v1/discovery`
+            # see the full advertised set.
+            continue
+        out.append({
+            "id": f"agent:{a['id']}",
+            "object": "model",
+            "owned_by": "sandbox-agent",
+            "aitelier_agent": True,
+            # The backend can drive any chat-capable LLM LiteLLM advertises;
+            # consumers can pair as `agent:<backend>/<llm_id>`. The raw
+            # LiteLLM catalog includes TTS / image / embedding / moderation
+            # routes that can't drive a code agent, so we filter those out
+            # before exposing the inner-LLM picklist.
+            "aitelier_inner_llms": _filter_chat_capable(llm_ids),
+            "aitelier_capabilities": a.get("capabilities") or {},
+            # Declarative request-field caps mirroring the agent-path gates
+            # enforced by `_reject_agent_incompatible_fields`. Generic
+            # consumers (model pickers, doctor probes) can pre-strip
+            # request fields from the catalog instead of waiting for a 400.
+            "aitelier_request_caps": {
+                "tools": False,
+                "tool_choice": False,
+                "n_gt_1": False,
+                "top_p": False,
+                "streaming": True,
+                "response_format": ["json_schema"],
+            },
+        })
+    return sorted(out, key=lambda m: m["id"])
 
 
-@app.post("/v1/agent/preview")
-async def agent_preview_endpoint(req: AgentPreviewRequest) -> dict:
-    """Dry-run resolution of MCP servers + tool_allowlist.
+# Model-id substrings that mark a route as not a valid inner LLM for a
+# code agent. Covers non-chat modalities (TTS, image, embeddings, audio
+# transcription, moderation, video) plus chat models with constrained
+# variants the agent harness can't drive (realtime voice / web-search
+# preview endpoints that change the response shape).
+_NON_CHAT_MODEL_MARKERS = (
+    "tts", "whisper", "dall-e", "image", "embed", "moderation",
+    "audio", "transcribe", "speech", "sora",
+    "realtime", "-search-preview",
+)
 
-    Queries each HTTP MCP server's tools/list and reports:
-      - per server: reachability + the tool names it advertises
-      - which allowlist entries match a discovered tool (matches)
-      - which allowlist entries match nothing (misses — likely typos)
-      - which available tools are not in the allowlist (unused)
 
-    stdio MCP servers can't be previewed without spawning the process;
-    they're returned with previewable=false.
+def _filter_chat_capable(model_ids: list[str]) -> list[str]:
+    return [m for m in model_ids
+            if not any(marker in m.lower() for marker in _NON_CHAT_MODEL_MARKERS)]
+
+
+@app.post("/v1/runs")
+async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
+    """Async agent run: returns immediately with a run_id; the final
+    ChatCompletion (or error) is delivered via webhook when ready.
+
+    LLM-path async isn't supported — LLM calls are short and stream-capable;
+    use /v1/chat/completions. Async exists for long-running agent runs.
     """
-    servers_info = await asyncio.gather(
-        *(_query_mcp_tools(s) for s in (req.mcp_servers or []))
-    ) if req.mcp_servers else []
+    route, agent_backend, inner_llm = parse_model_route(req.model)
+    if route != "agent":
+        raise HTTPException(
+            status_code=400,
+            detail="/v1/runs is for async agent runs only — set model to "
+                   "'agent:<backend>[/<inner-llm>]', or use "
+                   "/v1/chat/completions for LLM calls.",
+        )
+    _reject_if_saturated()
 
-    available: set[str] = set()
-    for s in servers_info:
-        for t in s.get("tools") or []:
-            available.add(t)
+    cid = request.state.correlation_id
+    idem = await _check_idempotency(request, "/v1/runs")
+    if idem and idem.cached is not None:
+        return idem.cached
 
-    allowlist = list(req.tool_allowlist or [])
-    matches = sorted(t for t in allowlist if t in available)
-    misses = sorted(t for t in allowlist if t not in available)
-    unused = sorted(available - set(allowlist)) if allowlist else []
+    if req.webhook_url:
+        await _check_webhook_url_or_die(req.webhook_url)
 
-    return {
-        "servers": servers_info,
-        "allowlist_matches": matches,
-        "allowlist_misses": misses,
-        "unused_tools": unused,
+    run_id = make_run_id("chat_agent_async")
+    webhook_url = req.webhook_url
+    inner_req = req  # ChatCompletionRequest fields are a subset
+
+    async def _run_and_callback() -> None:
+        try:
+            result = await _agent_chat_completion(
+                inner_req, request,
+                agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
+                webhook_url=webhook_url,
+            )
+        except Exception as exc:
+            result = {
+                "error": {
+                    "type": classify_error(exc), "message": str(exc),
+                },
+                "aitelier_run_id": run_id,
+            }
+        # Strip the rendering hint before persistence/delivery — it's only
+        # meaningful to a synchronous HTTP responder, not to webhook consumers.
+        result.pop("aitelier_status_code", None)
+        if webhook_url:
+            await _enqueue_webhook(webhook_url, result, run_id=run_id)
+
+    outer_task = asyncio.create_task(_run_and_callback())
+    # Pre-register so an immediate POST /v1/runs/{id}/cancel doesn't 404.
+    # `_agent_chat_completion` swaps this entry for the inner run task once
+    # it starts; the outer task is the safe placeholder.
+    _active_runs[run_id] = outer_task
+    accepted = {
+        "run_id": run_id,
+        "status": "accepted",
+        "correlation_id": cid,
+        "webhook_url": webhook_url,
     }
+    await _record_idempotency(idem, accepted)
+    return accepted
 
 
-def _run_to_trace_dict(run) -> dict:
-    """Convert a Run dataclass to the legacy trace-record wire shape.
-    Same fields as the SDK's TraceRecord; `trace_id` aliases `run_id`."""
+# Field set for the TraceRecord shape on /v1/traces — a strict subset of the
+# Run dict. Kept narrower than _run_to_dict so /v1/traces stays focused on
+# the observability summary while /v1/runs surfaces operational fields
+# (state, sandbox info, environment).
+_TRACE_RECORD_KEYS = frozenset({
+    "trace_id", "started_at", "ended_at", "model", "kind", "finish_reason",
+    "tool_call_count", "input_tokens", "output_tokens", "total_tokens",
+    "cost_usd", "system_prompt_hash", "trace_tag", "status",
+    "error_type", "error_msg", "metadata",
+})
+
+
+def _run_to_dict(run) -> dict:
+    """Canonical Run → dict converter used by /v1/runs*.
+
+    Includes every operational field: state, sandbox info, environment,
+    error info, tokens, cost. The narrower TraceRecord projection for
+    /v1/traces is derived from this via `_run_to_trace_dict`.
+    """
     return {
+        "run_id": run.run_id,
         "trace_id": run.run_id,
+        "state": run.state,
+        "kind": run.kind,
+        "agent_id": run.agent_id,
+        "model": run.model,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
-        "model": run.model,
-        "kind": run.kind,
-        "finish_reason": run.finish_reason,
-        "tool_call_count": run.tool_call_count,
+        "trace_tag": run.trace_tag,
+        "correlation_id": run.correlation_id,
+        "sandbox_backend": run.sandbox_backend,
+        "sandbox_url": run.sandbox_url,
+        "sandbox_server_id": run.sandbox_server_id,
+        "workspace": run.workspace,
+        "environment": run.environment,
         "input_tokens": run.input_tokens,
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
         "cost_usd": run.cost_usd,
+        "finish_reason": run.finish_reason,
+        "tool_call_count": run.tool_call_count,
         "system_prompt_hash": run.system_prompt_hash,
-        "trace_tag": run.trace_tag,
         "status": run.status,
         "error_type": run.error_type,
         "error_msg": run.error_msg,
         "metadata": run.metadata,
     }
+
+
+def _run_to_trace_dict(run) -> dict:
+    """TraceRecord shape returned by /v1/traces.
+
+    A narrower projection of `_run_to_dict` focused on observability fields
+    (counts, tokens, cost, status). For full operational detail (state,
+    sandbox info, environment), use /v1/runs.
+    """
+    full = _run_to_dict(run)
+    return {k: full[k] for k in _TRACE_RECORD_KEYS if k in full}
 
 
 @app.get("/v1/traces")
@@ -873,7 +1616,7 @@ async def traces_endpoint(
     status: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Query recent runs (legacy `traces` shape)."""
+    """Query recent runs as TraceRecord summaries (counts, tokens, cost)."""
     store = await get_store()
     since_dt = datetime.fromisoformat(since) if since else None
     flt = RunFilter(trace_tag=trace_tag, since=since_dt, limit=limit)
@@ -907,112 +1650,12 @@ async def traces_aggregates_endpoint(
 
 @app.get("/v1/traces/{trace_id}")
 async def get_trace_endpoint(trace_id: str) -> dict:
-    """Get a single trace by ID (legacy alias for /v1/runs/{run_id})."""
+    """Get a single trace by ID. Same data as /v1/runs/{id} in TraceRecord shape."""
     store = await get_store()
     run = await store.get_run(trace_id)
     if not run:
         raise HTTPException(status_code=404, detail=f"Trace not found: {trace_id}")
     return _run_to_trace_dict(run)
-
-
-# --- Task runner endpoints (fan-out, legacy) ---
-
-
-@app.post("/v1/execute")
-async def execute(task: TaskSpec, request: Request) -> dict:
-    from aitelier.runner import execute as run_execute
-    from aitelier.runner import make_run_id
-
-    cid = request.state.correlation_id
-    run_id = make_run_id(task.name)
-    task_dict = task.model_dump(exclude_none=True)
-    task_dict["metadata"] = _merge_correlation(task_dict.get("metadata"), cid)
-
-    run_task = asyncio.create_task(run_execute(task_dict, run_id=run_id))
-    _active_runs[run_id] = run_task
-    try:
-        result = await run_task
-    except asyncio.CancelledError:
-        if not run_task.cancelled():
-            run_task.cancel()
-        result = _cancelled_result(run_id, task.kind)
-    finally:
-        _active_runs.pop(run_id, None)
-
-    result["correlation_id"] = cid
-    return result
-
-
-@app.post("/v1/execute/stream")
-async def execute_stream(task: TaskSpec, request: Request):
-    from aitelier.runner import execute as run_execute
-    from aitelier.runner import make_run_id
-
-    cid = request.state.correlation_id
-    run_id = make_run_id(task.name)
-    task_dict = task.model_dump(exclude_none=True)
-    task_dict["metadata"] = _merge_correlation(task_dict.get("metadata"), cid)
-
-    async def event_generator():
-        yield _sse_event("run.started", {
-            "task": task.name,
-            "kind": task.kind,
-            "run_id": run_id,
-            "timestamp": _now_iso(),
-            "correlation_id": cid,
-        })
-        run_task = asyncio.create_task(run_execute(task_dict, run_id=run_id))
-        _active_runs[run_id] = run_task
-        try:
-            result = await run_task
-            result["correlation_id"] = cid
-            yield _sse_event("run.completed", result)
-        except asyncio.CancelledError:
-            if not run_task.cancelled():
-                run_task.cancel()
-            yield _sse_event("run.cancelled", {
-                "run_id": run_id,
-                "correlation_id": cid,
-                "timestamp": _now_iso(),
-            })
-        except Exception as exc:
-            yield _sse_event("run.error", {
-                "error_type": type(exc).__name__,
-                "error_msg": str(exc),
-                "timestamp": _now_iso(),
-                "correlation_id": cid,
-                "run_id": run_id,
-            })
-        finally:
-            _active_runs.pop(run_id, None)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
-@app.post("/v1/fanout")
-async def fanout_endpoint(req: FanoutRequest, request: Request) -> list[dict]:
-    from aitelier.fanout import fanout
-
-    cid = request.state.correlation_id
-    task_dict = req.task.model_dump(exclude_none=True)
-    task_dict["metadata"] = _merge_correlation(task_dict.get("metadata"), cid)
-    results = await fanout(
-        task_dict,
-        providers=req.providers,
-        max_concurrent=req.max_concurrent,
-    )
-    for r in results:
-        if isinstance(r, dict):
-            r["correlation_id"] = cid
-    return results
 
 
 def _validate_path_component(value: str, label: str) -> None:
@@ -1022,41 +1665,6 @@ def _validate_path_component(value: str, label: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: {value!r}")
     if ".." in value:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: path traversal not allowed")
-
-
-def _run_to_dict(run) -> dict:
-    """Convert a Run dataclass → dict for the /v1/runs* wire format.
-
-    Distinct from the legacy /v1/traces shape: surfaces state, environment,
-    sandbox info, error fields. trace_id retained as an alias of run_id.
-    """
-    return {
-        "run_id": run.run_id,
-        "trace_id": run.run_id,
-        "state": run.state,
-        "kind": run.kind,
-        "agent_id": run.agent_id,
-        "model": run.model,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
-        "trace_tag": run.trace_tag,
-        "correlation_id": run.correlation_id,
-        "sandbox_backend": run.sandbox_backend,
-        "sandbox_url": run.sandbox_url,
-        "sandbox_server_id": run.sandbox_server_id,
-        "workspace": run.workspace,
-        "environment": run.environment,
-        "input_tokens": run.input_tokens,
-        "output_tokens": run.output_tokens,
-        "total_tokens": run.total_tokens,
-        "cost_usd": run.cost_usd,
-        "finish_reason": run.finish_reason,
-        "tool_call_count": run.tool_call_count,
-        "status": run.status,
-        "error_type": run.error_type,
-        "error_msg": run.error_msg,
-        "metadata": run.metadata,
-    }
 
 
 def _event_to_dict(event) -> dict:
@@ -1143,15 +1751,7 @@ async def stream_run_events_endpoint(run_id: str, request: Request):
                 break
             await asyncio.sleep(0.5)
 
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return _sse_response(event_generator())
 
 
 @app.get("/v1/runs/active")
@@ -1178,40 +1778,34 @@ async def cancel_run(run_id: str) -> dict:
 
 @app.get("/v1/runs/{run_id}")
 async def get_run(run_id: str) -> dict:
+    """Fetch one run from the durable store. Same shape as `/v1/runs` list
+    entries, plus on-disk artifacts (prompt, manifest) folded in when the
+    run dir exists (agent runs with prepare/artifacts).
+    """
     _validate_path_component(run_id, "run_id")
+    store = await get_store()
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    body = _run_to_dict(run)
 
+    # Best-effort: fold in on-disk artifacts (prompt.txt, manifest.json) if
+    # the agent path wrote them. Defense-in-depth on the path so a crafted
+    # run_id can't escape the runs/ root.
     runs_base = Path("runs").resolve()
     run_dir = (runs_base / run_id).resolve()
+    if str(run_dir).startswith(str(runs_base)) and run_dir.exists():
+        manifest_path = run_dir / "manifest.json"
+        if manifest_path.exists():
+            try:
+                body["manifest"] = json.loads(manifest_path.read_text())
+            except json.JSONDecodeError:
+                pass
+        prompt_path = run_dir / "prompt.txt"
+        if prompt_path.exists():
+            body["prompt"] = prompt_path.read_text()
 
-    # Defense in depth: ensure resolved path is under runs/
-    if not str(run_dir).startswith(str(runs_base)):
-        raise HTTPException(status_code=400, detail="Invalid run_id")
-
-    if not run_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
-
-    manifest_path = run_dir / "manifest.json"
-    if not manifest_path.exists():
-        raise HTTPException(status_code=404, detail=f"No manifest for run: {run_id}")
-
-    manifest = json.loads(manifest_path.read_text())
-    results = []
-    for entry in manifest.get("results", []):
-        provider = entry.get("provider", "")
-        # Sanitize provider name before using in path
-        provider_safe = provider.replace("/", "_").replace("..", "_")
-        result_path = run_dir / provider_safe / "result.json"
-        if result_path.resolve().is_relative_to(run_dir) and result_path.exists():
-            results.append(json.loads(result_path.read_text()))
-        else:
-            results.append(entry)
-    manifest["results"] = results
-
-    prompt_path = run_dir / "prompt.txt"
-    if prompt_path.exists():
-        manifest["prompt"] = prompt_path.read_text()
-
-    return manifest
+    return body
 
 
 _KNOWN_LIMITATIONS = [
@@ -1228,6 +1822,84 @@ async def health() -> dict:
         "timestamp": _now_iso(),
         "known_limitations": _KNOWN_LIMITATIONS,
     }
+
+
+@app.get("/v1/metrics")
+async def metrics() -> dict:
+    """Runtime counters for operators / monitoring agents.
+
+    Intentionally narrow: things you'd want to see when investigating an
+    aitelier-process anomaly (memory, CPU consumed, in-flight runs,
+    pending webhook backlog, recent error rate). Dependency health lives
+    on /v1/discovery; this endpoint never reaches downstream services.
+
+    Macro picture is `process` (does aitelier itself look healthy) +
+    `runs` (is there a backlog or error spike) + `webhooks` (is delivery
+    keeping up).
+    """
+    uptime_seconds = round(time.monotonic() - _PROCESS_STARTED_AT, 3)
+    rusage = resource.getrusage(resource.RUSAGE_SELF)
+
+    store = await get_store()
+    recent_since = datetime.now(UTC) - timedelta(minutes=5)
+    recent = await store.list_runs(RunFilter(since=recent_since, limit=1000))
+    by_status: dict[str, int] = {}
+    for r in recent:
+        by_status[r.status or "<none>"] = by_status.get(r.status or "<none>", 0) + 1
+
+    webhook_pending = await _count_pending_webhooks(store)
+
+    return {
+        "uptime_seconds": uptime_seconds,
+        "timestamp": _now_iso(),
+        "process": {
+            # ru_maxrss is bytes on macOS, kilobytes on Linux. Normalize to
+            # MiB; operators care about order-of-magnitude, not precise units.
+            "rss_mb": round(_normalize_maxrss(rusage.ru_maxrss) / (1024 * 1024), 2),
+            "cpu_user_seconds": round(rusage.ru_utime, 3),
+            "cpu_system_seconds": round(rusage.ru_stime, 3),
+        },
+        "runs": {
+            "in_flight": len(_active_runs),
+            "recent_5min": {
+                "total": len(recent),
+                "by_status": by_status,
+            },
+        },
+        "webhooks": {"pending": webhook_pending},
+    }
+
+
+def _normalize_maxrss(raw: int) -> int:
+    """`getrusage().ru_maxrss` is bytes on macOS/BSD, kilobytes on Linux.
+    Best-effort detection by magnitude: any process actually using ≥1 GiB
+    of RSS would report a kB-units number larger than the bytes-units
+    threshold, but in practice aitelier sits in the tens-of-MB range so
+    the units differ by 1024×. Heuristic: if raw < 10 MiB-of-kB
+    (≈10 GiB), treat it as kB and multiply; else treat it as bytes."""
+    import sys
+    if sys.platform == "darwin":
+        return int(raw)
+    # Linux + most BSDs: kilobytes.
+    return int(raw) * 1024
+
+
+async def _count_pending_webhooks(store) -> int:
+    """Best-effort pending-webhook count. The InMemoryStore exposes the
+    backing dict directly; PostgresStore has no count method today, so we
+    fall back to claiming and immediately re-queuing — expensive but
+    bounded by the small limit and only runs on /v1/metrics requests.
+    Returns 0 if the count probe fails for any reason."""
+    try:
+        backing = getattr(store, "_webhooks", None)
+        if isinstance(backing, dict):
+            return sum(
+                1 for d in backing.values()
+                if getattr(d, "state", None) == "pending"
+            )
+        return 0
+    except Exception:
+        return 0
 
 
 # --- Discovery ---
@@ -1372,6 +2044,8 @@ async def list_schedules_endpoint() -> list[dict]:
 async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
     """Register a recurring or one-shot scheduled task."""
     from aitelier.schedules import create_schedule
+    if req.webhook_url:
+        await _check_webhook_url_or_die(req.webhook_url)
     try:
         return await create_schedule(req.model_dump(exclude_none=True))
     except ValueError as exc:
@@ -1397,33 +2071,6 @@ async def delete_schedule_endpoint(schedule_id: str) -> dict:
     return {"id": schedule_id, "deleted": True}
 
 
-@app.get("/v1/litellm/models")
-async def list_litellm_models() -> list[dict]:
-    """List every model LiteLLM knows about (aliases + wildcard providers).
-
-    Useful for consumers to discover what they can pass as the `model` field
-    on /v1/complete and /v1/embed. Proxies LiteLLM's /v1/models.
-    """
-    from aitelier.config import get_config
-    from aitelier.providers.llm import get_shared_client
-
-    cfg = get_config().litellm
-    client = await get_shared_client()
-    try:
-        resp = await client.get(
-            f"{cfg.base_url}/v1/models",
-            headers={"Authorization": f"Bearer {cfg.api_key}"},
-            timeout=5,
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"LiteLLM unreachable: {type(exc).__name__}: {exc}",
-        ) from None
-    if resp.status_code != 200:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    data = resp.json()
-    return data.get("data", []) if isinstance(data, dict) else data
 
 
 # --- Workflow consolidation: prepare → agent → artifacts ---
@@ -1599,28 +2246,18 @@ async def _sa_proxy(
             detail=f"Sandbox Agent unreachable: {type(exc).__name__}: {exc}",
         ) from None
     if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        # Truncate upstream body — it may carry container paths, env hints,
+        # or other internals we don't want to forward verbatim. Also scrub
+        # the literal sandbox URL so it doesn't leak through the proxy
+        # surface alongside the rest of the error vocabulary.
+        from aitelier.providers.sandbox_agent import _scrub_sandbox_url
+        text = _scrub_sandbox_url(resp.text[:200], cfg.base_url)
+        detail = f"sandbox-agent {resp.status_code}: {text}"
+        raise HTTPException(status_code=resp.status_code, detail=detail)
     ctype = resp.headers.get("content-type", "")
     if "application/json" in ctype:
         return resp.json()
     return resp.content
-
-
-@app.get("/v1/sandbox/agents/{agent}")
-async def get_sandbox_agent_info(agent: str) -> dict:
-    """Capability info for one Sandbox Agent backend (claude / codex / etc.).
-
-    Includes supported models, permission semantics, MCP support flags, etc.
-    Proxies Sandbox Agent's GET /v1/agents/{agent}.
-    """
-    _validate_path_component(agent, "agent")
-    try:
-        return await _sa_proxy("GET", f"/v1/agents/{agent}", timeout=5)
-    except HTTPException as exc:
-        if exc.status_code == 404:
-            raise HTTPException(status_code=404,
-                                detail=f"Agent not found: {agent}") from None
-        raise
 
 
 @app.get("/v1/discovery")
@@ -1661,6 +2298,27 @@ async def discovery() -> dict:
         def cap(ok: bool, reason: str) -> dict:
             return {"available": True} if ok else {"available": False, "reason": reason}
 
+        # Per-model response_format support — same registry the request-time
+        # normalizer consults, so consumers can fail fast at config time
+        # rather than waiting for UnsupportedResponseFormat at first call.
+        models = []
+        for m in litellm_info.get("models") or []:
+            entry: dict[str, Any] = {"name": m}
+            supports = model_response_format_capabilities(m)
+            if supports is not None:
+                entry["response_format"] = supports
+            models.append(entry)
+
+        # Hosted-mode posture: scrub internal `base_url`s from the
+        # dependency block. Error envelopes already scrub these via
+        # `_scrub_sandbox_url`; surfacing them here would be inconsistent
+        # — any authenticated caller could lift them and skip the abstraction.
+        # `reachable` + `reason` + `agents`/`models` lists stay so the
+        # endpoint is still useful for ops dashboards.
+        if cfg.service.api_key:
+            litellm_info = {k: v for k, v in litellm_info.items() if k != "base_url"}
+            sandbox_info = {k: v for k, v in sandbox_info.items() if k != "base_url"}
+
         result = {
             "service": "aitelier",
             "version": app.version,
@@ -1668,8 +2326,11 @@ async def discovery() -> dict:
             "timestamp": _now_iso(),
             "endpoints": _list_endpoints(),
             "capabilities": {
-                "complete": cap(litellm_ok, "LiteLLM proxy unreachable"),
-                "embed": cap(litellm_ok, "LiteLLM proxy unreachable"),
+                "chat_completions": cap(
+                    litellm_ok or sandbox_ok,
+                    "Neither LiteLLM nor Sandbox Agent reachable",
+                ),
+                "embeddings": cap(litellm_ok, "LiteLLM proxy unreachable"),
                 "agent": cap(sandbox_ok, "Sandbox Agent unreachable"),
                 "traces": traces_info,
             },
@@ -1677,6 +2338,7 @@ async def discovery() -> dict:
                 "litellm": litellm_info,
                 "sandbox_agent": sandbox_info,
             },
+            "models": models,
             "schemas": _list_schemas(),
             "known_limitations": _KNOWN_LIMITATIONS,
         }
@@ -1702,6 +2364,23 @@ async def get_schema(name: str) -> dict:
 
 def _sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data, default=str)}\n\n"
+
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    # Disable nginx response buffering; otherwise events stall until the
+    # consumer connection idles and a buffer flush is forced.
+    "X-Accel-Buffering": "no",
+}
+
+
+def _sse_response(generator) -> StreamingResponse:
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers=_SSE_HEADERS,
+    )
 
 
 def _now_iso() -> str:

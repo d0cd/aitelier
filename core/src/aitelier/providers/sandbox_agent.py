@@ -19,15 +19,18 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import logging
 import time
 import uuid
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error
-from aitelier.observability import end_agent_trace, trace_agent_call
+
+logger = logging.getLogger("aitelier.sandbox_agent")
 
 # ACP protocol version we advertise on initialize. Sandbox Agent currently
 # tracks Zed's ACP spec; bump when the upstream stabilizes 1.0.
@@ -168,9 +171,10 @@ class AcpClient:
                     # for now; POST returns sync responses.
         except asyncio.CancelledError:
             raise
-        except Exception:
-            # Stream may close when the session ends — that's fine.
-            pass
+        except Exception as exc:
+            # Stream may close when the session ends — common and benign.
+            # Log at debug for diagnosability without polluting normal output.
+            logger.debug("SSE consumer ended: %s: %s", type(exc).__name__, exc)
 
     async def _respond_to_agent_request(self, env: dict) -> None:
         """Build a JSON-RPC response for an agent → client request.
@@ -216,10 +220,13 @@ class AcpClient:
             await self._http.post(self._url(), json=response,
                                    headers=self._headers(),
                                    timeout=10.0)
-        except Exception:
+        except Exception as exc:
             # Best-effort. If the POST fails, the agent will eventually
-            # time out on its end — same outcome as before this fix.
-            pass
+            # time out on its end.
+            logger.debug(
+                "agent-response POST failed: %s: %s",
+                type(exc).__name__, exc,
+            )
 
     def start_stream(self) -> None:
         """Begin background SSE consumption. Call after first POST has bound
@@ -243,8 +250,99 @@ class AcpClient:
 
 
 # ---------------------------------------------------------------------------
-# High-level entry point used by providers/agent.py
+# Pre-flight validation — surface common remote-SA misconfigurations early
 # ---------------------------------------------------------------------------
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "0.0.0.0", "::1"})
+
+
+def _is_local_url(url: str) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host in _LOCAL_HOSTS
+
+
+def _scrub_sandbox_url(message: str, base_url: str | None) -> str:
+    """Replace the literal sandbox base URL with `<sandbox>` in any
+    consumer-visible message. The URL is internal topology; surfacing
+    it (in error envelopes, event payloads) leaks host shape to remote
+    callers in hosted mode and clutters consumer dashboards. The full
+    URL stays in server logs and the runs row for operator debugging.
+    """
+    if not base_url:
+        return message
+    return message.replace(base_url, "<sandbox>")
+
+
+def _warn_remote_misconfig(
+    sa_base_url: str,
+    workspace: str | None,
+    mcp_servers: list[dict] | None,
+) -> None:
+    """Emit warnings when the SA is remote/containerized but the request
+    references host-local paths or 127.0.0.1 URLs that won't resolve there.
+
+    Triggered when sandbox_agent.base_url is *not* local. Warnings only —
+    we never reject the request, since the user may have set up
+    `host.docker.internal` aliases or tunneled the loopback themselves.
+    """
+    if _is_local_url(sa_base_url):
+        return
+
+    for s in mcp_servers or []:
+        if s.get("transport", "http") != "http":
+            continue
+        url = s.get("url") or ""
+        if url and _is_local_url(url):
+            logger.warning(
+                "MCP server %r url=%s points at loopback but Sandbox Agent is "
+                "remote (%s); the agent won't be able to reach it. Use "
+                "host.docker.internal, a tunneled public URL, or a stdio "
+                "transport instead.",
+                s.get("name") or "<unnamed>", url, sa_base_url,
+            )
+
+    if workspace and workspace.startswith("/") and not workspace.startswith("/workspace"):
+        logger.warning(
+            "workspace=%s looks like a host path but Sandbox Agent is remote "
+            "(%s); the directory likely doesn't exist inside the sandbox. "
+            "Use a path under /workspace (the SA default) or seed files via "
+            "the `prepare.files` option on /v1/agent.",
+            workspace, sa_base_url,
+        )
+
+
+# ---------------------------------------------------------------------------
+# High-level entry point
+# ---------------------------------------------------------------------------
+
+
+async def _persist_sandbox_server_id(
+    run_id: str, sandbox_url: str, server_id: str,
+) -> None:
+    """Stamp the run row with the SA endpoint + server_id so recovery can
+    locate the session after an aitelier restart, and so dashboards can
+    distinguish local vs remote sandboxes. Best-effort: never blocks the run.
+    """
+    if not run_id:
+        return
+    try:
+        from aitelier.storage import get_store
+        store = await get_store()
+        await store.update_run_sandbox(
+            run_id,
+            sandbox_url=sandbox_url,
+            sandbox_server_id=server_id,
+            sandbox_backend="local" if _is_local_url(sandbox_url) else "remote",
+        )
+    except Exception as exc:
+        logger.debug(
+            "persist sandbox server_id failed for run %s: %s: %s",
+            run_id, type(exc).__name__, exc,
+        )
 
 
 class _RunEventEmitter:
@@ -267,8 +365,118 @@ class _RunEventEmitter:
                 run_id=self.run_id, seq=self._seq, kind=kind,
                 payload=payload or {},
             ))
-        except Exception:
-            pass
+        except Exception as exc:
+            # Event-append is observability, not load-bearing. Don't fail
+            # the run if storage is degraded — surface in logs instead.
+            logger.debug(
+                "event emit failed for run %s kind=%s: %s: %s",
+                self.run_id, kind, type(exc).__name__, exc,
+            )
+
+
+async def _open_acp_session(
+    client: AcpClient,
+    *,
+    workspace: str | None,
+    mcp_servers: list[dict] | None,
+    system_prompt: str | None,
+    agent_model: str | None,
+    tool_allowlist: list[str] | None,
+    max_turns: int | None,
+) -> str:
+    """Drive the ACP handshake up to a usable session_id.
+
+    initialize → session/new → start_stream → best-effort config notifications.
+
+    Capabilities are advertised honestly: aitelier doesn't service fs/*
+    or terminal/* (the SSE consumer rejects them in `_respond_to_agent_request`),
+    so we say `false`. The agent then never asks, instead of asking and
+    hanging on the rejection.
+    """
+    await client.call("initialize", {
+        "protocolVersion": _ACP_PROTOCOL_VERSION,
+        "clientCapabilities": {
+            "fs": {"readTextFile": False, "writeTextFile": False},
+            "terminal": False,
+        },
+        "clientInfo": {"name": "aitelier", "version": "0.1.0"},
+    }, first=True)
+
+    session_resp = await client.call("session/new", {
+        "cwd": workspace or ".",
+        "mcpServers": _adapt_mcp_servers(mcp_servers),
+    })
+    session_id = (
+        session_resp["sessionId"]
+        if isinstance(session_resp, dict) else session_resp
+    )
+
+    client.start_stream()
+
+    # Best-effort config options. Agent backends accept different keys
+    # (claude-code: model, systemPrompt, allowedTools, maxTurns; codex:
+    # similar). Failures here are silent on purpose — sandbox-agent passes
+    # the option through and the backend ignores unknowns.
+    for option, value in (
+        ("systemPrompt", system_prompt),
+        ("model", agent_model),
+        ("allowedTools", tool_allowlist),
+        ("maxTurns", max_turns),
+    ):
+        if value is None or value == "" or value == []:
+            continue
+        try:
+            await client.notify("session/set_config_option", {
+                "sessionId": session_id,
+                "option": option,
+                "value": value,
+            })
+        except Exception as exc:
+            logger.debug(
+                "session/set_config_option %s ignored: %s: %s",
+                option, type(exc).__name__, exc,
+            )
+
+    return session_id
+
+
+async def _close_acp_session(client: AcpClient, session_id: str) -> None:
+    """Tear down an ACP session.
+
+    Uses `client.call` (request/response) rather than `client.notify`
+    (fire-and-forget) so the server acknowledges receipt before our HTTP
+    connection closes. Without the round-trip, sandbox-agent can drop
+    the close message on connection teardown and leave child agent
+    processes alive indefinitely.
+
+    Failures are swallowed and logged: this runs from cleanup paths
+    where re-raising would mask the original error. A short timeout
+    keeps a stuck server from hanging the cleanup.
+    """
+    try:
+        await asyncio.wait_for(
+            client.call("session/close", {"sessionId": session_id}),
+            timeout=5.0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "session/close failed for session %s: %s — child process "
+            "may leak. Check sandbox-agent state.",
+            session_id, exc,
+        )
+
+
+def _prompt_params(
+    session_id: str, prompt: str, response_format: dict | None,
+) -> dict:
+    """Build the session/prompt request body."""
+    params: dict = {
+        "sessionId": session_id,
+        "prompt": [{"type": "text", "text": prompt}],
+    }
+    if response_format and response_format.get("type") == "json_schema":
+        params["responseFormat"] = response_format
+    return params
 
 
 async def call_via_sandbox(
@@ -276,7 +484,6 @@ async def call_via_sandbox(
     prompt: str,
     *,
     workspace: str | None = None,
-    workspace_mode: str = "copy",  # noqa: ARG001 — Sandbox Agent owns isolation
     system_prompt: str | None = None,
     mcp_servers: list[dict] | None = None,
     tool_allowlist: list[str] | None = None,
@@ -284,171 +491,67 @@ async def call_via_sandbox(
     max_turns: int | None = None,
     agent_model: str | None = None,
     timeout: int = 600,
-    run_dir: Any = None,  # noqa: ARG001 — kept for signature parity
     run_id: str = "",
-    trace_tag: str | None = None,  # noqa: ARG001
 ) -> dict:
     """Run an agent via Sandbox Agent. Returns aitelier's standard result dict.
 
-    Parameter mapping (M4 in progress — some params not yet plumbed):
-      system_prompt    → initialize.clientCapabilities or session config
+    Thin wrapper over call_via_sandbox_stream: consumes the event stream and
+    returns the final aggregated `done` (or surfaces error/timeout) as a dict.
+
+    Parameter routing:
+      system_prompt, agent_model, tool_allowlist, max_turns → session/set_config_option
       mcp_servers      → session/new mcpServers
-      tool_allowlist   → session/set_config_option (agent-specific)
-      response_format  → session/prompt content block (json_schema)
-      max_turns        → session/set_config_option (agent-specific)
-      workspace        → session/new working directory
-      workspace_mode   → handled inside Sandbox Agent (we don't manage isolation)
+      response_format  → session/prompt (json_schema only)
+      workspace        → session/new cwd
     """
-    cfg = get_config().sandbox_agent
     start = time.monotonic()
-
-    # Open a Langfuse generation if observability is configured.
-    # No-op when LANGFUSE_PUBLIC_KEY is unset.
-    _trace, _gen = trace_agent_call(
-        task_name=trace_tag or "agent",
-        agent_name=name,
-        prompt=prompt,
-        run_id=run_id,
-    )
-
+    final: dict | None = None
+    last_error: dict | None = None
     try:
-        async with AcpClient(cfg.base_url, name, token=cfg.token,
-                             timeout=timeout) as client:
-            result = await asyncio.wait_for(
-                _run_one_turn(
-                    client,
-                    prompt=prompt,
-                    workspace=workspace,
-                    system_prompt=system_prompt,
-                    mcp_servers=mcp_servers,
-                    response_format=response_format,
-                    tool_allowlist=tool_allowlist,
-                    max_turns=max_turns,
-                    agent_model=agent_model,
-                    run_id=run_id,
-                    start=start,
-                ),
-                timeout=timeout,
-            )
+        async def _consume() -> None:
+            nonlocal final, last_error
+            async for event in call_via_sandbox_stream(
+                name, prompt,
+                workspace=workspace, system_prompt=system_prompt,
+                mcp_servers=mcp_servers, tool_allowlist=tool_allowlist,
+                response_format=response_format, max_turns=max_turns,
+                agent_model=agent_model, timeout=timeout, run_id=run_id,
+            ):
+                etype = event.get("type")
+                if etype == "done":
+                    final = {k: v for k, v in event.items() if k != "type"}
+                elif etype == "error":
+                    last_error = event
+
+        await asyncio.wait_for(_consume(), timeout=timeout)
     except TimeoutError:
-        result = _timeout_result(name, run_id, time.monotonic() - start)
-    except Exception as exc:
-        result = _error_result(name, run_id, exc, time.monotonic() - start,
-                               base_url=cfg.base_url)
+        return _timeout_result(name, run_id, time.monotonic() - start)
 
-    end_agent_trace(_gen, result.get("content") or "", None, run_id)
-    return result
-
-
-async def _run_one_turn(
-    client: AcpClient,
-    *,
-    prompt: str,
-    workspace: str | None,
-    system_prompt: str | None,
-    mcp_servers: list[dict] | None,
-    response_format: dict | None,
-    tool_allowlist: list[str] | None = None,
-    max_turns: int | None = None,
-    agent_model: str | None = None,
-    run_id: str,
-    start: float,
-) -> dict:
-    emitter = _RunEventEmitter(run_id)
-    await emitter.emit("start", {
-        "agent": client.agent,
-        "sandbox_url": client.base_url,
-        "workspace": workspace,
-    })
-
-    # 1. Handshake
-    await client.call("initialize", {
-        "protocolVersion": _ACP_PROTOCOL_VERSION,
-        "clientCapabilities": {
-            "fs": {"readTextFile": True, "writeTextFile": True},
-            "terminal": True,
-        },
-        "clientInfo": {"name": "aitelier", "version": "0.1.0"},
-    }, first=True)
-
-    # 2. New session
-    session_params: dict = {
-        "cwd": workspace or ".",
-        "mcpServers": _adapt_mcp_servers(mcp_servers),
-    }
-    session_resp = await client.call("session/new", session_params)
-    session_id = session_resp["sessionId"] if isinstance(session_resp, dict) else session_resp
-
-    # 3. Start SSE consumer for notifications during the prompt
-    client.start_stream()
-
-    # 4. Best-effort config options. Agent backends accept different keys
-    #    (claude-code: model, systemPrompt, allowedTools, maxTurns; codex:
-    #    similar). We try the conventional names — if a backend doesn't
-    #    recognize one, sandbox-agent silently swallows it.
-    async def _set(option: str, value: object) -> None:
-        try:
-            await client.notify("session/set_config_option", {
-                "sessionId": session_id,
-                "option": option,
-                "value": value,
-            })
-        except Exception:
-            pass
-
-    if system_prompt:
-        await _set("systemPrompt", system_prompt)
-    if agent_model:
-        await _set("model", agent_model)
-    if tool_allowlist:
-        await _set("allowedTools", tool_allowlist)
-    if max_turns is not None:
-        await _set("maxTurns", max_turns)
-
-    # 5. Run the turn (POST blocks until the agent completes a turn)
-    prompt_params = {
-        "sessionId": session_id,
-        "prompt": [{"type": "text", "text": prompt}],
-    }
-    if response_format and response_format.get("type") == "json_schema":
-        prompt_params["responseFormat"] = response_format
-
-    turn_result = await client.call("session/prompt", prompt_params)
-
-    # 6. Drain any remaining notifications and persist each as a run_event
-    notifications = await client.drain_notifications()
-    for note in notifications:
-        ev = _notification_to_event(note)
-        if ev:
-            await emitter.emit(ev["type"], {k: v for k, v in ev.items() if k != "type"})
-
-    # 7. Close session
-    try:
-        await client.notify("session/close", {"sessionId": session_id})
-    except Exception:
-        pass
-
-    elapsed = time.monotonic() - start
-    result = _aggregate_result(
-        agent=client.agent,
-        run_id=run_id,
-        turn_result=turn_result,
-        notifications=notifications,
-        elapsed=elapsed,
-        response_format=response_format,
+    if final is not None:
+        return final
+    if last_error is not None:
+        # Reconstruct a full Result from the streamed error event. The
+        # producer already classified the exception via `classify_error`
+        # before serializing it into the event — preserve that type
+        # instead of re-wrapping as `RuntimeError`, which would lose the
+        # taxonomy and surface raw class names to consumers.
+        cfg = get_config().sandbox_agent
+        exc_msg = last_error.get("error_msg") or "stream error"
+        return _error_result(
+            name, run_id, RuntimeError(exc_msg),
+            time.monotonic() - start, base_url=cfg.base_url,
+            error_type=last_error.get("error_type"),
+        )
+    cfg = get_config().sandbox_agent
+    return _error_result(
+        name, run_id, RuntimeError("stream ended without a result"),
+        time.monotonic() - start, base_url=cfg.base_url,
+        error_type="ProviderError",
     )
-    await emitter.emit(
-        "finish" if result.get("status") == "ok" else "error",
-        {
-            "finish_reason": result.get("finish_reason"),
-            "tool_call_count": len(result.get("tool_calls") or []),
-        },
-    )
-    return result
 
 
 # ---------------------------------------------------------------------------
-# Streaming entry point used by /v1/agent/stream
+# Streaming entry point used by /v1/agent/stream and call_via_sandbox
 # ---------------------------------------------------------------------------
 
 
@@ -463,7 +566,7 @@ async def call_via_sandbox_stream(
     response_format: dict | None = None,
     max_turns: int | None = None,
     agent_model: str | None = None,
-    timeout: int = 600,  # noqa: ARG001 — outer endpoint enforces timeout
+    timeout: int = 600,
     run_id: str = "",
 ):
     """Streaming variant of call_via_sandbox.
@@ -480,162 +583,137 @@ async def call_via_sandbox_stream(
     cfg = get_config().sandbox_agent
     start = time.monotonic()
 
+    _warn_remote_misconfig(cfg.base_url, workspace, mcp_servers)
+
     text_chunks: list[str] = []
     tool_calls: list[dict] = []
 
     emitter = _RunEventEmitter(run_id)
+    # `sandbox_url` is internal topology — keep it out of consumer-visible
+    # event payloads so it can't end up in dashboards or leak to remote
+    # callers in hosted mode. The full URL stays in the runs row
+    # (`sandbox_url` column) for operator debugging.
     await emitter.emit("start", {
-        "agent": name, "sandbox_url": cfg.base_url, "workspace": workspace,
+        "agent": name,
+        "sandbox": "local" if _is_local_url(cfg.base_url) else "remote",
+        "workspace": workspace,
     })
-
-    _trace, _gen = trace_agent_call(
-        task_name="agent",
-        agent_name=name,
-        prompt=prompt,
-        run_id=run_id,
-    )
 
     try:
         async with AcpClient(cfg.base_url, name, token=cfg.token,
                              timeout=timeout) as client:
-            await client.call("initialize", {
-                "protocolVersion": _ACP_PROTOCOL_VERSION,
-                # Advertise only what aitelier actually services in the SSE
-                # consumer. fs/terminal handlers would need real
-                # implementations; until then say no so the agent doesn't
-                # ask and hang waiting for a response.
-                "clientCapabilities": {
-                    "fs": {"readTextFile": False, "writeTextFile": False},
-                    "terminal": False,
-                },
-                "clientInfo": {"name": "aitelier", "version": "0.1.0"},
-            }, first=True)
+            await _persist_sandbox_server_id(run_id, cfg.base_url, client.server_id)
+            session_id: str | None = None
+            try:
+                session_id = await _open_acp_session(
+                    client,
+                    workspace=workspace, mcp_servers=mcp_servers,
+                    system_prompt=system_prompt, agent_model=agent_model,
+                    tool_allowlist=tool_allowlist, max_turns=max_turns,
+                )
 
-            session_resp = await client.call("session/new", {
-                "cwd": workspace or ".",
-                "mcpServers": _adapt_mcp_servers(mcp_servers),
-            })
-            session_id = (
-                session_resp["sessionId"]
-                if isinstance(session_resp, dict) else session_resp
-            )
+                # Run session/prompt in the background; surface notifications live.
+                prompt_task = asyncio.create_task(
+                    client.call(
+                        "session/prompt",
+                        _prompt_params(session_id, prompt, response_format),
+                    )
+                )
 
-            client.start_stream()
-
-            async def _set(option: str, value: object) -> None:
+                turn_result: dict | None = None
+                prompt_err: dict | None = None
                 try:
-                    await client.notify("session/set_config_option", {
-                        "sessionId": session_id,
-                        "option": option,
-                        "value": value,
-                    })
-                except Exception:
-                    pass
+                    while not prompt_task.done():
+                        note = await client.next_notification(timeout=0.25)
+                        if note is None:
+                            continue
+                        ev = _notification_to_event(note)
+                        if ev is None:
+                            continue
+                        if ev["type"] == "delta":
+                            text_chunks.append(ev["content"])
+                        elif ev["type"] in ("tool_call", "tool_result"):
+                            tool_calls.append(
+                                {k: v for k, v in ev.items() if k != "type"},
+                            )
+                        await emitter.emit(
+                            ev["type"],
+                            {k: v for k, v in ev.items() if k != "type"},
+                        )
+                        yield ev
 
-            if system_prompt:
-                await _set("systemPrompt", system_prompt)
-            if agent_model:
-                await _set("model", agent_model)
-            if tool_allowlist:
-                await _set("allowedTools", tool_allowlist)
-            if max_turns is not None:
-                await _set("maxTurns", max_turns)
+                    try:
+                        turn_result = await prompt_task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        prompt_err = {
+                            "type": "error",
+                            "error_type": classify_error(exc),
+                            "error_msg": _scrub_sandbox_url(str(exc), cfg.base_url),
+                        }
 
-            prompt_params: dict = {
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
-            }
-            if response_format and response_format.get("type") == "json_schema":
-                prompt_params["responseFormat"] = response_format
+                    # Drain straggling notifications even on prompt error so the
+                    # event stream is consistent and we know what fired.
+                    for note in await client.drain_notifications():
+                        ev = _notification_to_event(note)
+                        if ev is None:
+                            continue
+                        if ev["type"] == "delta":
+                            text_chunks.append(ev["content"])
+                        await emitter.emit(
+                            ev["type"],
+                            {k: v for k, v in ev.items() if k != "type"},
+                        )
+                        yield ev
+                finally:
+                    # Close session on every exit path — cancellation, prompt
+                    # error, successful completion. Without this the inner
+                    # agent process (claude / codex / …) stays alive
+                    # indefinitely. Failures are logged inside _close_acp_session.
+                    await _close_acp_session(client, session_id)
+                    session_id = None
 
-            # Run session/prompt in the background; surface notifications live.
-            prompt_task = asyncio.create_task(
-                client.call("session/prompt", prompt_params)
-            )
+                if prompt_err is not None:
+                    await emitter.emit("error", prompt_err)
+                    yield prompt_err
+                    return
 
-            while not prompt_task.done():
-                note = await client.next_notification(timeout=0.25)
-                if note is None:
-                    continue
-                ev = _notification_to_event(note)
-                if ev is None:
-                    continue
-                if ev["type"] == "delta":
-                    text_chunks.append(ev["content"])
-                elif ev["type"] == "tool_call":
-                    tool_calls.append({
-                        "server": ev.get("server"),
-                        "tool": ev.get("tool"),
-                        "input": ev.get("input"),
-                    })
-                await emitter.emit(ev["type"],
-                                    {k: v for k, v in ev.items() if k != "type"})
-                yield ev
-
-            # Final turn response
-            try:
-                turn_result = await prompt_task
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                err = {
-                    "type": "error",
-                    "error_type": classify_error(exc),
-                    "error_msg": str(exc),
-                }
-                await emitter.emit("error", err)
-                yield err
-                return
-
-            # Drain any straggling notifications.
-            for note in await client.drain_notifications():
-                ev = _notification_to_event(note)
-                if ev is None:
-                    continue
-                if ev["type"] == "delta":
-                    text_chunks.append(ev["content"])
-                await emitter.emit(ev["type"],
-                                    {k: v for k, v in ev.items() if k != "type"})
-                yield ev
-
-            try:
-                await client.notify("session/close", {"sessionId": session_id})
-            except Exception:
-                pass
-
-            elapsed = time.monotonic() - start
-            done = _aggregate_result(
-                agent=client.agent,
-                run_id=run_id,
-                turn_result=turn_result,
-                notifications=[],  # already drained above
-                elapsed=elapsed,
-                response_format=response_format,
-            )
-            if text_chunks:
-                done["content"] = "".join(text_chunks)
-            if tool_calls:
-                done["tool_calls"] = tool_calls
-            done["type"] = "done"
-            await emitter.emit("finish", {
-                "finish_reason": done.get("finish_reason"),
-                "tool_call_count": len(tool_calls),
-            })
-            end_agent_trace(_gen, done.get("content") or "", None, run_id)
-            yield done
+                elapsed = time.monotonic() - start
+                done = _aggregate_result(
+                    agent=client.agent,
+                    run_id=run_id,
+                    turn_result=turn_result,
+                    elapsed=elapsed,
+                    response_format=response_format,
+                )
+                if text_chunks:
+                    done["content"] = "".join(text_chunks)
+                if tool_calls:
+                    done["tool_calls"] = tool_calls
+                done["type"] = "done"
+                await emitter.emit("finish", {
+                    "finish_reason": done.get("finish_reason"),
+                    "tool_call_count": len(tool_calls),
+                })
+                yield done
+            finally:
+                # Belt-and-suspenders: session_id is None after a normal
+                # close; non-None only when the inner try raised before
+                # the finally above ran (shouldn't be possible, but cheap).
+                if session_id is not None:
+                    await _close_acp_session(client, session_id)
 
     except asyncio.CancelledError:
         await emitter.emit("cancelled", {})
-        end_agent_trace(_gen, "".join(text_chunks), None, run_id)
         raise
     except Exception as exc:
         err = {
             "type": "error",
             "error_type": classify_error(exc),
-            "error_msg": str(exc),
+            "error_msg": _scrub_sandbox_url(str(exc), cfg.base_url),
         }
         await emitter.emit("error", err)
-        end_agent_trace(_gen, str(exc), None, run_id)
         yield err
 
 
@@ -647,35 +725,52 @@ async def call_via_sandbox_stream(
 def _notification_to_event(note: dict) -> dict | None:
     """Map an ACP session/update notification to an aitelier streaming event.
 
-    Returns None when the notification doesn't carry a payload we surface.
+    The discriminator per the ACP `SessionUpdate` schema is `sessionUpdate`
+    with snake_case values (`agent_message_chunk`, `tool_call`,
+    `tool_call_update`, …). Older sandbox-agent versions emitted camelCase
+    aliases (`messageChunk`, `toolCall`); we accept both.
     """
     params = note.get("params") or {}
     update = params.get("update") or params
-    kind = update.get("type") or update.get("kind")
+    kind = (
+        update.get("sessionUpdate")
+        or update.get("type")
+        or update.get("kind")
+    )
 
-    if kind in ("messageChunk", "agentMessageChunk", "text"):
+    if kind in (
+        "agent_message_chunk", "user_message_chunk",
+        "agentMessageChunk", "messageChunk", "text",
+    ):
         content = update.get("content") or update.get("text")
+        if isinstance(content, dict):
+            content = content.get("text")
         if isinstance(content, str):
             return {"type": "delta", "content": content}
-        if isinstance(content, dict):
-            text = content.get("text")
-            if text:
-                return {"type": "delta", "content": text}
         return None
 
-    if kind in ("toolCall", "tool_call"):
+    if kind == "agent_thought_chunk":
+        content = update.get("content")
+        if isinstance(content, dict):
+            content = content.get("text")
+        if isinstance(content, str):
+            return {"type": "thought", "content": content}
+        return None
+
+    if kind in ("tool_call", "toolCall"):
         return {
             "type": "tool_call",
             "server": update.get("server") or update.get("serverName"),
-            "tool": update.get("name") or update.get("toolName"),
-            "input": update.get("arguments") or update.get("input"),
+            "tool":   update.get("name") or update.get("toolName") or update.get("title"),
+            "input":  update.get("arguments") or update.get("input") or update.get("rawInput"),
         }
 
-    if kind in ("toolResult", "tool_result"):
+    if kind in ("tool_call_update", "toolCallUpdate", "toolResult", "tool_result"):
         return {
-            "type": "tool_result",
-            "tool": update.get("name") or update.get("toolName"),
-            "output": update.get("result") or update.get("output"),
+            "type":       "tool_result",
+            "tool":       update.get("name") or update.get("toolName"),
+            "output":     (update.get("result") or update.get("output")
+                            or update.get("rawOutput") or update.get("content")),
             "elapsed_ms": update.get("elapsed_ms") or update.get("elapsedMs"),
         }
 
@@ -719,28 +814,18 @@ def _aggregate_result(
     agent: str,
     run_id: str,
     turn_result: dict | None,
-    notifications: list[dict],
     elapsed: float,
     response_format: dict | None,
 ) -> dict:
-    """Convert ACP response + notifications → aitelier's standard result dict."""
-    text_chunks: list[str] = []
-    tool_calls: list[dict] = []
+    """Build the final aitelier result dict from an ACP turn response.
 
-    for note in notifications:
-        ev = _notification_to_event(note)
-        if ev is None:
-            continue
-        if ev["type"] == "delta":
-            text_chunks.append(ev["content"])
-        elif ev["type"] == "tool_call":
-            tool_calls.append({
-                "server": ev.get("server"),
-                "tool": ev.get("tool"),
-                "input": ev.get("input"),
-            })
-
-    content = "".join(text_chunks)
+    The streaming caller already drains notifications inline; we don't
+    re-process them here. This function exists to centralise turn_result
+    → result conversion (finish_reason, usage extraction, content
+    fallback, json_schema parsing) so streaming and non-streaming
+    paths produce identical shapes.
+    """
+    content = ""
     # Final stop_reason from the turn response if present
     finish_reason = "completed"
     usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
@@ -809,7 +894,7 @@ def _aggregate_result(
         "parsed": parsed,
         "usage": usage,
         "finish_reason": finish_reason,
-        "tool_calls": tool_calls,
+        "tool_calls": [],
         "cost_usd": None,  # See docs/INTEGRATION.md → "Cost tracking" for why.
         "error_type": None,
         "error_msg": None,
@@ -838,17 +923,29 @@ def _timeout_result(agent: str, run_id: str, elapsed: float) -> dict:
 def _error_result(
     agent: str, run_id: str, exc: Exception, elapsed: float,
     *, base_url: str | None = None,
+    error_type: str | None = None,
 ) -> dict:
     """Build an error result dict with a descriptive message.
 
     Some httpx exceptions (notably ReadTimeout) have an empty str(exc).
-    We always include the URL + elapsed time in the message so consumers
-    can tell *what* timed out without digging through logs.
+    We always include a sandbox locator + elapsed time so consumers can
+    tell *what* timed out without digging through logs — symbolic
+    `sandbox=local|remote` rather than the literal URL, since the URL is
+    internal topology that shouldn't appear in error payloads visible to
+    remote callers.
+
+    `error_type` lets callers preserve a previously-classified type
+    (e.g. one already derived from a streamed `error` event inside the
+    producer). Without that override we'd re-classify a generic wrapper
+    exception and lose the original taxonomy, leaking `RuntimeError` /
+    `ReadTimeout` etc. to consumers instead of the documented vocabulary.
     """
-    msg = str(exc) or type(exc).__name__
+    msg = _scrub_sandbox_url(str(exc) or type(exc).__name__, base_url)
     parts = [msg]
     if base_url:
-        parts.append(f"url={base_url}")
+        parts.append(
+            "sandbox=" + ("local" if _is_local_url(base_url) else "remote"),
+        )
     parts.append(f"elapsed={elapsed:.1f}s")
     return {
         "kind": "agent",
@@ -863,6 +960,6 @@ def _error_result(
         "finish_reason": "error",
         "tool_calls": [],
         "cost_usd": None,
-        "error_type": classify_error(exc),
+        "error_type": error_type or classify_error(exc),
         "error_msg": " | ".join(parts),
     }

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/schedule.schema.json",
+  "title": "Schedule",
+  "description": "A persisted schedule. Returned by /v1/schedules endpoints.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "name", "task"],
+  "properties": {
+    "id":               { "type": "string" },
+    "name":             { "type": "string" },
+    "task": {
+      "type": "object",
+      "description": "Task dict to dispatch when the schedule fires. Shape mirrors a primitive's request body plus {kind: 'complete'|'embed'|'agent', name: str}."
+    },
+    "interval_seconds": {
+      "type": ["integer", "null"],
+      "description": "Recurring fire interval. Mutually exclusive with at_iso."
+    },
+    "at_iso": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "One-shot trigger time. Mutually exclusive with interval_seconds."
+    },
+    "webhook_url": {
+      "type": ["string", "null"],
+      "description": "Optional callback URL. Each fire enqueues a durable POST with {schedule_id, run_id, result}."
+    },
+    "next_run_at":   { "type": ["string", "null"], "format": "date-time" },
+    "last_run_at":   { "type": ["string", "null"], "format": "date-time" },
+    "created_at":    { "type": ["string", "null"], "format": "date-time" }
+  }
+}

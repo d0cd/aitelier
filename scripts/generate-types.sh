@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Regenerate types from JSON schemas for both SDKs.
-# Python: datamodel-code-generator (JSON Schema → Pydantic)
-# TypeScript: json-schema-to-typescript
+# Regenerate Python models from JSON schemas.
+#
+# TypeScript types live at `sdks/typescript/src/types.ts` and are
+# hand-maintained — the wire is snake_case but the SDK exposes camelCase
+# (idiomatic JS), which `json-schema-to-typescript` can't produce
+# directly. When a schema gains a field, update `types.ts` by hand.
 
 set -euo pipefail
 
@@ -30,21 +33,6 @@ if [ -n "$DMC" ]; then
     echo "Python models generated."
 else
     echo "Warning: datamodel-codegen not found. Install with: uv sync (dev deps)"
-fi
-
-echo ""
-echo "=== Generating TypeScript types ==="
-if command -v json2ts &>/dev/null; then
-    output_file="$REPO_ROOT/sdks/typescript/src/_generated/types.ts"
-    echo '/* Generated from schemas/v1/ — do not hand-edit. */' > "$output_file"
-    echo '' >> "$output_file"
-    for schema in "$SCHEMA_DIR"/*.schema.json; do
-        json2ts "$schema" >> "$output_file"
-        echo '' >> "$output_file"
-    done
-    echo "TypeScript types generated."
-else
-    echo "Warning: json2ts not found. Install with: pnpm add -g json-schema-to-typescript"
 fi
 
 echo ""

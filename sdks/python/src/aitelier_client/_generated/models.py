@@ -1,6 +1,10 @@
 """Generated models from schemas/v1/ — do not hand-edit.
 
 To regenerate: ./scripts/generate-types.sh
+
+These cover the aitelier *control plane* — Run, RunEvent, Schedule, Discovery,
+Traces, ActiveRuns, CancelAck. Inference shapes (ChatCompletion, Embedding,
+Model) are OpenAI's; consume them via the `openai` package.
 """
 
 from __future__ import annotations
@@ -8,90 +12,6 @@ from __future__ import annotations
 from typing import Any
 
 from pydantic import BaseModel
-
-
-class Message(BaseModel):
-    role: str  # "user" | "assistant"
-    content: str
-
-
-class McpServer(BaseModel):
-    name: str
-    transport: str  # "http" | "stdio"
-    url: str | None = None
-    command: str | None = None
-    args: list[str] | None = None
-
-
-class TaskSpec(BaseModel):
-    """Specification for an aitelier task."""
-    name: str
-    kind: str  # "complete" | "embed" | "agent"
-    model: str | None = None
-    system_prompt: str | None = None
-    messages: list[Message] | None = None
-    prompt: str | None = None
-    temperature: float | None = None
-    max_tokens: int | None = None
-    response_format: dict | None = None
-    texts: list[str] | None = None
-    mcp_servers: list[McpServer] | None = None
-    tool_allowlist: list[str] | None = None
-    max_turns: int | None = None
-    workspace: str | None = None
-    workspace_mode: str = "copy"
-    preferred_providers: list[str] | None = None
-    timeout: int | None = None
-    trace_tag: str | None = None
-    metadata: dict[str, Any] | None = None
-
-
-class Usage(BaseModel):
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-
-
-class ToolCall(BaseModel):
-    server: str | None = None
-    tool: str | None = None
-    input: Any = None
-    output: Any = None
-    elapsed_ms: float | None = None
-
-
-class Result(BaseModel):
-    """Result of an aitelier operation."""
-    kind: str
-    provider: str
-    status: str
-    duration_s: float
-    run_id: str
-    trace_id: str | None = None
-    content: str | None = None
-    parsed: Any = None
-    usage: Usage | None = None
-    finish_reason: str | None = None
-    cost_usd: float | None = None
-    embeddings: list[list[float]] | None = None
-    dimensions: int | None = None
-    tool_calls: list[ToolCall] | None = None
-    session_id: str | None = None
-    files_changed: list[str] | None = None
-    error_type: str | None = None
-    error_msg: str | None = None
-
-    # Legacy compat
-    text: str | None = None
-
-
-class Event(BaseModel):
-    """Streaming event from a task execution."""
-    type: str
-    timestamp: str
-    run_id: str | None = None
-    provider: str | None = None
-    data: dict[str, Any] | None = None
 
 
 class TraceRecord(BaseModel):
@@ -165,29 +85,75 @@ class ActiveRuns(BaseModel):
     active: list[str]
 
 
-class CompleteStreamDelta(BaseModel):
-    type: str  # always "delta"
-    content: str
-    correlation_id: str
-
-
-class CompleteStreamDone(BaseModel):
-    type: str  # always "done"
-    content: str
-    usage: Usage
-    finish_reason: str
-    cost_usd: float | None = None
+class Run(BaseModel):
+    """A row from the durable runs table (GET /v1/runs, GET /v1/runs/{id})."""
+    run_id: str
+    state: str  # pending | running | completed | failed | cancelled | orphaned
+    kind: str
     trace_id: str | None = None
-    run_id: str | None = None
-    correlation_id: str
+    agent_id: str | None = None
+    model: str | None = None
+    started_at: str | None = None
+    ended_at: str | None = None
+    trace_tag: str | None = None
+    correlation_id: str | None = None
+    sandbox_backend: str | None = None
+    sandbox_url: str | None = None
+    sandbox_server_id: str | None = None
+    workspace: str | None = None
+    environment: dict[str, Any] = {}
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float | None = None
+    finish_reason: str | None = None
+    tool_call_count: int = 0
+    status: str | None = None
+    error_type: str | None = None
+    error_msg: str | None = None
+    metadata: dict[str, Any] = {}
 
 
-class CompleteStreamError(BaseModel):
-    type: str  # always "error"
-    error_type: str
-    error_msg: str
-    correlation_id: str
+class RunEvent(BaseModel):
+    """One row from the append-only run_events table."""
+    run_id: str
+    seq: int
+    kind: str
+    event_id: int | None = None
+    ts: str | None = None
+    payload: dict[str, Any] = {}
 
 
-# Tagged union: discriminate on `type` field.
-CompleteStreamEvent = CompleteStreamDelta | CompleteStreamDone | CompleteStreamError
+class Schedule(BaseModel):
+    """A persisted schedule entry."""
+    id: str
+    name: str
+    task: dict[str, Any]
+    interval_seconds: int | None = None
+    at_iso: str | None = None
+    webhook_url: str | None = None
+    next_run_at: str | None = None
+    last_run_at: str | None = None
+    created_at: str | None = None
+
+
+class TracesAggregateBucket(BaseModel):
+    key: str
+    count: int
+    total_tokens: int
+    cost_usd: float
+    error_count: int
+
+
+class TracesAggregateTotals(BaseModel):
+    count: int
+    total_tokens: int
+    cost_usd: float
+    error_count: int
+
+
+class TracesAggregate(BaseModel):
+    """Response from GET /v1/traces/aggregates."""
+    group_by: str
+    groups: list[TracesAggregateBucket]
+    total: TracesAggregateTotals

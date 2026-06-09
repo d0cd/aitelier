@@ -17,6 +17,9 @@ select = ["E", "F", "I", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["core/tests", "sdks/python/tests", "tests"]
+markers = [
+    "live: integration tests that require a running aitelier service (auto-skipped without AITELIER_LIVE_URL)",
+]
 
 [dependency-groups]
 dev = [

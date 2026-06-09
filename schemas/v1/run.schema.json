@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/run.schema.json",
+  "title": "Run",
+  "description": "A row from the durable runs table. Returned by GET /v1/runs and GET /v1/runs/{id} (with on-disk manifest details merged in).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "state", "kind"],
+  "properties": {
+    "run_id":            { "type": "string" },
+    "trace_id":          { "type": "string", "description": "Alias for run_id; preserved for legacy callers." },
+    "state": {
+      "type": "string",
+      "enum": ["pending", "running", "completed", "failed", "cancelled", "orphaned"],
+      "description": "Lifecycle state. `orphaned` = the row was running when a prior aitelier process exited; Sandbox Agent has no resume API yet, so it's terminal."
+    },
+    "kind":              { "type": "string", "enum": ["complete", "embed", "agent"] },
+    "agent_id":          { "type": ["string", "null"], "description": "Agent backend name (claude, codex, ...) when kind=agent." },
+    "model":             { "type": ["string", "null"] },
+    "started_at":        { "type": ["string", "null"], "format": "date-time" },
+    "ended_at":          { "type": ["string", "null"], "format": "date-time" },
+    "trace_tag":         { "type": ["string", "null"] },
+    "correlation_id":    { "type": ["string", "null"] },
+    "sandbox_backend":   { "type": ["string", "null"], "description": "`local` if the SA URL is loopback, `remote` otherwise. Stamped at agent-call time." },
+    "sandbox_url":       { "type": ["string", "null"] },
+    "sandbox_server_id": { "type": ["string", "null"], "description": "ACP server_id this run was bound to. Future SA session-resume APIs can adopt it." },
+    "workspace":         { "type": ["string", "null"] },
+    "environment":       { "type": "object", "description": "Snapshot of mcp_servers + tool_allowlist at run time." },
+    "input_tokens":      { "type": "integer" },
+    "output_tokens":     { "type": "integer" },
+    "total_tokens":      { "type": "integer" },
+    "cost_usd":          { "type": ["number", "null"] },
+    "finish_reason":     { "type": ["string", "null"] },
+    "tool_call_count":   { "type": "integer" },
+    "status":            { "type": ["string", "null"], "enum": ["ok", "error", null] },
+    "error_type":        { "type": ["string", "null"] },
+    "error_msg":         { "type": ["string", "null"] },
+    "metadata":          { "type": "object" }
+  }
+}

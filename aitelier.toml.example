@@ -1,20 +1,40 @@
 # aitelier configuration
-# Copy to aitelier.toml (repo-local) or ~/.config/aitelier/config.toml (global)
-# Env vars override all values:
-#   LITELLM_BASE_URL, LITELLM_API_KEY,
-#   SANDBOX_AGENT_BASE_URL, SANDBOX_TOKEN
+# Copy to aitelier.toml (repo-local) or ~/.config/aitelier/config.toml (global).
+#
+# All configuration is TOML — aitelier reads ZERO env vars in app code.
+# Loading is layered (each layer overrides keys in the prior one):
+#
+#   1. Defaults (dataclass fields in core/src/aitelier/config.py)
+#   2. This file (or whatever --config points at)
+#   3. aitelier.secrets.toml next to this file (gitignored; for api_keys etc)
+#   4. runs/.session.toml (gitignored; written by scripts/start.sh for
+#      runtime-discovered values like the actual sandbox-agent port and the
+#      dev Postgres DSN; cleaned up by scripts/stop.sh)
+#
+# Per-invocation override: `aitelier --config /path/to/foo.toml <subcommand>`.
 
 runs_dir = "runs"
 
+[database]
+# Postgres DSN for durable run/event/schedule/webhook state.
+# Unset = InMemoryStore (dev only — no persistence across restarts).
+# `make start` writes the dev DSN into runs/.session.toml for you. Uncomment
+# below if you want it set in this checked-in file too.
+# url = "postgresql://aitelier:aitelier_local@localhost:5433/aitelier"
+
 [litellm]
 base_url = "http://localhost:4000"
-api_key = "sk-litellm-local"
+# Move api_key into aitelier.secrets.toml so it doesn't get checked in:
+#   [litellm]
+#   api_key = "sk-litellm-local"
 
 [sandbox_agent]
 # aitelier runs agents (claude-code, codex, etc.) through Rivet's sandbox-agent
-# binary. `make start` installs and supervises it on this URL.
+# binary. `make start` installs and supervises it locally and writes the
+# chosen port to runs/.session.toml. To run against a remote sandbox
+# (closed-laptop tolerance), set base_url here to the remote host and put
+# `token = "..."` in aitelier.secrets.toml.
 base_url = "http://localhost:2468"
-# token = "..."  # optional; defaults to --no-token for local
 
 [ollama]
 # Where Ollama runs. "host" assumes `ollama serve` is running on your machine
@@ -26,3 +46,14 @@ mode = "host"   # "host" | "docker"
 [service]
 host = "127.0.0.1"
 port = 7777
+log_format = "human"   # "json" for one-line-per-record aggregator-friendly logs
+# api_key + webhook_secret go in aitelier.secrets.toml:
+#   [service]
+#   api_key = "replace-me"        # enables hosted-mode Bearer auth on /v1/*
+#   webhook_secret = "..."        # HMAC signing for outbound webhooks
+
+[storage]
+# Cap on JSON-encoded run metadata size. Aitelier persists the whole dict as
+# JSONB in Postgres; without a bound, a buggy consumer can bloat the runs
+# table. 64 KB is well above typical use.
+max_metadata_bytes = 65536

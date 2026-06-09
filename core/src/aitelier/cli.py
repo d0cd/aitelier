@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import json
 import sys
 from pathlib import Path
@@ -12,46 +11,32 @@ from pathlib import Path
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="aitelier",
-        description="AI task toolkit — fan-out dispatch across providers",
+        description="aitelier — HTTP service for AI inference + agent delegation",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=None, metavar="PATH",
+        help="Path to aitelier.toml (default: ./aitelier.toml then ~/.config/aitelier/config.toml)",
     )
     sub = parser.add_subparsers(dest="command")
-
-    # Task execution (aitelier <task> ...)
-    run_parser = sub.add_parser("run", help="Run a named task")
-    run_parser.add_argument("task", help="Task name (audit, research, lint, implement, summarize)")
-    run_parser.add_argument("args", nargs="*", help="Task arguments (workspace path or content)")
-    run_parser.add_argument(
-        "--fanout", action="store_true",
-        help="Fan out across all preferred providers",
-    )
-    run_parser.add_argument("--providers", nargs="+", help="Override providers for fan-out")
-    run_parser.add_argument(
-        "--max-concurrent", type=int, default=4,
-        help="Max concurrent fan-out (default: 4)",
-    )
-    run_parser.add_argument("--timeout", type=int, help="Timeout in seconds")
-    run_parser.add_argument("--focus", default=None, help="Focus area (for audit/lint)")
-    run_parser.add_argument("--format", default=None, help="Output format (for summarize)")
-    run_parser.add_argument("--workspace-mode", choices=["copy", "in_place"], default="copy")
 
     # Serve
     serve_parser = sub.add_parser("serve", help="Start the HTTP service")
     serve_parser.add_argument("--port", type=int, default=7777, help="Port (default: 7777)")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Host (default: 127.0.0.1)")
 
-    # List tasks
-    sub.add_parser("list", help="List available tasks")
-
     # Show runs
     runs_parser = sub.add_parser("runs", help="Show recent run records")
     runs_parser.add_argument("--last", type=int, default=10, help="Number of runs to show")
 
-    # Compare
-    compare_parser = sub.add_parser("compare", help="Show fan-out comparison")
-    compare_parser.add_argument("run_id", help="Run ID to compare")
+    # Doctor (delegates to scripts/doctor.sh in the repo)
+    sub.add_parser("doctor", help="Run preflight diagnostics")
 
     # Status
-    sub.add_parser("status", help="Check service and infrastructure status")
+    status_parser = sub.add_parser("status", help="Check service and infrastructure status")
+    status_parser.add_argument(
+        "--all-models", action="store_true",
+        help="List every model the LiteLLM proxy reports (otherwise show curated aliases)",
+    )
 
     # Traces (list / show single)
     traces_parser = sub.add_parser("traces", help="Query the trace store")
@@ -69,86 +54,27 @@ def main(argv: list[str] | None = None) -> None:
 
     args = parser.parse_args(argv)
 
+    # Load config (with optional --config override) into the singleton before
+    # any subcommand runs. This is the only entry point that should ever set
+    # the config — every other call site reads via get_config().
+    if args.config is not None:
+        from aitelier.config import load_config, set_config
+        set_config(load_config(args.config))
+
     if args.command is None:
         parser.print_help()
         sys.exit(1)
 
-    if args.command == "run":
-        asyncio.run(_cmd_run(args))
-    elif args.command == "serve":
+    if args.command == "serve":
         _cmd_serve(args)
-    elif args.command == "list":
-        _cmd_list()
     elif args.command == "runs":
         _cmd_runs(args)
-    elif args.command == "compare":
-        _cmd_compare(args)
+    elif args.command == "doctor":
+        _cmd_doctor()
     elif args.command == "status":
-        _cmd_status()
+        _cmd_status(all_models=args.all_models)
     elif args.command == "traces":
         _cmd_traces(args)
-
-
-async def _cmd_run(args: argparse.Namespace) -> None:
-    from aitelier.observability import setup_langfuse
-
-    setup_langfuse()
-
-    # Build task spec from name + args
-    task = _build_task_spec(args)
-
-    if args.fanout:
-        from aitelier.fanout import fanout
-
-        providers = args.providers or task.get("preferred_providers")
-        results = await fanout(task, providers=providers, max_concurrent=args.max_concurrent)
-        for r in results:
-            _print_result(r)
-    else:
-        from aitelier.runner import execute
-
-        result = await execute(task)
-        _print_result(result)
-
-
-def _build_task_spec(args: argparse.Namespace) -> dict:
-    # Import task definitions
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-    from tasks import get_task
-
-    task_args = args.args or []
-    kwargs = {}
-
-    # Route positional args based on task type
-    if args.task in ("audit", "lint", "implement"):
-        if task_args:
-            kwargs["workspace"] = task_args[0]
-        else:
-            kwargs["workspace"] = "."
-        if args.task == "implement" and len(task_args) > 1:
-            kwargs["description"] = " ".join(task_args[1:])
-        elif args.task == "implement":
-            print("Error: implement requires a description", file=sys.stderr)
-            sys.exit(1)
-    elif args.task == "research":
-        kwargs["topic"] = " ".join(task_args) if task_args else "general"
-    elif args.task == "summarize":
-        kwargs["content"] = " ".join(task_args) if task_args else sys.stdin.read()
-
-    if args.focus and args.task in ("audit", "lint"):
-        kwargs["focus"] = args.focus
-    if args.format and args.task == "summarize":
-        kwargs["format"] = args.format
-    if hasattr(args, "workspace_mode") and args.task in ("audit", "lint", "implement"):
-        kwargs["workspace_mode"] = args.workspace_mode
-
-    task = get_task(args.task, **kwargs)
-
-    if args.timeout:
-        task["timeout"] = args.timeout
-
-    return task
 
 
 def _cmd_serve(args: argparse.Namespace) -> None:
@@ -162,19 +88,6 @@ def _cmd_serve(args: argparse.Namespace) -> None:
     port = args.port if args.port != 7777 else cfg.port
 
     uvicorn.run(app, host=host, port=port)
-
-
-def _cmd_list() -> None:
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-
-    from tasks import list_tasks
-
-    tasks = list_tasks()
-    if not tasks:
-        print("No tasks found.")
-        return
-    for name in tasks:
-        print(f"  {name}")
 
 
 def _cmd_runs(args: argparse.Namespace) -> None:
@@ -194,14 +107,6 @@ def _cmd_runs(args: argparse.Namespace) -> None:
             print(f"  {rd.name}  [{results_summary}]")
         else:
             print(f"  {rd.name}  [no manifest]")
-
-
-def _cmd_compare(args: argparse.Namespace) -> None:
-    compare_path = Path("runs") / args.run_id / "compare.md"
-    if not compare_path.exists():
-        print(f"No comparison found for run {args.run_id}", file=sys.stderr)
-        sys.exit(1)
-    print(compare_path.read_text())
 
 
 def _cmd_traces(args: argparse.Namespace) -> None:
@@ -262,7 +167,7 @@ def _cmd_traces(args: argparse.Namespace) -> None:
 
 
 def _run_to_dict(run) -> dict:
-    """Run dataclass → legacy trace-shaped dict (for CLI JSON output)."""
+    """Run dataclass → TraceRecord-shaped dict for CLI JSON output."""
     return {
         "trace_id": run.run_id,
         "started_at": run.started_at.isoformat() if run.started_at else None,
@@ -313,7 +218,31 @@ def _print_trace_detail(t: dict) -> None:
         print(f"metadata:           {md_str}")
 
 
-def _cmd_status() -> None:
+def _cmd_doctor() -> None:
+    """Run preflight diagnostics by execing scripts/doctor.sh.
+
+    Locates the script relative to the package source, which works for
+    editable installs (`uv tool install --editable ./core`). For non-editable
+    PyPI installs we'd need to ship doctor.sh as package data — TODO once
+    we publish.
+    """
+    import os
+
+    # core/src/aitelier/cli.py → repo root is parents[3]
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / "scripts" / "doctor.sh"
+    if not script.exists():
+        print(
+            f"doctor script not found at {script}.\n"
+            "This subcommand currently requires an editable install from a "
+            "checkout of the aitelier repo. PyPI install support is pending.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    os.execvp("bash", ["bash", str(script)])
+
+
+def _cmd_status(all_models: bool = False) -> None:
     import asyncio
     import shutil
 
@@ -328,13 +257,11 @@ def _cmd_status() -> None:
 
     # --- Services ---
     print("Services:")
-    # LiteLLM proxy
+    # LiteLLM proxy — use /health/liveness (no auth, no upstream-provider probe).
+    # /health is a deep check that hits every configured backend; an OpenAI 429
+    # would flip this to ✗ even though the proxy itself is fine.
     try:
-        resp = httpx.get(
-            f"{cfg.litellm.base_url}/health",
-            headers={"Authorization": f"Bearer {cfg.litellm.api_key}"},
-            timeout=3,
-        )
+        resp = httpx.get(f"{cfg.litellm.base_url}/health/liveness", timeout=3)
         if resp.status_code == 200:
             print(f"  ✓ LiteLLM proxy    {cfg.litellm.base_url}")
         else:
@@ -391,6 +318,10 @@ def _cmd_status() -> None:
         print("  - Codex OAuth      not logged in (optional)")
 
     # --- Models ---
+    # LiteLLM's /models reports every backend discovery returns — 200+ entries
+    # of OpenAI / Anthropic SKU noise. By default show the curated aliases
+    # that this repo's tasks/SDKs actually reference, plus pass-through
+    # markers. Use --all-models for the full dump.
     print("\nModels (via LiteLLM proxy):")
     try:
         resp = httpx.get(
@@ -400,11 +331,22 @@ def _cmd_status() -> None:
         )
         if resp.status_code == 200:
             data = resp.json()
-            models = [m.get("id", "?") for m in data.get("data", [])]
-            for m in sorted(models):
+            models = sorted(m.get("id", "?") for m in data.get("data", []))
+            if all_models:
+                shown = models
+            else:
+                # Curated aliases (the ones in CLAUDE.md "Available models").
+                aliases = {"local", "claude-sonnet", "claude-haiku", "nomic-embed-text"}
+                shown = [m for m in models if m in aliases]
+                # Plus pass-through wildcard markers, if registered.
+                shown += [m for m in models if m in {"anthropic/*", "openai/*", "ollama/*"}]
+            for m in shown:
                 print(f"  {m}")
-            if not models:
+            if not shown:
                 print("  (none)")
+            hidden = len(models) - len(shown)
+            if not all_models and hidden > 0:
+                print(f"  … {hidden} more (run `aitelier status --all-models` to list)")
         else:
             print(f"  (couldn't list — HTTP {resp.status_code})")
     except Exception:
@@ -429,26 +371,10 @@ def _cmd_status() -> None:
         print("  (no trace store)")
 
     # --- Config ---
-    print(f"\nConfig: {cfg.runs_dir}/")
-
-
-def _print_result(result: dict) -> None:
-    status = result["status"]
-    provider = result["provider"]
-    duration = result["duration_s"]
-    cost = result.get("cost_usd")
-
-    header = f"[{provider}] {status} ({duration}s"
-    if cost is not None:
-        header += f", ${cost:.4f}"
-    header += ")"
-    print(header)
-
-    if status == "error":
-        print(f"  Error: {result.get('error_type')}: {result.get('error_msg')}")
-    else:
-        print(result.get("text", ""))
-    print()
+    print("\nConfig:")
+    print(f"  runs_dir            {cfg.runs_dir}")
+    print(f"  database.url        {cfg.database.url or '(unset — InMemoryStore)'}")
+    print(f"  sandbox_agent       {cfg.sandbox_agent.base_url}")
 
 
 if __name__ == "__main__":
