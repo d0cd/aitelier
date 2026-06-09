@@ -14,8 +14,7 @@ FROM alpine:3.20
 
 RUN apk add --no-cache curl bash ca-certificates nodejs npm git \
  && curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | bash \
- && cp "$(command -v sandbox-agent || echo /root/.local/bin/sandbox-agent)" /usr/local/bin/sandbox-agent \
- && chmod +x /usr/local/bin/sandbox-agent
+ && sandbox-agent --version
 
 # Credentials get mounted in by docker-compose, not baked in. SA reads
 # ~/.claude/.credentials.json and ~/.codex/auth.json at agent dispatch.
