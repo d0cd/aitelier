@@ -1658,6 +1658,90 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
             _active_runs.pop(f"saturating-run-{i}", None)
 
 
+def test_chat_completions_records_parent_run_id_on_agent_path(
+    client, monkeypatch,
+):
+    """The `aitelier.parent_run_id` field flows from request → RunSpec
+    → run row → /v1/runs filter. No FK / no cycle check — just a
+    pass-through pointer the consumer can later query by."""
+    import asyncio
+
+    from aitelier.storage import RunFilter, get_store
+
+    async def fake_call(name, prompt, **kw):
+        return {
+            "kind": "agent", "provider": name, "status": "ok",
+            "duration_s": 0.1, "run_id": kw.get("run_id", ""),
+            "trace_id": kw.get("run_id", ""),
+            "content": "ok",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            "finish_reason": "completed", "tool_calls": [],
+            "cost_usd": None, "error_type": None, "error_msg": None,
+        }
+
+    monkeypatch.setattr(
+        "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
+    )
+    resp = client.post("/v1/chat/completions", json={
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "child task"}],
+        "aitelier": {"parent_run_id": "parent-xyz",
+                      "trace_tag": "workflow-1"},
+    })
+    assert resp.status_code == 200, resp.text
+    run_id = resp.json()["aitelier_run_id"]
+
+    async def _check():
+        store = await get_store()
+        run = await store.get_run(run_id)
+        assert run.parent_run_id == "parent-xyz"
+        children = await store.list_runs(RunFilter(parent_run_id="parent-xyz"))
+        assert any(r.run_id == run_id for r in children)
+    asyncio.new_event_loop().run_until_complete(_check())
+
+
+def test_v1_runs_filter_by_parent_run_id(client, monkeypatch):
+    """/v1/runs?parent_run_id=X surfaces children to consumers building
+    multi-agent workflow visualizations."""
+    import asyncio
+
+    from aitelier.storage import RunSpec, get_store
+
+    async def seed():
+        store = await get_store()
+        await store.create_run(RunSpec(run_id="parent", kind="agent"))
+        for i in range(3):
+            await store.create_run(RunSpec(
+                run_id=f"child-{i}", kind="agent", parent_run_id="parent",
+            ))
+        await store.create_run(RunSpec(run_id="unrelated", kind="agent"))
+    asyncio.new_event_loop().run_until_complete(seed())
+
+    resp = client.get("/v1/runs?parent_run_id=parent&limit=10")
+    assert resp.status_code == 200
+    ids = sorted(r["run_id"] for r in resp.json())
+    assert ids == ["child-0", "child-1", "child-2"]
+
+
+def test_v1_runs_response_includes_parent_run_id(client, monkeypatch):
+    """GET /v1/runs/{id} echoes `parent_run_id` so consumers building
+    trees can reconstruct edges from a leaf upward."""
+    import asyncio
+
+    from aitelier.storage import RunSpec, get_store
+
+    async def seed():
+        store = await get_store()
+        await store.create_run(RunSpec(
+            run_id="leaf", kind="agent", parent_run_id="root",
+        ))
+    asyncio.new_event_loop().run_until_complete(seed())
+
+    resp = client.get("/v1/runs/leaf")
+    assert resp.status_code == 200
+    assert resp.json()["parent_run_id"] == "root"
+
+
 def test_chat_completions_rejects_unknown_aitelier_field(client):
     """`aitelier_request.schema.json` is `additionalProperties: false`.
     The Pydantic model must enforce that at the wire so consumers

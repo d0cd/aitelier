@@ -97,6 +97,7 @@ class Run(BaseModel):
     ended_at: str | None = None
     trace_tag: str | None = None
     correlation_id: str | None = None
+    parent_run_id: str | None = None
     sandbox_backend: str | None = None
     sandbox_url: str | None = None
     sandbox_server_id: str | None = None

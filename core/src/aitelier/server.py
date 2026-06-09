@@ -735,6 +735,7 @@ async def _agent_chat_completion(
         run_id=run_id, kind="agent",
         agent_id=agent_backend, model=inner_llm,
         trace_tag=opts.trace_tag, correlation_id=cid,
+        parent_run_id=opts.parent_run_id,
         workspace=opts.workspace,
         environment={
             "mcp_servers": opts.mcp_servers or [],
@@ -968,6 +969,7 @@ async def _agent_chat_completion_stream(
         run_id=run_id, kind="agent",
         agent_id=agent_backend, model=inner_llm,
         trace_tag=opts.trace_tag, correlation_id=cid,
+        parent_run_id=opts.parent_run_id,
         workspace=opts.workspace,
         environment={
             "mcp_servers": opts.mcp_servers or [],
@@ -1600,7 +1602,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
 _TRACE_RECORD_KEYS = frozenset({
     "trace_id", "started_at", "ended_at", "model", "kind", "finish_reason",
     "tool_call_count", "input_tokens", "output_tokens", "total_tokens",
-    "cost_usd", "system_prompt_hash", "trace_tag", "status",
+    "cost_usd", "system_prompt_hash", "trace_tag", "parent_run_id", "status",
     "error_type", "error_msg", "metadata",
 })
 
@@ -1623,6 +1625,7 @@ def _run_to_dict(run) -> dict:
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
         "trace_tag": run.trace_tag,
         "correlation_id": run.correlation_id,
+        "parent_run_id": run.parent_run_id,
         "sandbox_backend": run.sandbox_backend,
         "sandbox_url": run.sandbox_url,
         "sandbox_server_id": run.sandbox_server_id,
@@ -1657,13 +1660,21 @@ def _run_to_trace_dict(run) -> dict:
 async def traces_endpoint(
     since: str | None = None,
     trace_tag: str | None = None,
+    parent_run_id: str | None = None,
     status: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
-    """Query recent runs as TraceRecord summaries (counts, tokens, cost)."""
+    """Query recent runs as TraceRecord summaries (counts, tokens, cost).
+
+    `parent_run_id` narrows to children of a specific parent — useful
+    for rendering a multi-agent workflow's subtree as a flat trace list.
+    """
     store = await get_store()
     since_dt = datetime.fromisoformat(since) if since else None
-    flt = RunFilter(trace_tag=trace_tag, since=since_dt, limit=limit)
+    flt = RunFilter(
+        trace_tag=trace_tag, parent_run_id=parent_run_id,
+        since=since_dt, limit=limit,
+    )
     runs = await store.list_runs(flt)
     if status:
         runs = [r for r in runs if r.status == status]
@@ -1729,18 +1740,22 @@ async def list_runs_endpoint(
     agent_id: str | None = None,
     trace_tag: str | None = None,
     correlation_id: str | None = None,
+    parent_run_id: str | None = None,
     since: str | None = None,
     limit: int = 50,
 ) -> list[dict]:
     """List runs from the durable store with optional filters.
 
     `state` ∈ {pending, running, completed, failed, cancelled, orphaned}.
+    `parent_run_id` filters to children of a specific parent — the
+    primary way to reconstruct a multi-agent workflow's tree.
     """
     store = await get_store()
     since_dt = datetime.fromisoformat(since) if since else None
     runs = await store.list_runs(RunFilter(
         state=state, kind=kind, agent_id=agent_id,
         trace_tag=trace_tag, correlation_id=correlation_id,
+        parent_run_id=parent_run_id,
         since=since_dt, limit=limit,
     ))
     return [_run_to_dict(r) for r in runs]

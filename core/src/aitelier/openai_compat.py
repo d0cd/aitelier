@@ -48,6 +48,11 @@ class AitelierAgentOpts(BaseModel):
     prepare: dict | None = None
     artifacts: dict | None = None
     trace_tag: str | None = None
+    parent_run_id: str | None = None
+    """Optional pointer to a parent run for multi-agent workflows. Pure
+    pass-through — recorded on the child's run row and queryable via
+    `/v1/runs?parent_run_id=X`, but aitelier enforces no semantics. Use
+    with `trace_tag` to group a whole workflow's runs."""
     examples: list[dict] | None = Field(default=None, max_length=100)
     # Escape hatch for transports that emit OpenAI `tools` per a global
     # toolset config and can't suppress it per-profile. Default stays

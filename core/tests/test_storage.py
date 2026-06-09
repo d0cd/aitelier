@@ -189,6 +189,31 @@ async def test_record_run_marks_unexpected_exception_as_error(_fresh_store):
 
 
 @pytest.mark.asyncio
+async def test_parent_run_id_round_trip(store):
+    """The passthrough field survives create → get → list-filter without
+    aitelier imposing any semantics (no FK, no cycle check)."""
+    await store.create_run(RunSpec(run_id="p", kind="agent"))
+    await store.create_run(RunSpec(run_id="c1", kind="agent", parent_run_id="p"))
+    await store.create_run(RunSpec(run_id="c2", kind="agent", parent_run_id="p"))
+    await store.create_run(RunSpec(run_id="other", kind="agent"))
+
+    p = await store.get_run("p")
+    c1 = await store.get_run("c1")
+    assert p.parent_run_id is None
+    assert c1.parent_run_id == "p"
+
+    children = await store.list_runs(RunFilter(parent_run_id="p"))
+    ids = sorted(r.run_id for r in children)
+    assert ids == ["c1", "c2"]
+
+    # No FK constraint: child can point at a parent that doesn't exist.
+    await store.create_run(RunSpec(
+        run_id="orphan", kind="agent", parent_run_id="ghost",
+    ))
+    assert (await store.get_run("orphan")).parent_run_id == "ghost"
+
+
+@pytest.mark.asyncio
 async def test_list_runs_filters(store):
     for i in range(3):
         await store.create_run(RunSpec(run_id=f"r-{i}", kind="agent", trace_tag="A"))

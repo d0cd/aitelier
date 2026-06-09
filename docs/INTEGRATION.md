@@ -657,6 +657,124 @@ dependencies.sandbox_agent.agents`. Typical list:
 Use `model: "agent:<backend>"` to route to one. Optional inner-LLM override:
 `model: "agent:<backend>/<inner-llm>"`.
 
+## Multi-agent workflows
+
+Aitelier is the execution backend. It exposes the primitives a
+multi-agent system needs — sandboxed agent runs, async submission,
+cancellation, observability, idempotency, correlation — without
+imposing a workflow shape. The patterns below show how the mechanism
+composes; pick whichever fits your orchestrator.
+
+### Approach 1: agent dispatches subagents via HTTP loopback
+
+The parent agent calls aitelier's HTTP API directly (claude-code has
+`Bash` + `curl`; codex has `commandExecution`). The agent submits a
+child run, gets the `run_id` back, and either polls or registers a
+webhook for completion.
+
+```bash
+# Inside the parent agent's sandbox:
+curl -s -X POST http://localhost:7777/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "agent:codex",
+    "messages": [{"role": "user", "content": "Audit deps in /workspace/pkg.json"}],
+    "aitelier": {
+      "parent_run_id":  "'"$AITELIER_RUN_ID"'",
+      "trace_tag":      "deps-audit-2026-05",
+      "workspace":      "/workspace"
+    }
+  }'
+```
+
+In a Brig-cell deployment, replace `localhost:7777` with
+`http://aitelier.host.brig/v1`. For local dev where you need
+loopback webhook callbacks, set `[service] allow_loopback_webhooks = true`.
+
+### Approach 2: agent loads `aitelier-mcp` as an MCP server
+
+`aitelier-mcp` is a small MCP server (separate package, sibling of
+`aitelier-client`) that exposes the control plane as typed MCP tools:
+`submit_run`, `get_run`, `list_runs`, `list_run_events`, `cancel_run`.
+The inner agent uses its MCP-tool channel (both `claude` and `codex`
+advertise `mcpTools: true`) rather than hand-rolling HTTP.
+
+```jsonc
+{
+  "model": "agent:claude",
+  "messages": [{"role": "user", "content": "Run audit + lint in parallel; summarize."}],
+  "aitelier": {
+    "mcp_servers": [
+      {
+        "name": "aitelier",
+        "transport": "stdio",
+        "command": "aitelier-mcp"
+      }
+    ]
+  }
+}
+```
+
+The agent's tool-use loop now sees `submit_run`, `list_runs`, etc.
+alongside its other tools. Whatever orchestration pattern the agent
+runs — fan-out + merge, sequential handoff, retry-on-failure — happens
+inside the inner agent's reasoning; aitelier just executes each
+submitted run.
+
+### Recovering a workflow's tree
+
+Use `parent_run_id` (and optionally `trace_tag`) to reconstruct
+lineage after the fact:
+
+```bash
+# All children of one orchestrator run:
+curl 'http://localhost:7777/v1/runs?parent_run_id=orchestrator-run-id'
+
+# All runs in a workflow, with token + cost rollups:
+curl 'http://localhost:7777/v1/traces?trace_tag=deps-audit-2026-05'
+
+# Aggregate by status:
+curl 'http://localhost:7777/v1/traces/aggregates?group_by=status&trace_tag=deps-audit-2026-05'
+```
+
+`parent_run_id` is a pure pass-through field: aitelier records it but
+doesn't enforce hierarchy semantics (no FK, no cycle check, no cascade
+cancellation). The orchestrator above aitelier owns the meaning. Pair
+with `trace_tag` so a whole workflow's runs (including children of
+children) share one queryable handle.
+
+### What aitelier does *not* do
+
+- **No built-in fanout primitive** (`parallel: [...]` in the request).
+  Picks a workflow shape. Use `asyncio.gather` / `Promise.all` /
+  whatever your orchestrator gives you.
+- **No coordinator agent type**. There's no `agent:orchestrator`
+  privileged backend.
+- **No graph DSL / DAG runner**. Workflow shape lives in your
+  orchestrator (LangGraph, Crew, Mastra, or hand-rolled).
+- **No automatic parent→child cancellation propagation**. `POST /v1/runs/{id}/cancel`
+  is per-run. Whether cancelling a parent should also cancel children
+  is a consumer policy — query `list_runs(parent_run_id=parent)`,
+  iterate, cancel each.
+- **No "share inner-agent context across calls"**. ACP sessions are
+  per-call by design. To pass state from a parent agent's reasoning
+  to a child, marshal it into the child's `messages`.
+
+### Visibility limit: subagents *inside* claude-code
+
+Claude Code's `.claude/agents/*.md` subagent mechanism dispatches
+**inside** the inner agent process. To aitelier (one rung up at the
+ACP layer), the entire parent + subagent sequence looks like one
+long turn: subagent identity, prompt, and per-subagent token cost
+are merged into the outer run's row. If a parent claude run fires
+three subagents internally, you'll see one aitelier run with merged
+tokens — not four runs with parent_run_id edges.
+
+To make subagent dispatch visible to aitelier, the parent must
+submit each child as its own aitelier run (Approach 1 or 2). Then
+`parent_run_id` records the edge and `/v1/traces?parent_run_id=X`
+recovers the subtree.
+
 ## Webhooks
 
 Async run completions and scheduled jobs route through a durable webhook

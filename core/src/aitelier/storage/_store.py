@@ -150,16 +150,16 @@ class PostgresStore:
                 """
                 INSERT INTO runs (
                     run_id, state, kind, agent_id, model,
-                    trace_tag, correlation_id,
+                    trace_tag, correlation_id, parent_run_id,
                     sandbox_backend, sandbox_url, sandbox_server_id, workspace,
                     environment_json, system_prompt_hash, metadata_json
                 )
-                VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                        $11::jsonb, $12, $13::jsonb)
+                VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                        $12::jsonb, $13, $14::jsonb)
                 RETURNING *
                 """,
                 spec.run_id, spec.kind, spec.agent_id, spec.model,
-                spec.trace_tag, spec.correlation_id,
+                spec.trace_tag, spec.correlation_id, spec.parent_run_id,
                 spec.sandbox_backend, spec.sandbox_url, spec.sandbox_server_id, spec.workspace,
                 json.dumps(spec.environment), spec.system_prompt_hash,
                 json.dumps(spec.metadata),
@@ -189,6 +189,8 @@ class PostgresStore:
             add(flt.trace_tag, "trace_tag = ${idx}")
         if flt.correlation_id:
             add(flt.correlation_id, "correlation_id = ${idx}")
+        if flt.parent_run_id:
+            add(flt.parent_run_id, "parent_run_id = ${idx}")
         if flt.since:
             add(flt.since, "started_at >= ${idx}")
         if flt.until:
@@ -573,6 +575,7 @@ class InMemoryStore:
             started_at=datetime.now(UTC),
             agent_id=spec.agent_id, model=spec.model,
             trace_tag=spec.trace_tag, correlation_id=spec.correlation_id,
+            parent_run_id=spec.parent_run_id,
             sandbox_backend=spec.sandbox_backend, sandbox_url=spec.sandbox_url,
             sandbox_server_id=spec.sandbox_server_id, workspace=spec.workspace,
             environment=spec.environment,
@@ -597,6 +600,8 @@ class InMemoryStore:
             if flt.trace_tag and r.trace_tag != flt.trace_tag:
                 return False
             if flt.correlation_id and r.correlation_id != flt.correlation_id:
+                return False
+            if flt.parent_run_id and r.parent_run_id != flt.parent_run_id:
                 return False
             if flt.since and r.started_at < flt.since:
                 return False
@@ -885,11 +890,20 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _row_to_run(row: Any) -> Run:
+    # `parent_run_id` is read defensively: old Postgres rows from before
+    # migration 003 don't have the column. asyncpg raises KeyError on
+    # missing columns; we treat that as None so the runtime stays
+    # backward-compatible across rolling upgrades.
+    try:
+        parent_run_id = row["parent_run_id"]
+    except (KeyError, IndexError):
+        parent_run_id = None
     return Run(
         run_id=row["run_id"], state=row["state"], kind=row["kind"],
         started_at=row["started_at"], ended_at=row["ended_at"],
         agent_id=row["agent_id"], model=row["model"],
         trace_tag=row["trace_tag"], correlation_id=row["correlation_id"],
+        parent_run_id=parent_run_id,
         sandbox_backend=row["sandbox_backend"],
         sandbox_url=row["sandbox_url"],
         sandbox_server_id=row["sandbox_server_id"],

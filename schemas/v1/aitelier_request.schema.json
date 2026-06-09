@@ -92,6 +92,10 @@
       "type": ["string", "null"],
       "description": "Free-form tag stamped on the run row. Query via `/v1/runs?trace_tag=...`."
     },
+    "parent_run_id": {
+      "type": ["string", "null"],
+      "description": "Optional pointer to a parent run for multi-agent workflows. Pure pass-through: recorded on this child's row, queryable via `/v1/runs?parent_run_id=X`. Aitelier enforces no semantics (no FK, no cycle check, no cascade). Orchestrators above aitelier own the meaning."
+    },
     "examples": {
       "type": ["array", "null"],
       "maxItems": 100,

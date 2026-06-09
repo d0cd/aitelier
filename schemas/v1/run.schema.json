@@ -21,6 +21,7 @@
     "ended_at":          { "type": ["string", "null"], "format": "date-time" },
     "trace_tag":         { "type": ["string", "null"] },
     "correlation_id":    { "type": ["string", "null"] },
+    "parent_run_id":     { "type": ["string", "null"], "description": "Optional pointer to a parent run for multi-agent workflows. Pure pass-through: aitelier records it and lets consumers query `/v1/runs?parent_run_id=X`, but enforces no semantics (no FK, no cycle check, no cascade). Orchestrators above aitelier own the meaning." },
     "sandbox_backend":   { "type": ["string", "null"], "description": "`local` if the SA URL is loopback, `remote` otherwise. Stamped at agent-call time." },
     "sandbox_url":       { "type": ["string", "null"] },
     "sandbox_server_id": { "type": ["string", "null"], "description": "ACP server_id this run was bound to. Future SA session-resume APIs can adopt it." },
@@ -32,7 +33,7 @@
     "cost_usd":          { "type": ["number", "null"] },
     "finish_reason":     { "type": ["string", "null"] },
     "tool_call_count":   { "type": "integer" },
-    "status":            { "type": ["string", "null"], "enum": ["ok", "error", null] },
+    "status":            { "type": ["string", "null"], "enum": ["ok", "error", "cancelled", null] },
     "error_type":        { "type": ["string", "null"] },
     "error_msg":         { "type": ["string", "null"] },
     "metadata":          { "type": "object" }

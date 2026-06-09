@@ -64,6 +64,13 @@ class RunSpec:
     model: str | None = None
     trace_tag: str | None = None
     correlation_id: str | None = None
+    parent_run_id: str | None = None
+    """Optional pointer to a parent run for multi-agent workflows.
+
+    Pure pass-through — aitelier records the value and lets consumers
+    query `/v1/runs?parent_run_id=X` to reconstruct hierarchies, but
+    imposes no semantics: no FK, no cycle check, no cascade. The
+    consumer (or the orchestrator above aitelier) owns the meaning."""
     sandbox_backend: str | None = None     # local | remote
     sandbox_url: str | None = None
     sandbox_server_id: str | None = None
@@ -98,6 +105,7 @@ class Run:
     model: str | None = None
     trace_tag: str | None = None
     correlation_id: str | None = None
+    parent_run_id: str | None = None
     sandbox_backend: str | None = None
     sandbox_url: str | None = None
     sandbox_server_id: str | None = None
@@ -124,6 +132,7 @@ class RunFilter:
     agent_id: str | None = None
     trace_tag: str | None = None
     correlation_id: str | None = None
+    parent_run_id: str | None = None
     since: datetime | None = None
     until: datetime | None = None
     limit: int = 50

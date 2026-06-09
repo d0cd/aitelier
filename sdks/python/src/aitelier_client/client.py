@@ -176,6 +176,7 @@ class Aitelier:
         trace_tag: str | None = None,
         state: str | None = None,
         correlation_id: str | None = None,
+        parent_run_id: str | None = None,
         limit: int = 50,
     ) -> list[Run]:
         params: dict[str, Any] = {"limit": limit}
@@ -185,6 +186,8 @@ class Aitelier:
             params["state"] = state
         if correlation_id is not None:
             params["correlation_id"] = correlation_id
+        if parent_run_id is not None:
+            params["parent_run_id"] = parent_run_id
         resp = await self._ensure_client().get("/v1/runs", params=params)
         resp.raise_for_status()
         return [Run(**r) for r in resp.json()]
