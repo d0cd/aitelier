@@ -281,6 +281,146 @@ def test_schedules_redacts_headers_and_env_on_get(client):
         client.delete(f"/v1/schedules/{sid}")
 
 
+def test_redact_secrets_strips_metadata_and_result_on_run_to_dict():
+    """`metadata` and `result` carry consumer-written values that may
+    include secrets (a webhook_url with credentials, a captured stderr
+    containing a token). Both must be redacted in the projection."""
+    from aitelier.server import _run_to_dict
+
+    class _R:
+        run_id = "r-1"
+        state = "completed"
+        kind = "agent"
+        agent_id = None
+        model = None
+        started_at = None
+        ended_at = None
+        trace_tag = None
+        correlation_id = None
+        parent_run_id = None
+        sandbox_backend = None
+        sandbox_url = None
+        sandbox_server_id = None
+        workspace = None
+        environment = {}
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        cost_usd = None
+        finish_reason = None
+        tool_call_count = 0
+        system_prompt_hash = None
+        status = "ok"
+        error_type = None
+        error_msg = None
+        result = {"content": "ok", "authorization": "Bearer SECRET"}
+        metadata = {
+            "headers": [{"name": "X-Forwarded", "value": "token"}],
+            "webhook_url": "https://hooks.example.com/X",
+        }
+
+    out = _run_to_dict(_R())
+    assert out["result"]["authorization"] == "[redacted]"
+    assert out["metadata"]["headers"] == ["[redacted]"]
+    # Non-secret fields stay intact.
+    assert out["result"]["content"] == "ok"
+    assert out["metadata"]["webhook_url"] == "https://hooks.example.com/X"
+
+
+def test_event_to_dict_redacts_tool_call_payloads():
+    """Agent run_events.payload from `tool_call` carries the raw `input`
+    arguments and `tool_result.output` content — both can leak secrets
+    if the user passed them through the agent."""
+    from aitelier.server import _event_to_dict
+    from aitelier.storage.models import RunEvent
+    ev = RunEvent(
+        run_id="r-1", seq=1, kind="tool_call",
+        payload={
+            "server": "x", "tool": "shell",
+            "input": {"cmd": "echo", "env": [
+                {"name": "DB_URL", "value": "postgres://secret@db"},
+            ]},
+        },
+    )
+    out = _event_to_dict(ev)
+    assert out["payload"]["input"]["env"] == ["[redacted]"]
+    assert out["payload"]["tool"] == "shell"
+
+
+def test_traces_endpoint_rejects_oversized_limit(client):
+    """limit > 500 must 422 at the route layer (Query(..., le=500))."""
+    resp = client.get("/v1/traces?limit=10000")
+    assert resp.status_code == 422
+
+
+def test_runs_events_endpoint_caps_limit(client):
+    """/v1/runs/{id}/events caps at 5000."""
+    resp = client.get("/v1/runs/anything/events?limit=99999")
+    assert resp.status_code == 422
+
+
+def test_get_trace_endpoint_validates_path_component(client):
+    """trace_id charset is enforced at the route boundary."""
+    resp = client.get("/v1/traces/has%20space")
+    assert resp.status_code == 400
+
+
+def test_validate_path_component_length_cap():
+    """A pathological-length but charset-valid run_id is rejected."""
+    from aitelier.security import validate_path_component
+    with pytest.raises(Exception, match="length"):
+        validate_path_component("a" * 300, "run_id")
+
+
+def test_body_size_middleware_rejects_negative_content_length(client):
+    """Negative Content-Length (Content-Length: -1) must 413, not pass."""
+    from aitelier.config import get_config
+    cfg = get_config()
+    original = cfg.service.max_request_body_bytes
+    cfg.service.max_request_body_bytes = 1000
+    try:
+        # httpx normalizes -1; use a raw socket header override via TestClient.
+        # FastAPI TestClient calls Starlette's app directly, so a request with
+        # a manually-set negative Content-Length header is valid for testing
+        # the middleware's branch.
+        resp = client.post(
+            "/v1/chat/completions",
+            content="{}",
+            headers={"Content-Length": "-1",
+                     "Content-Type": "application/json"},
+        )
+        assert resp.status_code == 413
+    finally:
+        cfg.service.max_request_body_bytes = original
+
+
+def test_fold_response_format_accepts_openai_nested_shape():
+    """OpenAI spec nests as {type, json_schema: {name, schema, strict}};
+    the older flat form is also accepted."""
+    from aitelier.server import _fold_response_format
+    out = _fold_response_format(
+        None,
+        {"type": "json_schema",
+         "json_schema": {"name": "verdict",
+                          "schema": {"type": "object",
+                                      "properties": {"v": {"type": "string"}}}}},
+    )
+    assert "v" in out  # the schema's property name is in the rendered prompt
+
+
+def test_fold_response_format_drops_oversized_schemas():
+    """Over-cap schemas don't fold into the system prompt (still pass via ACP)."""
+    from aitelier.server import _fold_response_format
+    huge = {"type": "object", "properties": {
+        f"p{i}": {"type": "string", "description": "x" * 200}
+        for i in range(500)
+    }}
+    out = _fold_response_format(
+        "Hi.", {"type": "json_schema", "schema": huge},
+    )
+    assert out == "Hi."  # untouched
+
+
 def test_fold_response_format_injects_json_schema_into_system_prompt():
     """response_format: json_schema is forwarded to ACP AND folded into
     the system prompt as enforced-output text. Backends that ignore
@@ -713,7 +853,7 @@ def test_llm_path_classifies_connection_refused_as_provider_unavailable(
 ):
     """When LiteLLM is unreachable (connection refused), aitelier must
     return a typed `ProviderUnavailable` envelope with HTTP 503, not a
-    bare 500. Earlier deepread report cited bare 500 in this scenario."""
+    bare 500."""
     import httpx as _httpx
     fake_client = MagicMock()
     fake_client.post = AsyncMock(
@@ -736,15 +876,18 @@ def test_llm_path_classifies_connection_refused_as_provider_unavailable(
     )
     body = resp.json()
     assert body["error"]["type"] == "ProviderUnavailable"
-    assert "Connection refused" in body["error"]["message"] \
-        or "refused" in body["error"]["message"].lower()
+    # Phase H: transport-layer details are scrubbed from the wire to
+    # avoid leaking upstream hostnames. The message names the exception
+    # class only; the full string is in the server log.
+    msg = body["error"]["message"]
+    assert "ConnectError" in msg or "transport failure" in msg.lower()
 
 
 def test_agent_path_classifies_bad_backend_as_provider_error(client, monkeypatch):
-    """Unknown agent backend used to surface as `error.type: "RuntimeError"`
-    — the streamed error event's classified type was thrown away by a
-    re-wrap in `call_via_sandbox`. The fix preserves the type so consumer
-    retry policies keying on the documented vocabulary work."""
+    """An unknown agent backend surfaces as the classified
+    `error.type` from the producer, not a re-wrapped RuntimeError.
+    Consumer retry policies keying on the documented vocabulary depend
+    on this."""
 
     async def fake_stream(name, prompt, **kwargs):
         # Simulate what `call_via_sandbox_stream` emits when sandbox-agent

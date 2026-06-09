@@ -161,10 +161,3 @@ def _to_dict(s: Schedule) -> dict[str, Any]:
         "last_run_at": s.last_run_at.isoformat() if s.last_run_at else None,
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
-
-
-def _task_for_dispatch(s: Schedule) -> dict:
-    """Return the unredacted task dict that the scheduler hands to the
-    inference path. `_to_dict` redacts secrets for the HTTP projection;
-    the in-process dispatch still needs the real values."""
-    return s.task

@@ -235,6 +235,19 @@ def _classify_llm_status(status: int) -> str:
     return "ProviderError"
 
 
+def _safe_connect_message(exc: BaseException) -> str:
+    """Sanitize a transport-layer failure (DNS, connect, read timeout).
+
+    `str(exc)` from httpx routinely includes the upstream URL/host. In
+    hosted mode that leaks internal topology to consumers via the error
+    envelope. Surface only the exception class + a generic phrase and
+    log the full string server-side.
+    """
+    cls = type(exc).__name__
+    logger.warning("LLM transport failure: %s: %s", cls, exc)
+    return f"Upstream transport failure ({cls})"
+
+
 def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
     """Build a sanitized error message from an upstream LiteLLM response.
 
@@ -391,7 +404,7 @@ async def _chat_completion_via_ollama(
             timeout=httpx.Timeout(timeout, connect=10),
         )
     except Exception as exc:
-        raise LLMError(classify_error(exc), str(exc)) from exc
+        raise LLMError(classify_error(exc), _safe_connect_message(exc)) from exc
     if resp.status_code >= 400:
         raise LLMError(
             _classify_llm_status(resp.status_code),
@@ -519,7 +532,7 @@ async def chat_completion(
             timeout=httpx.Timeout(timeout, connect=10),
         )
     except Exception as exc:
-        raise LLMError(classify_error(exc), str(exc)) from exc
+        raise LLMError(classify_error(exc), _safe_connect_message(exc)) from exc
     if resp.status_code >= 400:
         _raise_for_preflight_response_format(body, resp)
         raise LLMError(
@@ -666,7 +679,7 @@ async def embeddings(body: dict, *, timeout: int = 30) -> dict:
             timeout=httpx.Timeout(timeout, connect=10),
         )
     except Exception as exc:
-        raise LLMError(classify_error(exc), str(exc)) from exc
+        raise LLMError(classify_error(exc), _safe_connect_message(exc)) from exc
     if resp.status_code >= 400:
         raise LLMError(
             _classify_llm_status(resp.status_code),
@@ -693,7 +706,7 @@ async def list_models() -> list[dict]:
             timeout=5.0,
         )
     except Exception as exc:
-        raise LLMError(classify_error(exc), str(exc)) from exc
+        raise LLMError(classify_error(exc), _safe_connect_message(exc)) from exc
     if resp.status_code != 200:
         raise LLMError(
             _classify_llm_status(resp.status_code),

@@ -7,6 +7,78 @@ relevant section.
 
 ## Unreleased
 
+### Added / changed — Phase H (audit-3 fixes)
+
+- **Secret redaction extended to `metadata`, `result`, and
+  `run_events.payload`.** Phase F covered `environment`; the adjacent
+  surfaces (`/v1/runs/{id}.metadata`, `.result`, and
+  `/v1/runs/{id}/events[/stream]` payloads — which include raw
+  `tool_call.input` arguments and `tool_result.output` content) were
+  not. They are now run through `_redact_secrets` at the projection
+  boundary in `_run_to_dict` and `_event_to_dict`. Stored rows keep
+  the originals for operator debugging.
+- **`/v1/traces/{trace_id}` validates the path component** via
+  `security.validate_path_component`, matching every other path-
+  segment route. 404 detail no longer reflects the raw value.
+- **List-endpoint `limit` is bounded** at the route layer:
+  `/v1/traces` and `/v1/runs` cap at 500, `/v1/runs/{id}/events` caps
+  at 5000. Stops a single authenticated caller from forcing a 10M-row
+  SELECT.
+- **Inline webhook fallback removed.** When Postgres enqueue fails
+  the previous code POSTed inline, skipping HMAC signing AND the
+  delivery-time SSRF re-check. Better to log + lose the single
+  delivery than emit an unsigned, un-SSRF-checked webhook. Consumers
+  retry / poll on their side.
+- **Stream idempotency replay buffer capped.** Stream runs emitting
+  more than 2000 chunks skip the idempotency cache (the run still
+  succeeds; only the 24h replay path is best-effort).
+- **LLM transport-error message scrubbed.** Connect / read-timeout
+  / DNS failures used to surface `str(exc)` to consumers, leaking
+  upstream URLs/hosts. New `_safe_connect_message` returns only the
+  exception class + a generic phrase; the full string is logged.
+- **`_fold_response_format` accepts the OpenAI nested
+  `{type: "json_schema", json_schema: {schema}}` shape** in addition
+  to the flat `{type: "json_schema", schema}` form, and caps the
+  rendered schema at 32 KiB (over-cap schemas still travel via ACP
+  but aren't folded into the system prompt).
+- **`security.validate_path_component` gains a 256-byte length cap**
+  and the 400 detail no longer echoes the offending value.
+- **`/v1/discovery.models` declared on schema + SDKs.** The field
+  has been on the wire since Phase 10; the schema and both SDK
+  Discovery types lagged.
+- **Body-size middleware guards negative `Content-Length`** — a
+  hostile `-1` previously short-circuited the 413 check.
+- **Dead code removed**: `_merge_correlation` (server.py),
+  `_task_for_dispatch` (schedules.py).
+- **Stale comments cleaned up**: `AITELIER_LOG_FORMAT` env-var
+  reference in the JSON formatter docstring, `_normalize_maxrss`
+  docstring describing a heuristic the code didn't implement, two
+  redundant "Workflow helpers" block comments, dated incident
+  references in test docstrings.
+- **CHANGELOG.md Phase F entry corrected**: the `AtelierOptions`
+  alias was *removed* in Phase G, not kept as `@deprecated`.
+
+### Added / changed — Phase G
+
+- **`agent:mock` no longer leaks `KeyError`.** `_open_acp_session`
+  defensively looks up `sessionId` and raises a classified `AcpError`
+  when missing. The `mock` SA backend is filtered from
+  `/v1/discovery.dependencies.sandbox_agent.agents` so consumers
+  don't pick it up as a test target.
+- **`response_format` on agent path is best-effort enforced.**
+  `_fold_response_format` renders the JSON Schema into the system
+  prompt as text alongside the existing ACP `responseFormat`
+  pass-through, so backends that ignore the ACP param (claude-code
+  et al) still see the contract.
+- **`aitelier_trace_id` removed.** Was always identical to
+  `aitelier_run_id`; deleted outright (no slow-deprecation per the
+  no-tech-debt rule). `/v1/traces/{id}` still keyed by `run_id`.
+- **TS SDK `AtelierOptions` typo alias removed**, leaving only
+  `AitelierOptions`.
+- Multi-turn history folding is already documented at
+  INTEGRATION.md "Multi-turn history" — confirmed no doc change
+  needed.
+
 ### Added — Phase F (audit-2 fixes)
 
 - **Secret redaction** on `/v1/runs/{id}` and `/v1/schedules*`.
@@ -28,8 +100,9 @@ relevant section.
   now reports a real count on Postgres (previously always 0).
 - **TS SDK gains `streamRunEvents`** (SSE iterator); brings the TS
   control plane to parity with Python.
-- **TS SDK adds `AitelierOptions`** as the correct name; the original
-  `AtelierOptions` is kept as a `@deprecated` alias for 0.1.x callers.
+- **TS SDK renames the constructor-options type to `AitelierOptions`**
+  (was `AtelierOptions` — a typo). Phase G removed the typo'd alias
+  outright per the no-tech-debt rule.
 - **`TraceRecord` gains `parent_run_id`, `error_type`, `error_msg`,
   `metadata`** in both SDKs — fields the server has always emitted
   but the typed clients dropped.

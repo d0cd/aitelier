@@ -74,6 +74,7 @@ class Discovery(BaseModel):
     endpoints: list[EndpointInfo]
     capabilities: dict[str, CapabilityInfo]
     dependencies: Dependencies
+    models: list[dict[str, Any]] = []
     schemas: dict[str, str]
     known_limitations: list[str]
 

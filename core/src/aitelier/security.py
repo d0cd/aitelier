@@ -11,19 +11,26 @@ from urllib.parse import urlparse
 from fastapi import HTTPException
 
 _PATH_COMPONENT_CHARSET = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
+_PATH_COMPONENT_MAX_LEN = 256
 
 
 def validate_path_component(value: str, label: str) -> None:
     """Reject path traversal in user-supplied URL path segments.
 
-    Whitelisted charset + explicit `..` ban. Used wherever a segment of
-    a `/v1/<…>/{name}` route is concatenated into a filesystem path or
-    a downstream URL — `run_id`, `schedule_id`, schema name, agent
-    name, etc.
+    Whitelisted charset + explicit `..` ban + length cap. Used wherever
+    a segment of a `/v1/<…>/{name}` route is concatenated into a
+    filesystem path or a downstream URL — `run_id`, `schedule_id`,
+    schema name, agent name, etc. The length cap guards against
+    pathological inputs that pass the charset (e.g. a 10 MiB run_id
+    matching `[A-Za-z0-9._-]+`).
     """
+    if not value or len(value) > _PATH_COMPONENT_MAX_LEN:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: length must be 1..{_PATH_COMPONENT_MAX_LEN}",
+        )
     if not _PATH_COMPONENT_CHARSET.match(value):
         raise HTTPException(
-            status_code=400, detail=f"Invalid {label}: {value!r}",
+            status_code=400, detail=f"Invalid {label}: charset",
         )
     if ".." in value:
         raise HTTPException(

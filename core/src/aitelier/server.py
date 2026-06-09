@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -88,7 +88,7 @@ _AITELIER_LOG_FORMAT = (
 
 
 class _JsonFormatter(logging.Formatter):
-    """One-line-per-record JSON formatter for AITELIER_LOG_FORMAT=json.
+    """One-line-per-record JSON formatter for `[service] log_format = "json"`.
 
     Aggregator-friendly (Loki, Datadog, etc.). Includes correlation_id from
     the contextvar that the LogRecord factory stamped onto every record.
@@ -424,7 +424,7 @@ async def _body_size_middleware(request: Request, call_next):
                 body_len = int(raw_len)
             except ValueError:
                 body_len = 0
-            if body_len > cap:
+            if body_len < 0 or body_len > cap:
                 return JSONResponse(
                     {"detail": (
                         f"Request body {body_len} bytes exceeds cap "
@@ -570,13 +570,13 @@ class ScheduleRequest(BaseModel):
 # --- Primitive endpoints ---
 
 
-def _merge_correlation(metadata: dict | None, cid: str) -> dict:
-    out = dict(metadata or {})
-    out["correlation_id"] = cid
-    return out
-
-
 _IDEMPOTENCY_TTL = timedelta(hours=24)
+# Cap the chunk buffer cached for stream-idempotency replay. A long
+# agent run emitting megabyte-class deltas would otherwise persist a
+# multi-MB JSONB row for 24h. When exceeded, the stream stays caching
+# nothing — replay is best-effort, the consumer's first request still
+# succeeds.
+_STREAM_IDEMPOTENCY_MAX_CHUNKS = 2000
 
 
 @dataclass
@@ -696,16 +696,15 @@ async def _enqueue_webhook(
         await store.enqueue_webhook(url, payload,
                                      run_id=run_id, schedule_id=schedule_id)
     except Exception as exc:
-        # If enqueueing itself fails (e.g. DB down), fall back to inline POST
-        # so the consumer at least *might* hear about completion.
-        logger.warning("Webhook enqueue failed (%s); attempting inline POST", exc)
-        try:
-            from aitelier.providers.llm import get_shared_client
-            client = await get_shared_client()
-            await client.post(url, json=payload, timeout=10)
-        except Exception as exc2:
-            logger.warning("Inline webhook fallback to %s also failed: %s",
-                            url, exc2)
+        # Enqueue is the only delivery path. A previous fallback POSTed
+        # inline when Postgres was down, but it skipped HMAC signing AND
+        # the delivery-time SSRF re-check — both of which the worker
+        # applies on the durable path. Better to log + lose this single
+        # delivery than to emit an unsigned, un-SSRF-checked webhook.
+        logger.warning(
+            "Webhook enqueue failed (%s); delivery dropped. run_id=%s schedule_id=%s",
+            exc, run_id, schedule_id,
+        )
 
 
 def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> str | None:
@@ -725,6 +724,9 @@ def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> st
     return f"{system_prompt}\n\n{section}" if system_prompt else section
 
 
+_RESPONSE_FORMAT_SCHEMA_MAX_BYTES = 32 * 1024
+
+
 def _fold_response_format(
     system_prompt: str | None, response_format: dict | None,
 ) -> str | None:
@@ -736,21 +738,39 @@ def _fold_response_format(
     the system prompt as text — agents that read instructions in plain
     English will conform without needing native schema support.
 
+    Accepts both the OpenAI-spec nested shape
+    `{type: "json_schema", json_schema: {name, schema, strict}}` and the
+    flat shape `{type: "json_schema", schema: {...}}`. Schemas larger
+    than 32 KiB are dropped from the prompt fold (still passed via ACP)
+    to bound the token cost.
+
     Best-effort, not guaranteed. Consumers needing hard enforcement
     should run the response through their own validator and surface a
     typed retry.
     """
     if not response_format or response_format.get("type") != "json_schema":
         return system_prompt
-    schema = response_format.get("schema") or response_format.get("json_schema")
-    if not schema:
+    nested = response_format.get("json_schema")
+    if isinstance(nested, dict) and isinstance(nested.get("schema"), dict):
+        schema = nested["schema"]
+    else:
+        schema = response_format.get("schema")
+    if not isinstance(schema, dict) or not schema:
+        return system_prompt
+    rendered = json.dumps(schema, indent=2)
+    if len(rendered) > _RESPONSE_FORMAT_SCHEMA_MAX_BYTES:
+        logger.warning(
+            "response_format schema too large to fold into system prompt "
+            "(%d bytes > %d cap); passing only via ACP responseFormat",
+            len(rendered), _RESPONSE_FORMAT_SCHEMA_MAX_BYTES,
+        )
         return system_prompt
     section = (
         "## Required output format\n\n"
         "Your final assistant message MUST be a JSON object conforming "
         "exactly to this JSON Schema. Emit only the JSON object, with "
         "no prose, code fences, or commentary.\n\n"
-        f"{json.dumps(schema, indent=2)}"
+        f"{rendered}"
     )
     return f"{system_prompt}\n\n{section}" if system_prompt else section
 
@@ -1225,6 +1245,7 @@ async def _agent_chat_completion_stream(
                 idem is not None
                 and state == "completed"
                 and final.get("status") != "error"
+                and len(recorded_chunks) <= _STREAM_IDEMPOTENCY_MAX_CHUNKS
             )
             asyncio.create_task(_finalize_stream_run(
                 run_id=run_id, final=final, state=state,
@@ -1819,8 +1840,8 @@ def _run_to_dict(run) -> dict:
         "status": run.status,
         "error_type": run.error_type,
         "error_msg": run.error_msg,
-        "result": run.result,
-        "metadata": run.metadata,
+        "result": _redact_secrets(run.result),
+        "metadata": _redact_secrets(run.metadata),
     }
 
 
@@ -1841,7 +1862,7 @@ async def traces_endpoint(
     trace_tag: str | None = None,
     parent_run_id: str | None = None,
     status: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
 ) -> list[dict]:
     """Query recent runs as TraceRecord summaries (counts, tokens, cost).
 
@@ -1885,25 +1906,26 @@ async def traces_aggregates_endpoint(
 @app.get("/v1/traces/{trace_id}")
 async def get_trace_endpoint(trace_id: str) -> dict:
     """Get a single trace by ID. Same data as /v1/runs/{id} in TraceRecord shape."""
+    _validate_path_component(trace_id, "trace_id")
     store = await get_store()
     run = await store.get_run(trace_id)
     if not run:
-        raise HTTPException(status_code=404, detail=f"Trace not found: {trace_id}")
+        raise HTTPException(status_code=404, detail="Trace not found")
     return _run_to_trace_dict(run)
 
 
-# _validate_path_component is imported at top from aitelier.security and
-# aliased for the many existing call sites in this module.
-
-
 def _event_to_dict(event) -> dict:
+    """tool_call/tool_result payloads carry raw user arguments + tool
+    outputs — both can contain credentials (a `bash` tool call's argv,
+    or a `read_file` result returning a .env). Redact at the projection
+    boundary; the durable row keeps the original for operator debugging."""
     return {
         "event_id": event.event_id,
         "run_id": event.run_id,
         "seq": event.seq,
         "kind": event.kind,
         "ts": event.ts.isoformat() if event.ts else None,
-        "payload": event.payload,
+        "payload": _redact_secrets(event.payload),
     }
 
 
@@ -1916,7 +1938,7 @@ async def list_runs_endpoint(
     correlation_id: str | None = None,
     parent_run_id: str | None = None,
     since: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
 ) -> list[dict]:
     """List runs from the durable store with optional filters.
 
@@ -1937,7 +1959,9 @@ async def list_runs_endpoint(
 
 @app.get("/v1/runs/{run_id}/events")
 async def list_run_events_endpoint(
-    run_id: str, since_seq: int = 0, limit: int = 1000,
+    run_id: str,
+    since_seq: int = Query(0, ge=0),
+    limit: int = Query(1000, ge=1, le=5000),
 ) -> list[dict]:
     """Paginated event timeline for a single run."""
     _validate_path_component(run_id, "run_id")
@@ -2166,16 +2190,14 @@ async def metrics() -> dict:
 
 
 def _normalize_maxrss(raw: int) -> int:
-    """`getrusage().ru_maxrss` is bytes on macOS/BSD, kilobytes on Linux.
-    Best-effort detection by magnitude: any process actually using ≥1 GiB
-    of RSS would report a kB-units number larger than the bytes-units
-    threshold, but in practice aitelier sits in the tens-of-MB range so
-    the units differ by 1024×. Heuristic: if raw < 10 MiB-of-kB
-    (≈10 GiB), treat it as kB and multiply; else treat it as bytes."""
+    """Return ru_maxrss in bytes regardless of platform.
+
+    `getrusage().ru_maxrss` is bytes on macOS/BSD, kilobytes on Linux —
+    a glibc quirk dating to the early 90s. We branch on `sys.platform`.
+    """
     import sys
     if sys.platform == "darwin":
         return int(raw)
-    # Linux + most BSDs: kilobytes.
     return int(raw) * 1024
 
 
@@ -2361,18 +2383,6 @@ async def delete_schedule_endpoint(schedule_id: str) -> dict:
     if not await delete_schedule(schedule_id):
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
     return {"id": schedule_id, "deleted": True}
-
-
-
-
-# Workflow helpers (run_prepare, stop_sidecars, fetch_artifacts,
-# prepare_failed_result) live in aitelier.sandbox_proxy and are imported
-# at the top of this file.
-
-
-# Sandbox-agent workflow helpers (run_prepare, stop_sidecars, fetch_artifacts,
-# prepare_failed_result) are imported at the top of this file from
-# aitelier.sandbox_proxy.
 
 
 @app.get("/v1/discovery")

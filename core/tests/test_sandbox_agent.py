@@ -342,7 +342,7 @@ def test_adapt_mcp_servers_no_injection_when_run_id_empty():
 async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
     """ACP backends that respond to session/new without a sessionId must
     surface a classified ProviderError, not a bare KeyError. Regression
-    test for the agent:mock backend reported by dispatcher 2026-05-18."""
+    backends like `mock` whose session/new handshake omits sessionId."""
     from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
 
     class _FakeClient:

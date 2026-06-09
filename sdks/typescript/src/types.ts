@@ -58,6 +58,7 @@ export interface Discovery {
   endpoints: EndpointInfo[];
   capabilities: Record<string, CapabilityInfo>;
   dependencies: Dependencies;
+  models?: Array<Record<string, unknown>>;
   schemas: Record<string, string>;
   knownLimitations: string[];
 }
