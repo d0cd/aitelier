@@ -80,7 +80,7 @@ full surface; `docs/INTEGRATION.md` for the rationale.
   inference + control plane. SDK usage (Python + TS). Auth, security, retries,
   idempotency, correlation IDs, cost tracking.
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture + tradeoffs.
-- [`docs/PLAN.md`](docs/PLAN.md) — what's built; what's deliberately out of scope.
+- [`docs/PLAN.md`](docs/PLAN.md) — what's built, directions worth exploring, what's deliberately out of scope.
 - [`CLAUDE.md`](CLAUDE.md) — orientation for AI agents working in this repo.
 
 ## Project layout
