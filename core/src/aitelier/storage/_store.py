@@ -573,13 +573,13 @@ class PostgresStore:
 
 
 # ---------------------------------------------------------------------------
-# In-memory implementation — for tests + when DATABASE_URL is unset
+# In-memory implementation — for tests + when [database] url is unset
 # ---------------------------------------------------------------------------
 
 
 class InMemoryStore:
     """Volatile, single-process. Used by tests and as the fallback when
-    DATABASE_URL isn't set (e.g., dev without docker compose). NO persistence.
+    [database] url isn't set (e.g., dev without docker compose). NO persistence.
     """
 
     def __init__(self):

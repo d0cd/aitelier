@@ -9,6 +9,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import resource
 import time
@@ -1280,22 +1281,17 @@ def _http_status_for_llm_error(exc: LLMError) -> int:
 
 def _llm_body_from_request(req: ChatCompletionRequest) -> dict:
     body: dict[str, Any] = {"model": req.model, "messages": req.messages}
-    if req.temperature is not None:
-        body["temperature"] = req.temperature
-    if req.max_tokens is not None:
-        body["max_tokens"] = req.max_tokens
-    if req.top_p is not None:
-        body["top_p"] = req.top_p
-    if req.n is not None:
-        body["n"] = req.n
-    if req.response_format is not None:
-        body["response_format"] = req.response_format
+    for field in (
+        "temperature", "max_tokens", "top_p", "n", "response_format",
+        "tool_choice", "user", "stream_options", "seed",
+        "frequency_penalty", "presence_penalty", "stop",
+        "logprobs", "top_logprobs",
+    ):
+        value = getattr(req, field, None)
+        if value is not None:
+            body[field] = value
     if req.tools:
         body["tools"] = req.tools
-    if req.tool_choice is not None:
-        body["tool_choice"] = req.tool_choice
-    if req.user is not None:
-        body["user"] = req.user
     return body
 
 
@@ -1804,10 +1800,12 @@ async def get_trace_endpoint(trace_id: str) -> dict:
     return _run_to_trace_dict(run)
 
 
+_PATH_COMPONENT_CHARSET = re.compile(r'^[a-zA-Z0-9_\-\.]+$')
+
+
 def _validate_path_component(value: str, label: str) -> None:
     """Reject path traversal attempts in user-supplied path components."""
-    import re
-    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', value):
+    if not _PATH_COMPONENT_CHARSET.match(value):
         raise HTTPException(status_code=400, detail=f"Invalid {label}: {value!r}")
     if ".." in value:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: path traversal not allowed")
@@ -1998,10 +1996,13 @@ async def get_run(run_id: str) -> dict:
 
     # Best-effort: fold in on-disk artifacts (prompt.txt, manifest.json) if
     # the agent path wrote them. Defense-in-depth on the path so a crafted
-    # run_id can't escape the runs/ root.
-    runs_base = Path("runs").resolve()
+    # run_id can't escape the runs/ root. `os.sep` suffix forces the prefix
+    # check to span a directory boundary so `runs_evil/` can't match `runs/`.
+    runs_base = Path(get_config().runs_dir).resolve()
     run_dir = (runs_base / run_id).resolve()
-    if str(run_dir).startswith(str(runs_base)) and run_dir.exists():
+    base_prefix = str(runs_base) + os.sep
+    if (str(run_dir) == str(runs_base) or
+            str(run_dir).startswith(base_prefix)) and run_dir.exists():
         manifest_path = run_dir / "manifest.json"
         if manifest_path.exists():
             try:

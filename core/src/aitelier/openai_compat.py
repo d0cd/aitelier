@@ -66,7 +66,12 @@ class ChatCompletionRequest(BaseModel):
 
     Fields we ignore on purpose are listed in the agent-path validator —
     silently dropping safety knobs is a bug class we explicitly fight.
+    `extra="forbid"` extends that posture to unknown top-level fields
+    (`temperture=`, `max_token=`) — better a 422 than a silently
+    untemperated request.
     """
+    model_config = ConfigDict(extra="forbid")
+
     model: str
     messages: list[dict] = Field(min_length=1, max_length=1000)
     stream: bool = False
@@ -79,6 +84,13 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Any = None
     user: str | None = None
     timeout: int | None = None
+    stream_options: dict | None = None
+    seed: int | None = None
+    frequency_penalty: float | None = None
+    presence_penalty: float | None = None
+    stop: str | list[str] | None = None
+    logprobs: bool | None = None
+    top_logprobs: int | None = None
 
     # aitelier extension — agent-specific options.
     aitelier: AitelierAgentOpts | None = None

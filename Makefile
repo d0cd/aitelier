@@ -16,7 +16,7 @@ install:
 test: test-py test-ts
 
 test-py:
-	uv run pytest core/tests/ sdks/python/tests/ -v
+	uv run pytest core/tests/ sdks/python/tests/ sdks/python-mcp/tests/ -v
 
 test-ts:
 	cd sdks/typescript && npx tsc --noEmit && npx vitest run

@@ -9,7 +9,8 @@ Two implementations satisfy the same interface:
   - `InMemoryStore`  — tests, no infra needed
 
 The active implementation is chosen at startup time by `get_store()` based
-on whether DATABASE_URL is set.
+on whether `[database] url` is set in aitelier.toml. Aitelier reads no env
+vars — see config.py for the four-layer overlay rules.
 """
 
 from __future__ import annotations

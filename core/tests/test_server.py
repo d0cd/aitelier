@@ -1896,6 +1896,21 @@ def test_chat_completions_rejects_unknown_aitelier_field(client):
     assert "extra" in text or "forbidden" in text or "not permitted" in text
 
 
+def test_chat_completions_rejects_misspelled_top_level_field(client):
+    """ChatCompletionRequest sets `extra="forbid"` — a typo like
+    `temperture=` returns 422 instead of being silently dropped.
+    Catching this at the request boundary saves consumers from
+    debugging a wholly-default-temperature response."""
+    resp = client.post("/v1/chat/completions", json={
+        "model": "claude-sonnet",
+        "messages": [{"role": "user", "content": "x"}],
+        "temperture": 0.7,
+    })
+    assert resp.status_code == 422, resp.text
+    text = str(resp.json()).lower()
+    assert "temperture" in text
+
+
 def test_chat_completions_rejects_empty_messages(client):
     """Empty `messages: []` must be a clean 422 validation error at the
     request boundary, not an opaque downstream RuntimeError from ACP
