@@ -217,6 +217,27 @@ class Aitelier:
         resp.raise_for_status()
         return CancelAck(**resp.json())
 
+    async def wait_for_run(
+        self, run_id: str, *,
+        timeout: float = 60.0, poll_interval: float = 0.5,
+    ) -> Run:
+        """Block until `run_id` reaches a terminal state; return the Run.
+
+        Server-side polling — convenience over rolling your own loop
+        when you want submit-and-await without a webhook receiver.
+        Raises `httpx.HTTPStatusError(408)` if the run is still
+        pending/running when the timeout elapses (call again to keep
+        waiting). Raises `httpx.HTTPStatusError(404)` if the run id
+        is unknown.
+        """
+        resp = await self._ensure_client().post(
+            f"/v1/runs/{run_id}/wait",
+            params={"timeout": timeout, "poll_interval": poll_interval},
+            timeout=timeout + 10.0,
+        )
+        resp.raise_for_status()
+        return Run(**resp.json())
+
     # --- Control plane: traces ----------------------------------------------
 
     async def recent_traces(

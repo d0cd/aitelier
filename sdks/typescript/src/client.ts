@@ -186,14 +186,43 @@ export class Aitelier {
   }
 
   async listRuns(opts: {
-    traceTag?: string; state?: string; correlationId?: string; limit?: number;
+    traceTag?: string; state?: string; correlationId?: string;
+    parentRunId?: string; limit?: number;
   } = {}): Promise<Run[]> {
     const params = new URLSearchParams();
     params.set("limit", String(opts.limit ?? 50));
     if (opts.traceTag) params.set("trace_tag", opts.traceTag);
     if (opts.state) params.set("state", opts.state);
     if (opts.correlationId) params.set("correlation_id", opts.correlationId);
+    if (opts.parentRunId) params.set("parent_run_id", opts.parentRunId);
     return this.getJson<Run[]>(`/v1/runs?${params}`);
+  }
+
+  /**
+   * Block until `runId` reaches a terminal state; return the Run.
+   *
+   * Server-side polling — convenience over rolling your own loop when
+   * you want submit-and-await without a webhook receiver. Throws on a
+   * 408 response (run still pending/running at timeout — call again to
+   * keep waiting) or 404 (unknown run id).
+   */
+  async waitForRun(runId: string, opts: {
+    timeoutSeconds?: number; pollIntervalSeconds?: number;
+  } = {}): Promise<Run> {
+    const timeout = opts.timeoutSeconds ?? 60;
+    const params = new URLSearchParams({
+      timeout: String(timeout),
+      poll_interval: String(opts.pollIntervalSeconds ?? 0.5),
+    });
+    const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/wait?${params}`, {
+      method: "POST",
+      headers: { ...this.authHeader() },
+      signal: AbortSignal.timeout((timeout + 10) * 1000),
+    });
+    if (!resp.ok) {
+      throw new Error(`waitForRun failed: ${resp.status} ${await resp.text()}`);
+    }
+    return snakeToCamelDeep(await resp.json()) as Run;
   }
 
   async listRunEvents(runId: string): Promise<RunEvent[]> {

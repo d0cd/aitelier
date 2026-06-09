@@ -1658,6 +1658,71 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
             _active_runs.pop(f"saturating-run-{i}", None)
 
 
+def test_wait_for_run_returns_terminal_run(client):
+    """`POST /v1/runs/{id}/wait` blocks until terminal state then
+    returns the Run row. Pre-seed a run already in `completed` so the
+    endpoint returns on the first poll."""
+    import asyncio
+
+    from aitelier.storage import RunSpec, get_store
+
+    async def seed():
+        store = await get_store()
+        await store.create_run(RunSpec(run_id="r-wait-ok", kind="agent"))
+        await store.update_run_state("r-wait-ok", "running")
+        await store.finalize_run("r-wait-ok", {
+            "status": "ok", "finish_reason": "stop",
+        })
+    asyncio.new_event_loop().run_until_complete(seed())
+
+    resp = client.post(
+        "/v1/runs/r-wait-ok/wait",
+        params={"timeout": 2, "poll_interval": 0.05},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["state"] == "completed"
+    assert body["status"] == "ok"
+
+
+def test_wait_for_run_times_out_with_408(client):
+    """If the run never reaches a terminal state inside `timeout`, the
+    endpoint returns 408 — consumer can re-poll. Doesn't leave the
+    pending row in a bad state."""
+    import asyncio
+
+    from aitelier.storage import RunSpec, get_store
+
+    async def seed():
+        store = await get_store()
+        await store.create_run(RunSpec(run_id="r-wait-stuck", kind="agent"))
+        # Leave it pending — wait will never see a terminal state.
+    asyncio.new_event_loop().run_until_complete(seed())
+
+    resp = client.post(
+        "/v1/runs/r-wait-stuck/wait",
+        params={"timeout": 0.2, "poll_interval": 0.05},
+    )
+    assert resp.status_code == 408
+    assert "still" in resp.text.lower()
+
+
+def test_wait_for_run_404_for_unknown_id(client):
+    resp = client.post(
+        "/v1/runs/no-such-run/wait", params={"timeout": 0.1},
+    )
+    assert resp.status_code == 404
+
+
+def test_wait_for_run_rejects_invalid_timeout(client):
+    """timeout must be in (0, 600] — anything else is a 400 at the
+    boundary so we don't accept an unbounded server-side poll."""
+    resp = client.post("/v1/runs/x/wait", params={"timeout": 0})
+    assert resp.status_code == 400
+    resp = client.post("/v1/runs/x/wait", params={"timeout": 601})
+    assert resp.status_code == 400
+
+
 def test_chat_completions_records_parent_run_id_on_agent_path(
     client, monkeypatch,
 ):

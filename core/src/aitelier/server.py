@@ -1819,6 +1819,63 @@ async def list_active_runs() -> dict:
     return {"active": sorted(_active_runs.keys())}
 
 
+_TERMINAL_STATES_FOR_WAIT = frozenset({"completed", "failed", "cancelled", "orphaned"})
+
+
+@app.post("/v1/runs/{run_id}/wait")
+async def wait_for_run(
+    run_id: str,
+    timeout: float = 60.0,
+    poll_interval: float = 0.5,
+) -> dict:
+    """Block until a run reaches a terminal state, then return it.
+
+    Convenience over manual polling: a consumer that submits an async
+    run via `POST /v1/runs` and doesn't want to set up a webhook
+    receiver can call this and get the final Run row back when it
+    settles.
+
+    Polls the store every `poll_interval` seconds (default 0.5s) up to
+    `timeout` seconds (default 60s, max 600s). Returns the Run as
+    soon as state ∈ {completed, failed, cancelled, orphaned}. Returns
+    HTTP 408 if the run is still pending/running at deadline — the
+    consumer can call again to keep waiting.
+
+    Returns 404 if the run id doesn't exist. Returns the same Run
+    shape as `GET /v1/runs/{id}` (no on-disk artifacts folded in;
+    fetch separately if needed).
+    """
+    _validate_path_component(run_id, "run_id")
+    if timeout <= 0 or timeout > 600:
+        raise HTTPException(
+            status_code=400,
+            detail="timeout must be in (0, 600] seconds",
+        )
+    if poll_interval <= 0 or poll_interval > 10:
+        raise HTTPException(
+            status_code=400,
+            detail="poll_interval must be in (0, 10] seconds",
+        )
+
+    store = await get_store()
+    deadline = time.monotonic() + timeout
+    while True:
+        run = await store.get_run(run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+        if run.state in _TERMINAL_STATES_FOR_WAIT:
+            return _run_to_dict(run)
+        if time.monotonic() >= deadline:
+            raise HTTPException(
+                status_code=408,
+                detail=(
+                    f"Run {run_id} still in state={run.state} after "
+                    f"{timeout}s. Call again to keep waiting."
+                ),
+            )
+        await asyncio.sleep(poll_interval)
+
+
 @app.post("/v1/runs/{run_id}/cancel")
 async def cancel_run(run_id: str) -> dict:
     """Signal cancellation for an in-flight run.
