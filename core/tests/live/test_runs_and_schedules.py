@@ -6,18 +6,11 @@ import uuid
 
 import pytest
 
+from .conftest import skip_on_upstream_unavailable as _skip_on_upstream_unavailable
+
 
 def _has_claude_haiku(models: list[str]) -> bool:
     return any(m == "claude-haiku" or m.endswith("/claude-haiku") for m in models)
-
-
-def _skip_on_upstream_unavailable(r) -> None:
-    """Skip rather than fail when an upstream provider 429s / 5xxs us."""
-    if r.status_code in (401, 403, 429, 503, 504):
-        pytest.skip(
-            f"upstream provider returned {r.status_code} — "
-            "not exercising aitelier behavior on this run",
-        )
 
 
 def test_runs_list_filterable_by_trace_tag(http, trace_tag, litellm_models):
@@ -56,8 +49,8 @@ def test_runs_events_endpoint_returns_timeline(http, trace_tag, picked_agent):
             "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
         },
     )
-    if r.status_code != 200:
-        pytest.skip(f"agent unavailable: {r.status_code} {r.text}")
+    _skip_on_upstream_unavailable(r)
+    assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
 
     events = http.get(f"/v1/runs/{run_id}/events").json()

@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import uuid
 
-import pytest
-
 
 def _agent_body(agent: str, content: str = "Reply: ack",
                 aitelier_opts: dict | None = None) -> dict:
@@ -29,12 +27,13 @@ def test_same_key_and_body_returns_cached_response(http, trace_tag, picked_agent
     agent = picked_agent
     key = str(uuid.uuid4())
     body = _agent_body(agent, aitelier_opts={"max_turns": 1, "trace_tag": trace_tag})
+    from .conftest import skip_on_upstream_unavailable
     r1 = http.post("/v1/chat/completions", headers={"Idempotency-Key": key},
                     json=body)
     r2 = http.post("/v1/chat/completions", headers={"Idempotency-Key": key},
                     json=body)
-    if r1.status_code != 200:
-        pytest.skip(f"first call failed: {r1.status_code} {r1.text}")
+    skip_on_upstream_unavailable(r1)
+    assert r1.status_code == 200, r1.text
     assert r2.status_code == 200, r2.text
     assert r1.json()["aitelier_run_id"] == r2.json()["aitelier_run_id"]
     assert r1.json() == r2.json()
@@ -45,6 +44,7 @@ def test_same_key_different_body_returns_422(http, picked_agent):
     the server should refuse loud rather than treat as a new request."""
     agent = picked_agent
     key = str(uuid.uuid4())
+    from .conftest import skip_on_upstream_unavailable
     r1 = http.post("/v1/chat/completions",
                     headers={"Idempotency-Key": key},
                     json=_agent_body(agent, "first call",
@@ -53,8 +53,8 @@ def test_same_key_different_body_returns_422(http, picked_agent):
                     headers={"Idempotency-Key": key},
                     json=_agent_body(agent, "DIFFERENT",
                                       aitelier_opts={"max_turns": 1}))
-    if r1.status_code != 200:
-        pytest.skip(f"first call failed: {r1.status_code} {r1.text}")
+    skip_on_upstream_unavailable(r1)
+    assert r1.status_code == 200, r1.text
     assert r2.status_code == 422
     assert "Idempotency-Key" in r2.json()["detail"]
 
@@ -64,12 +64,15 @@ def test_distinct_keys_produce_distinct_runs(http, trace_tag, picked_agent):
     agent = picked_agent
     body = _agent_body(agent, aitelier_opts={"max_turns": 1,
                                               "trace_tag": trace_tag})
+    from .conftest import skip_on_upstream_unavailable
     r1 = http.post("/v1/chat/completions",
                     headers={"Idempotency-Key": str(uuid.uuid4())},
                     json=body)
     r2 = http.post("/v1/chat/completions",
                     headers={"Idempotency-Key": str(uuid.uuid4())},
                     json=body)
-    if r1.status_code != 200 or r2.status_code != 200:
-        pytest.skip("agent unavailable")
+    skip_on_upstream_unavailable(r1)
+    skip_on_upstream_unavailable(r2)
+    assert r1.status_code == 200, r1.text
+    assert r2.status_code == 200, r2.text
     assert r1.json()["aitelier_run_id"] != r2.json()["aitelier_run_id"]

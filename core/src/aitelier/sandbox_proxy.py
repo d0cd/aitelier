@@ -117,7 +117,19 @@ async def run_prepare(prep: dict | None) -> dict:
 
     for f in prep.get("files") or []:
         try:
-            await sa_proxy("PUT", "/v1/fs/file", json_body=f, timeout=30)
+            # SA's PUT /v1/fs/file expects `path` as a query-string
+            # parameter, NOT in the JSON body (same as GET /v1/fs/file
+            # used by fetch_artifacts). Sending path-in-body returns
+            # "missing field `path`" from SA's query deserializer.
+            body: dict = {"content": f.get("content")}
+            if f.get("encoding") is not None:
+                body["encoding"] = f["encoding"]
+            await sa_proxy(
+                "PUT", "/v1/fs/file",
+                params={"path": f["path"]},
+                json_body=body,
+                timeout=30,
+            )
             out["file_results"].append({"path": f.get("path"), "ok": True})
         except Exception as exc:
             out["file_results"].append({

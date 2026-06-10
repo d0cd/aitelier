@@ -9,20 +9,11 @@ import json
 
 import pytest
 
+from .conftest import skip_on_upstream_unavailable as _skip_on_upstream_unavailable
+
 
 def _has_claude_haiku(models: list[str]) -> bool:
     return any(m == "claude-haiku" or m.endswith("/claude-haiku") for m in models)
-
-
-def _skip_on_upstream_unavailable(r) -> None:
-    """Anthropic OAuth tokens get rate-limited or expire upstream; that's
-    not an aitelier bug. Skip rather than fail when the provider says no."""
-    if r.status_code in (401, 403, 429, 503, 504):
-        import pytest as _pytest
-        _pytest.skip(
-            f"upstream provider returned {r.status_code} — "
-            "not exercising aitelier behavior on this run",
-        )
 
 
 # ---------- /v1/chat/completions (LLM path) ----------
@@ -82,21 +73,24 @@ def test_chat_completions_local_reasoning_model_acceptance(http, litellm_models)
         "max_tokens": 50,
         "temperature": 0,
     })
-    if r.status_code != 200:
-        pytest.skip(f"local model unavailable: {r.text}")
+    _skip_on_upstream_unavailable(r)
+    assert r.status_code == 200, r.text
     body = r.json()
     completion_tokens = body["usage"]["completion_tokens"]
-    if completion_tokens == 0:
-        pytest.skip("model emitted no tokens — nothing to assert about")
     msg = body["choices"][0]["message"]
     has_any = bool(
         msg.get("content")
         or msg.get("reasoning_content")
         or msg.get("tool_calls")
+        or msg.get("aitelier_exit") == "empty"
     )
+    # Either some payload surfaced, or aitelier flagged the empty-tokens
+    # case via the documented `aitelier_exit: "empty"` signal. Anything
+    # else means the regression (LiteLLM-drops-thinking) is back.
     assert has_any, (
         f"completion_tokens={completion_tokens} but no content / "
-        f"reasoning_content / tool_calls surfaced. choice={body['choices'][0]!r}"
+        f"reasoning_content / tool_calls / aitelier_exit signal "
+        f"surfaced. choice={body['choices'][0]!r}"
     )
 
 
@@ -113,16 +107,13 @@ def test_chat_completions_json_object_on_anthropic_returns_200(http):
         "temperature": 0,
     })
     _skip_on_upstream_unavailable(r)
+    # The assertion this test enforces is aitelier's contract:
+    # `response_format: json_object` on an unsupported provider must
+    # NOT 422 and must NOT drop the request — aitelier strips the
+    # param and injects a system-prompt directive, so the call should
+    # land at 200. Whether the MODEL actually returns parseable JSON
+    # is the model's job; aitelier doesn't promise it.
     assert r.status_code == 200, r.text
-    body = r.json()
-    content = body["choices"][0]["message"]["content"] or ""
-    if content:
-        # The model should have produced parseable JSON (possibly fenced).
-        stripped = content.strip().lstrip("`").lstrip("json").strip("`").strip()
-        try:
-            json.loads(stripped)
-        except json.JSONDecodeError:
-            pytest.skip(f"model returned non-JSON despite directive: {content!r}")
 
 
 def test_chat_completions_json_schema_on_local_uses_ollama_structured_output(
@@ -216,21 +207,36 @@ def test_models_endpoint_lists_aliases(http, litellm_models):
 
 
 def test_discovery_exposes_model_response_format_capabilities(http):
+    """Cross-check /v1/discovery.models[*].response_format against the
+    documented capability registry in providers/llm.py:
+
+      - claude / anthropic/*: empty (no native support; aitelier falls back
+        to system-prompt directive)
+      - local / ollama/*: {json_object, json_schema} (Ollama native via
+        the bypass adapter)
+    """
     d = http.get("/v1/discovery").json()
     models = d.get("models") or []
     assert models, "discovery should expose a models[] list"
     annotated = [m for m in models if "response_format" in m]
     assert annotated, "no model in discovery has response_format capabilities"
     by_name = {m["name"]: m for m in models}
+
     if "local" in by_name and "response_format" in by_name["local"]:
-        # local = Ollama; no native structured output.
-        assert by_name["local"]["response_format"] == []
+        # Ollama bypass DOES support structured output natively.
+        rf = by_name["local"]["response_format"]
+        assert "json_object" in rf, f"local should support json_object: {rf}"
+        assert "json_schema" in rf, f"local should support json_schema: {rf}"
+
     claude_keys = [n for n in by_name if n.startswith("claude")]
     if claude_keys:
-        m = by_name[claude_keys[0]]
-        rf = m.get("response_format", [])
-        assert "json_schema" in rf
-        assert "json_object" not in rf
+        rf = by_name[claude_keys[0]].get("response_format", [])
+        # Anthropic doesn't natively support either; aitelier returns []
+        # so consumers know to expect the system-prompt-directive fallback.
+        assert rf == [], (
+            f"claude should advertise no native response_format support; "
+            f"got: {rf}"
+        )
 
 
 # ---------- /v1/embeddings ----------

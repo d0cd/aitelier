@@ -6,6 +6,7 @@ Exercises real Sandbox Agent + OpenAI-shape translation end-to-end.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -69,14 +70,15 @@ def test_agent_rejects_aitelier_namespace_on_llm_path(http, litellm_models):
 def test_agent_run_persists_agent_id_and_inner_model(http, trace_tag, picked_agent):
     """The run row should record agent_id=<backend> and model=<inner LLM>
     distinctly, not collapse them."""
+    from .conftest import skip_on_upstream_unavailable
     agent = picked_agent
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent, inner_model="claude-haiku",
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
         "timeout": 60,
     })
-    if r.status_code != 200:
-        pytest.skip(f"agent run failed: {r.status_code} {r.text}")
+    skip_on_upstream_unavailable(r)
+    assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
 
     runs = http.get("/v1/runs", params={"trace_tag": trace_tag, "limit": 10}).json()
@@ -116,3 +118,72 @@ def test_agent_stream_emits_openai_chunks(http, trace_tag, picked_agent):
                 if c.get("choices")]
     has_terminal = "stop" in finishes or any("error" in c for c in chunks)
     assert has_terminal, f"no terminal chunk; got {chunks!r}"
+
+
+# ---------- prepare → agent → artifacts loop ----------
+
+
+def test_agent_prepare_files_round_trip(http, trace_tag, picked_agent):
+    """`aitelier.prepare.files` ships a file into the sandbox and
+    `aitelier.artifacts.fetch` reads it back. Exercises SA's actual
+    `/v1/fs/file` wire shape — unit tests with mocked sa_proxy passed
+    for a year while the real call sent `path` in the body and got 400
+    from SA's query-string deserializer.
+
+    No skipping: a 4xx here means a real bug (wire shape, validator
+    misconfigured, picked_agent gone). The only legitimate non-pass is
+    a 502 if SA itself is unreachable — and that's a fixture-level
+    failure (`picked_agent` would also have failed)."""
+    import tempfile
+
+    agent = picked_agent
+    # Resolve to a real path; on macOS `/tmp` is a symlink to
+    # `/private/tmp` and Phase I's validator refuses any path with a
+    # symlinked component. We want to test prepare.files, not the
+    # symlink guard.
+    tmpdir = Path(tempfile.gettempdir()).resolve()
+    fname = str(tmpdir / f"aitelier-live-{trace_tag}.txt")
+    content = f"live-test-{trace_tag}"
+
+    r = http.post("/v1/chat/completions", json={
+        **_agent_body(agent, content="ok",
+                      aitelier_opts={
+                          "max_turns": 1, "trace_tag": trace_tag,
+                          "prepare": {"files": [{"path": fname, "content": content}]},
+                          "artifacts": {"fetch": [fname]},
+                      }),
+        "timeout": 60,
+    })
+
+    # Distinguish: prepare-layer breakage (the bug class this test
+    # guards) is a HARD FAIL. Agent-dispatch breakage downstream of a
+    # successful prepare also fails — we want to know if anything in
+    # the round-trip broke.
+    assert r.status_code != 400, (
+        f"aitelier rejected the request at validation: {r.text}. "
+        f"Likely a path-validation false positive on the test setup."
+    )
+    body = r.json()
+    if r.status_code == 500:
+        err_type = (body.get("error") or {}).get("type", "")
+        assert err_type != "PrepareFailed", (
+            f"prepare failed — the bug we guard: {body}"
+        )
+
+    # We need a successful run for the artifact fetch to populate.
+    assert r.status_code == 200, (
+        f"agent run didn't complete cleanly; status={r.status_code}, "
+        f"body={body}"
+    )
+    artifacts = body.get("aitelier_artifacts") or {}
+    assert fname in artifacts, (
+        f"expected `aitelier_artifacts[{fname!r}]` in response; got keys: "
+        f"{list(artifacts)}"
+    )
+    fetched = artifacts[fname]
+    fetched_text = (
+        fetched.get("content") if isinstance(fetched, dict) else fetched
+    )
+    assert content in str(fetched_text), (
+        f"round-trip mismatch — wrote {content!r}, read {fetched_text!r}"
+    )

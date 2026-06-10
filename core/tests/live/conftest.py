@@ -98,3 +98,22 @@ def wait_for_run_state(http: httpx.Client, run_id: str, target: str,
                 return r
         time.sleep(0.5)
     raise AssertionError(f"run {run_id} did not reach state={target} within {timeout}s")
+
+
+# Status codes that mean "the upstream provider, not aitelier, said no."
+# Anthropic OAuth tokens get rate-limited or expire; LiteLLM 5xxs on
+# transient backend issues. These are environmental — skipping is
+# correct. Anything else (400, 500 from aitelier itself, 422) means a
+# real bug and should NOT be wrapped in a skip.
+_UPSTREAM_UNAVAILABLE_CODES = frozenset({401, 403, 429, 503, 504})
+
+
+def skip_on_upstream_unavailable(r) -> None:
+    """Skip only on known-environmental status codes. For any other
+    non-2xx, the test should `assert r.status_code == 200, r.text` and
+    let the real failure surface."""
+    if r.status_code in _UPSTREAM_UNAVAILABLE_CODES:
+        pytest.skip(
+            f"upstream provider returned {r.status_code} — "
+            "not exercising aitelier behavior on this run",
+        )
