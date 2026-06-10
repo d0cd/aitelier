@@ -5,24 +5,37 @@
 # cleanly if brig isn't installed — brig isn't on PyPI / homebrew, so
 # this script is local-only by design.
 #
-# Uses post-restructure `brig <noun> <verb>` CLI form
-# (per the brig CLI restructure shipped earlier).
+# Uses brig 0.3.0 CLI surface (verified against the real binary):
+#   brig run --file <yaml> -d            (top-level; NOT `brig cell run`)
+#   brig cell stop / cell logs / cell list
+#   brig image build --tag X --file Y <context>
+#   brig system doctor
 #
 # What it does:
-#   1. Verifies `brig` is on PATH and the daemon responds.
-#   2. Ensures `localhost/aitelier:latest` image exists (or builds it).
+#   1. Verifies `brig` is on PATH and the VM is up.
+#   2. Builds `aitelier:latest` via `brig image build`.
 #   3. Launches the cell from docs/deploy/aitelier.cell.yaml.
 #   4. Polls the cell's ingress for /v1/health readiness.
 #   5. Runs the live test suite against aitelier-in-cell.
 #   6. Tears down on exit (success or failure).
 #
-# What it doesn't do:
-#   - Set up Postgres + LiteLLM as separate cells (the cell yaml lists
-#     `*.host.brig` URLs but assumes you've already configured brig's
-#     virtual-domain routing to reach them).
-#   - Materialize Claude / Codex credentials or aitelier.toml as brig
-#     secrets — the secrets block lists them but you must add them via
-#     `brig secrets add` before running this.
+# PREREQS (none of these are automated — set them up once locally):
+#   - `brig` on PATH globally. If you've installed brig but not exposed
+#     it system-wide:
+#         uv tool install -e ~/projects/brig
+#     Or (simpler) just run via:
+#         (cd ~/projects/brig && uv run brig <args>)
+#   - VM running: `brig system up`
+#   - aitelier-config + aitelier-secrets-toml + claude-credentials +
+#     codex-credentials registered as brig secrets:
+#         brig secrets add aitelier-config < aitelier.toml
+#         brig secrets add aitelier-secrets-toml < aitelier.secrets.toml
+#         brig secrets add claude-credentials < ~/.claude/.credentials.json
+#         brig secrets add codex-credentials < ~/.codex/auth.json
+#   - Postgres + LiteLLM reachable via `*.host.brig` routing:
+#         brig policy set global --allow api.anthropic.com
+#         # Add postgres to host_services if not already there
+#         # (litellm + aitelier are typically pre-configured).
 #
 # Run with:
 #   ./scripts/test-brig-mode.sh
@@ -39,17 +52,19 @@ CELL_NAME="aitelier"
 INGRESS_URL="${BRIG_AITELIER_URL:-http://aitelier.host.brig}"
 
 if ! command -v brig >/dev/null 2>&1; then
-    echo "✗ brig not installed; skipping brig-mode e2e."
-    echo "  This script targets a brig-cell deployment of aitelier."
-    echo "  See docs/deploy/aitelier.cell.yaml for the cell definition."
+    echo "✗ brig not on PATH; skipping brig-mode e2e."
+    echo "  Install system-wide:"
+    echo "    uv tool install -e ~/projects/brig"
+    echo "  Or run this script via:"
+    echo "    PATH=\"\$HOME/projects/brig/.venv/bin:\$PATH\" ./scripts/test-brig-mode.sh"
     exit 0
 fi
 
-# brig CLI is `brig <noun> <verb>` post-restructure. Probe for
-# `brig system status` first; if that fails, the daemon's down.
-if ! brig system status >/dev/null 2>&1; then
-    echo "✗ \`brig system status\` failed."
-    echo "  Make sure brig's daemon is running."
+# brig 0.3.0 has no `system status`. Use `system doctor` to confirm
+# the VM + warden are healthy. Fall back to limactl if doctor missing.
+if ! brig system doctor --quick >/dev/null 2>&1; then
+    echo "✗ \`brig system doctor --quick\` failed."
+    echo "  Bring brig up:  brig system up"
     exit 1
 fi
 
@@ -57,36 +72,30 @@ cleanup() {
     echo ""
     echo "=== Tearing down cell ==="
     brig cell stop "$CELL_NAME" >/dev/null 2>&1 || true
-    echo "  ✓ cell stopped"
+    brig cell rm "$CELL_NAME" >/dev/null 2>&1 || true
+    echo "  ✓ cell stopped + removed"
 }
 trap cleanup EXIT
 
-echo "=== Checking aitelier image ==="
-# `brig image ls` lists local images; format unspecified across brig
-# versions so we grep the image name.
-if ! brig image ls 2>/dev/null | grep -q "localhost/aitelier:latest\|aitelier:latest"; then
-    echo "  aitelier image not found; building from docker/Dockerfile..."
-    if brig image build --tag aitelier:latest --file docker/Dockerfile .; then
-        echo "  ✓ built aitelier:latest"
-    else
-        echo "  ✗ \`brig image build\` failed."
-        echo "    Build manually with brig (consult \`brig image build --help\`)"
-        echo "    or use docker: docker build -f docker/Dockerfile -t aitelier:latest ."
-        exit 1
-    fi
-else
-    echo "  ✓ aitelier:latest already present"
+echo "=== Building aitelier:latest ==="
+# `brig image build` doesn't have a `list` / `ls` subcommand. Just
+# build unconditionally — the build cache makes repeats cheap.
+if ! brig image build --tag aitelier:latest --file docker/Dockerfile .; then
+    echo "  ✗ image build failed."
+    exit 1
 fi
 
 echo "=== Stopping any prior cell ==="
 brig cell stop "$CELL_NAME" >/dev/null 2>&1 || true
+brig cell rm "$CELL_NAME" >/dev/null 2>&1 || true
 
 echo "=== Launching cell from $CELL_YAML ==="
-if ! brig cell run --file "$CELL_YAML" -d; then
-    echo "  ✗ \`brig cell run\` failed."
+if ! brig run --file "$CELL_YAML" -d; then
+    echo "  ✗ \`brig run\` failed."
     echo "    Check that secrets referenced in the yaml are registered:"
     echo "      brig secrets list"
-    echo "    And that policy.allow covers the hosts your build needs."
+    echo "    And that policy.allow covers api.anthropic.com etc.:"
+    echo "      brig policy show"
     exit 1
 fi
 
