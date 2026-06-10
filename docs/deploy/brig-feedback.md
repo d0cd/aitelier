@@ -194,6 +194,64 @@ dies at the TLS layer inside Warden.
 Until then: keep `claude` as the only curated brig backend; document
 the limitation in the test script.
 
+
+### The principled fix for outbound credentialed traffic
+
+Beyond the specific chatgpt.com symptom, this is a general class
+problem: any host with **strict TLS** — public-key pinning (HPKP),
+Certificate Transparency expectations, Encrypted Client Hello (ECH),
+tight ALPN/cipher negotiation, or Cloudflare's bot-fingerprinting
+TLS — will refuse mitmproxy's relayed handshake. The list will only
+grow as more providers harden their edges.
+
+mitmproxy can't be expected to satisfy every modern TLS endpoint.
+Brig's design needs to accept that constraint and offer operators an
+explicit, audited way to opt out of MITM per host.
+
+**Threat-model framing brig should adopt:**
+
+| Concern | MITM mode | Passthrough mode |
+|---|---|---|
+| Host allowlist enforcement (SNI match) | ✓ | ✓ — Warden reads SNI from client hello |
+| Per-request URL / method audit | ✓ | ✗ — only SNI + connection metadata |
+| Body inspection / DLP | ✓ | ✗ |
+| Credential confidentiality (cell ↔ provider) | ✗ — warden sees the cleartext | ✓ — warden never sees the body |
+| Handshake compatibility with strict TLS | ✗ | ✓ |
+
+For an agent runtime that holds the OPERATOR'S provider credentials
+(claude OAuth, codex OAuth, OpenAI API keys), the passthrough mode is
+arguably more secure than MITM: warden in MITM mode sees every bearer
+token on every request. Operators trust warden today only because
+they own it; in a multi-tenant brig (when it lands), passthrough
+becomes the only acceptable mode for credentialed flows.
+
+**Concrete API ask:**
+
+```yaml
+# cells/<name>.yaml
+policy:
+  allow:
+    - "api.anthropic.com"     # default: MITM, full URL audit
+    - "registry.npmjs.org"
+  passthrough_tls:
+    - "chatgpt.com"           # raw TCP tunnel after CONNECT; SNI-only audit
+    - "auth.openai.com"       # codex OAuth refresh
+```
+
+Keeping `allow` and `passthrough_tls` as separate lists (rather than
+overloading the allow entries with per-host attributes) gives a clear
+visual signal that these hosts are NOT being inspected and forces an
+explicit operator decision per-host. Warden's audit log should
+distinguish the two modes so operators can tell from log lines whether
+a request was inspected or just SNI-routed.
+
+**Implementation pointer** (for the brig devs): mitmproxy supports
+this natively via the `tls_strategy` addon hooks. Setting
+`flow.client_conn.tls_passthrough = True` in `tls_clienthello`
+based on the matched SNI is a ~10-line addon. Warden's existing
+host-policy resolution gives us the matched host name; the only new
+logic is the passthrough_tls allowlist match + the metadata flip.
+
 ## Smaller frictions (now that we hit them, worth flagging)
 
 ### `brig cell network` only logs egress

@@ -41,4 +41,16 @@ fi
 # traffic with bearer auth (`<cell-name>-ingress-token` secret).
 # Bind 0.0.0.0 so the ingress reverse-proxy at the warden layer can
 # reach SA from its bridge IP.
-exec sandbox-agent server --host 0.0.0.0 --port 2468 --no-token
+#
+# `--no-telemetry` disables SA's anonymous usage POSTs to
+# `tc.rivet.dev`. Without it, warden blocks the call (not in
+# policy.allow), SA retries, and the retry loop adds ~30-90s to the
+# agent-startup critical path. Allowing the host would let SA phone
+# home with usage data we don't owe Rivet anyway.
+#
+# SA self-redirects logs to /tmp/home/.local/share/sandbox-agent/logs/
+# (the entrypoint's redirect is replaced at runtime). `brig cell logs`
+# will be empty as a result — to inspect SA's actual logs:
+#   brig cell exec sandbox-agent sh -c \
+#     'tail -50 /tmp/home/.local/share/sandbox-agent/logs/log-*'
+exec sandbox-agent server --host 0.0.0.0 --port 2468 --no-token --no-telemetry
