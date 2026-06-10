@@ -16,7 +16,11 @@ install:
 test: test-py test-ts
 
 test-py:
-	uv run pytest core/tests/ sdks/python/tests/ sdks/python-mcp/tests/ -v
+	# AITELIER_TEST_DATABASE_URL points at the dev Postgres that `make start`
+	# boots. The Postgres-integration tests in test_storage.py require it.
+	# Override (e.g. for CI) by exporting before `make test`.
+	AITELIER_TEST_DATABASE_URL="$${AITELIER_TEST_DATABASE_URL:-postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier}" \
+	  uv run pytest core/tests/ sdks/python/tests/ sdks/python-mcp/tests/ -v
 
 test-ts:
 	cd sdks/typescript && npx tsc --noEmit && npx vitest run

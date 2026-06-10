@@ -17,8 +17,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import pytest
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DOCTOR_SH = REPO_ROOT / "scripts" / "doctor.sh"
 
@@ -27,9 +25,13 @@ def _has(cmd: str) -> bool:
     return shutil.which(cmd) is not None
 
 
-pytestmark = pytest.mark.skipif(
-    not (_has("bash") and _has("lsof")),
-    reason="doctor.sh needs bash + lsof",
+# Strict mode: doctor.sh requires bash + lsof; if the host is missing
+# them, fail loudly at the module-level assertion rather than skipping.
+# This catches CI machines that don't have the tools doctor needs.
+assert _has("bash") and _has("lsof"), (
+    "doctor.sh needs bash and lsof on PATH. Install them (e.g. via "
+    "Homebrew on macOS, apt on Debian) or deselect this file with "
+    "`pytest -k 'not doctor'`."
 )
 
 

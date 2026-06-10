@@ -359,17 +359,30 @@ async def test_webhook_enqueue_claim_record(store):
     assert len(due_again) == 0
 
 
-# --- Optional Postgres integration test (gated on DATABASE_URL) -------------
+# --- Postgres integration tests (strict — require DATABASE_URL) -------------
+#
+# These hit a real Postgres. In strict mode the env var must be set; an
+# unset var fails the test rather than skipping. Set:
+#   export AITELIER_TEST_DATABASE_URL=postgresql://aitelier:aitelier_local@localhost:5433/aitelier
+# (matches the dev Postgres that `make start` boots.) To exclude these
+# without running them, deselect via `-k 'not postgres'`.
+
+
+def _require_database_url() -> str:
+    url = os.environ.get("AITELIER_TEST_DATABASE_URL")
+    assert url, (
+        "AITELIER_TEST_DATABASE_URL must be set for Postgres integration "
+        "tests. Try: "
+        "export AITELIER_TEST_DATABASE_URL="
+        "postgresql://aitelier:aitelier_local@localhost:5433/aitelier"
+    )
+    return url
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not os.environ.get("AITELIER_TEST_DATABASE_URL"),
-    reason="set AITELIER_TEST_DATABASE_URL to run Postgres integration tests",
-)
 async def test_postgres_round_trip():
     """Smoke test against a real Postgres. Verifies the migration + a CRUD cycle."""
-    store = PostgresStore(os.environ["AITELIER_TEST_DATABASE_URL"])
+    store = PostgresStore(_require_database_url())
     await store.connect()
     try:
         await store.create_run(RunSpec(run_id="pg-test-1", kind="agent",
@@ -389,14 +402,10 @@ async def test_postgres_round_trip():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not os.environ.get("AITELIER_TEST_DATABASE_URL"),
-    reason="set AITELIER_TEST_DATABASE_URL to run Postgres integration tests",
-)
 async def test_postgres_update_run_sandbox_and_orphan_sweep():
     """Verify the Postgres-specific COALESCE semantics on update_run_sandbox
     and the startup orphan sweep — these don't exercise on InMemoryStore."""
-    store = PostgresStore(os.environ["AITELIER_TEST_DATABASE_URL"])
+    store = PostgresStore(_require_database_url())
     await store.connect()
     try:
         # Partial updates: only url first, then only server_id; both should

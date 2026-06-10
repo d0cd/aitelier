@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
 
 def test_active_runs_endpoint_shape(http):
     """Even with nothing in flight, the endpoint should respond with the
@@ -45,6 +43,11 @@ def test_cancel_active_run_returns_cancelled_ack(http, trace_tag, picked_agent):
     r.raise_for_status()
     run_id = r.json()["run_id"]
 
+    # Observe the run as active. If the backend finishes faster than we can
+    # poll, the test design is racy and needs to be redesigned (e.g.,
+    # against a slow `mock` backend with a deliberate delay). Failing
+    # here is the honest signal: cancellation can't be tested if we can't
+    # see the run in flight.
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         active = http.get("/v1/runs/active").json()["active"]
@@ -52,14 +55,20 @@ def test_cancel_active_run_returns_cancelled_ack(http, trace_tag, picked_agent):
             break
         time.sleep(0.05)
     else:
-        pytest.skip("run never reached the active registry (backend too fast)")
+        raise AssertionError(
+            f"run {run_id} never appeared in /v1/runs/active within 10s. "
+            f"Either the backend is too fast to observe (test needs a "
+            f"deterministic-slow backend) or the active registry has a bug."
+        )
 
     cancel = http.post(f"/v1/runs/{run_id}/cancel")
-    if cancel.status_code == 404:
-        # Run finalized (e.g. upstream rate-limited) between our active-check
-        # and the cancel POST. Not a cancellation-contract bug.
-        pytest.skip("run finished between active-check and cancel — no live test possible")
-    assert cancel.status_code == 200, cancel.text
+    assert cancel.status_code == 200, (
+        f"cancel returned HTTP {cancel.status_code}: {cancel.text}. "
+        f"If 404, the run finalized between active-check and cancel — "
+        f"that's a race in the test design, not a cancellation bug, but "
+        f"it still needs fixing (use a slower backend so the race window "
+        f"closes deterministically)."
+    )
     assert cancel.json() == {"run_id": run_id, "cancelled": True}
 
     # The run must transition to *some* terminal state, never stuck in
@@ -73,4 +82,6 @@ def test_cancel_active_run_returns_cancelled_ack(http, trace_tag, picked_agent):
         if mine and mine["state"] in ("cancelled", "completed", "failed"):
             return
         time.sleep(0.5)
-    pytest.fail(f"run {run_id} never reached a terminal state after cancel")
+    raise AssertionError(
+        f"run {run_id} never reached a terminal state after cancel"
+    )

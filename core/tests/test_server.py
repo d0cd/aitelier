@@ -1708,6 +1708,15 @@ def test_agent_prepare_runs_setup_commands_and_files(client):
     ]
     assert any(m == "POST" and "/v1/processes/run" in p for m, p in methods_and_paths)
     assert any(m == "PUT" and "/v1/fs/file" in p for m, p in methods_and_paths)
+    # SA's PUT /v1/fs/file deserializes `path` from the query string, not
+    # the body. Lock that in: path must travel as a param, and the JSON
+    # body must NOT carry it.
+    put_call = next(
+        c for c in fake_client.request.call_args_list
+        if c.args[0] == "PUT" and "/v1/fs/file" in c.args[1]
+    )
+    assert put_call.kwargs["params"] == {"path": "/workspace/in.txt"}
+    assert "path" not in (put_call.kwargs.get("json") or {})
 
 
 def test_agent_prepare_command_failure_short_circuits_agent(client):

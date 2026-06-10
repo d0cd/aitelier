@@ -1,40 +1,60 @@
 """Live tests for /v1/chat/completions (LLM path) and /v1/embeddings against
 a running aitelier. Hits the real LiteLLM + model stack so the surface
 documented in INTEGRATION.md is continuously verified end-to-end.
+
+Strict mode: if a curated model isn't advertised by /v1/discovery, the
+test fails — provisioning gaps must be visible, not papered over.
+
+LLM-mode tests target `local` (Ollama via LiteLLM) so they don't need
+an external provider key. Anthropic-specific behavior (e.g. the
+strip-and-system-prompt fallback when response_format=json_object isn't
+natively supported) is covered by unit tests against a mocked provider.
 """
 
 from __future__ import annotations
 
 import json
 
-import pytest
-
-from .conftest import skip_on_upstream_unavailable as _skip_on_upstream_unavailable
+from .conftest import assert_upstream_ok
 
 
-def _has_claude_haiku(models: list[str]) -> bool:
-    return any(m == "claude-haiku" or m.endswith("/claude-haiku") for m in models)
+def _assert_curated_model(model: str, models: list[str]) -> None:
+    """Strict gate: the curated model must be advertised. Tells the
+    operator exactly what's missing instead of skipping."""
+    assert model in models or any(m.endswith(f"/{model}") for m in models), (
+        f"{model!r} must be advertised by /v1/discovery for this test. "
+        f"Curated models in this LiteLLM config: "
+        f"{sorted(m for m in models if '/' not in m)}"
+    )
 
 
 # ---------- /v1/chat/completions (LLM path) ----------
 
 
-def test_chat_completions_returns_content_for_haiku(http, litellm_models):
-    if not _has_claude_haiku(litellm_models):
-        pytest.skip("claude-haiku not in this LiteLLM config")
+def test_chat_completions_returns_content(http, litellm_models):
+    """Basic completion against `local` (Ollama). Verifies the OpenAI
+    response shape: object/choices/message, usage, correlation. Allows
+    content to be empty when a reasoning model (qwen3 etc.) routes all
+    its tokens to hidden thinking — finish_reason must still be honest,
+    and `test_chat_completions_local_reasoning_model_acceptance` covers
+    the empty-content-with-reasoning-signal case separately."""
+    _assert_curated_model("local", litellm_models)
     r = http.post("/v1/chat/completions", json={
-        "model": "claude-haiku",
+        "model": "local",
         "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
-        "max_tokens": 20,
+        "max_tokens": 200,
         "temperature": 0,
     })
-    _skip_on_upstream_unavailable(r)
-    r.raise_for_status()
+    assert_upstream_ok(r)
     body = r.json()
     assert body["object"] == "chat.completion"
-    content = body["choices"][0]["message"]["content"]
-    if body["usage"]["completion_tokens"] > 0:
-        assert content, "output tokens reported but content is empty"
+    choice = body["choices"][0]
+    msg = choice["message"]
+    assert (
+        msg.get("content")
+        or msg.get("reasoning_content")
+        or choice.get("finish_reason") in ("stop", "length")
+    ), f"response has no content, reasoning, or terminal finish: {choice}"
     assert body["aitelier_run_id"]
     assert body["correlation_id"]
 
@@ -43,16 +63,14 @@ def test_chat_completions_with_local_model(http, litellm_models):
     """Contract: even reasoning models (qwen3 / o1 / thinking) return a
     valid ChatCompletion. With the Ollama bypass, thinking surfaces as
     `message.reasoning_content` and `finish_reason` is honest."""
-    if "local" not in litellm_models:
-        pytest.skip("`local` model not configured in LiteLLM")
+    _assert_curated_model("local", litellm_models)
     r = http.post("/v1/chat/completions", json={
         "model": "local",
         "messages": [{"role": "user", "content": "Reply with just: hi"}],
         "max_tokens": 200,
         "temperature": 0,
     })
-    if r.status_code != 200:
-        pytest.skip(f"local model unavailable: {r.text}")
+    assert_upstream_ok(r)
     body = r.json()
     assert body["object"] == "chat.completion"
     finish = body["choices"][0]["finish_reason"]
@@ -64,8 +82,7 @@ def test_chat_completions_local_reasoning_model_acceptance(http, litellm_models)
     """For `local` with completion_tokens > 0, at least one of content /
     reasoning_content / tool_calls must be non-empty. Catches the
     LiteLLM-drops-thinking regression on Ollama-routed reasoning models."""
-    if "local" not in litellm_models:
-        pytest.skip("`local` model not configured")
+    _assert_curated_model("local", litellm_models)
     # Tight budget forces qwen3-class models into hidden reasoning territory.
     r = http.post("/v1/chat/completions", json={
         "model": "local",
@@ -73,8 +90,7 @@ def test_chat_completions_local_reasoning_model_acceptance(http, litellm_models)
         "max_tokens": 50,
         "temperature": 0,
     })
-    _skip_on_upstream_unavailable(r)
-    assert r.status_code == 200, r.text
+    assert_upstream_ok(r)
     body = r.json()
     completion_tokens = body["usage"]["completion_tokens"]
     msg = body["choices"][0]["message"]
@@ -94,26 +110,21 @@ def test_chat_completions_local_reasoning_model_acceptance(http, litellm_models)
     )
 
 
-def test_chat_completions_json_object_on_anthropic_returns_200(http):
-    """When a provider doesn't natively support `json_object`, aitelier
-    strips the param and injects a system-prompt directive — the call
-    should succeed."""
+def test_chat_completions_json_object_returns_200(http, litellm_models):
+    """`response_format: json_object` must round-trip without 422 / drop.
+    Exercised against `local` (Ollama, which has native json_object via
+    the bypass adapter); the Anthropic-fallback path (strip + system-
+    prompt directive) is covered by unit tests against a mocked provider."""
+    _assert_curated_model("local", litellm_models)
     r = http.post("/v1/chat/completions", json={
-        "model": "claude-haiku",
+        "model": "local",
         "messages": [{"role": "user",
                        "content": "Return JSON like {\"ok\": true}"}],
         "response_format": {"type": "json_object"},
         "max_tokens": 50,
         "temperature": 0,
     })
-    _skip_on_upstream_unavailable(r)
-    # The assertion this test enforces is aitelier's contract:
-    # `response_format: json_object` on an unsupported provider must
-    # NOT 422 and must NOT drop the request — aitelier strips the
-    # param and injects a system-prompt directive, so the call should
-    # land at 200. Whether the MODEL actually returns parseable JSON
-    # is the model's job; aitelier doesn't promise it.
-    assert r.status_code == 200, r.text
+    assert_upstream_ok(r)
 
 
 def test_chat_completions_json_schema_on_local_uses_ollama_structured_output(
@@ -122,8 +133,7 @@ def test_chat_completions_json_schema_on_local_uses_ollama_structured_output(
     """With the Ollama bypass, `local` supports json_schema natively via
     Ollama's `format` parameter (structured outputs). Returns 200 with
     `aitelier_parsed` populated when the model produces parseable JSON."""
-    if "local" not in litellm_models:
-        pytest.skip("`local` model not configured")
+    _assert_curated_model("local", litellm_models)
     r = http.post("/v1/chat/completions", json={
         "model": "local",
         "messages": [{"role": "user", "content": "Return JSON: x is the string 'ok'"}],
@@ -139,8 +149,7 @@ def test_chat_completions_json_schema_on_local_uses_ollama_structured_output(
         },
         "max_completion_tokens": 400,
     })
-    if r.status_code != 200:
-        pytest.skip(f"local model unavailable: {r.status_code} {r.text}")
+    assert_upstream_ok(r)
     body = r.json()
     content = body["choices"][0]["message"].get("content") or ""
     # Either the content parses as JSON (Ollama enforced the schema) or
@@ -160,18 +169,23 @@ def test_chat_completions_json_schema_on_local_uses_ollama_structured_output(
 
 
 def test_chat_completions_stream_emits_chunks(http, litellm_models):
-    if not _has_claude_haiku(litellm_models):
-        pytest.skip("claude-haiku not configured")
+    """SSE streaming wire format. Allows finish_reason to be `length` as
+    well as `stop` — a reasoning model on a tight budget can legitimately
+    terminate via length, and the test is about the OpenAI chunk shape,
+    not the model's verbosity."""
+    _assert_curated_model("local", litellm_models)
     chunks = []
     with http.stream("POST", "/v1/chat/completions", json={
-        "model": "claude-haiku",
+        "model": "local",
         "messages": [{"role": "user", "content": "Count to three."}],
-        "max_tokens": 30,
+        "max_tokens": 200,
         "temperature": 0,
         "stream": True,
     }) as resp:
-        _skip_on_upstream_unavailable(resp)
-        resp.raise_for_status()
+        assert resp.status_code == 200, (
+            f"stream open failed: HTTP {resp.status_code}. See conftest's "
+            f"`assert_upstream_ok` for the diagnostic table."
+        )
         for line in resp.iter_lines():
             if line.startswith("data: "):
                 payload = line[6:].strip()
@@ -181,14 +195,21 @@ def test_chat_completions_stream_emits_chunks(http, litellm_models):
                     chunks.append(json.loads(payload))
                 except json.JSONDecodeError:
                     pass
-    # Upstream may have failed mid-stream (rate limit etc.); skip rather
-    # than fail when we got an error envelope instead of a terminal stop.
-    if any("error" in c for c in chunks):
-        pytest.skip(f"upstream errored mid-stream: {chunks[-1].get('error')}")
+    # If a chunk reports an error envelope mid-stream, that's a real bug
+    # in aitelier's streaming surface — fail rather than dressing it as
+    # an environmental issue.
+    error_chunks = [c["error"] for c in chunks if "error" in c]
+    assert not error_chunks, (
+        f"stream emitted error chunks: {error_chunks}. Streaming must "
+        f"surface clean terminal chunks; mid-stream errors indicate a "
+        f"real upstream or aitelier bug."
+    )
     assert chunks, "expected at least one OpenAI chunk"
     finishes = [c["choices"][0].get("finish_reason") for c in chunks
                 if c.get("choices")]
-    assert "stop" in finishes
+    assert any(f in ("stop", "length") for f in finishes), (
+        f"stream never emitted a terminal finish_reason; got: {finishes}"
+    )
 
 
 # ---------- /v1/models ----------
@@ -243,8 +264,7 @@ def test_discovery_exposes_model_response_format_capabilities(http):
 
 
 def test_embeddings_returns_correct_dimensions(http, litellm_models):
-    if "nomic-embed-text" not in litellm_models:
-        pytest.skip("nomic-embed-text not configured")
+    _assert_curated_model("nomic-embed-text", litellm_models)
     r = http.post("/v1/embeddings", json={
         "model": "nomic-embed-text",
         "input": ["one", "two"],

@@ -1,34 +1,40 @@
-"""Live tests for /v1/runs*, /v1/schedules, /v1/traces/aggregates."""
+"""Live tests for /v1/runs*, /v1/schedules, /v1/traces/aggregates.
+
+Strict mode: missing curated models or upstream failures fail the test
+rather than skipping. See ./conftest.py.
+
+LLM-mode tests target `local` (Ollama via LiteLLM) so no external
+provider key is required.
+"""
 
 from __future__ import annotations
 
 import uuid
 
-import pytest
-
-from .conftest import skip_on_upstream_unavailable as _skip_on_upstream_unavailable
+from .conftest import assert_upstream_ok
 
 
-def _has_claude_haiku(models: list[str]) -> bool:
-    return any(m == "claude-haiku" or m.endswith("/claude-haiku") for m in models)
+def _assert_local(litellm_models: list[str]) -> None:
+    assert "local" in litellm_models, (
+        f"`local` (Ollama) must be advertised by /v1/discovery for this test. "
+        f"Curated models: {sorted(m for m in litellm_models if '/' not in m)}"
+    )
 
 
 def test_runs_list_filterable_by_trace_tag(http, trace_tag, litellm_models):
-    if not _has_claude_haiku(litellm_models):
-        pytest.skip("claude-haiku not configured")
+    _assert_local(litellm_models)
     # Create a run with a trace tag via aitelier headers (since OpenAI shape
     # has no trace_tag field, use correlation_id and look up by run_id).
     r = http.post(
         "/v1/chat/completions",
         json={
-            "model": "claude-haiku",
+            "model": "local",
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 10, "temperature": 0,
         },
         headers={"X-Correlation-Id": trace_tag},
     )
-    _skip_on_upstream_unavailable(r)
-    r.raise_for_status()
+    assert_upstream_ok(r)
     run_id = r.json()["aitelier_run_id"]
 
     runs = http.get("/v1/runs", params={"correlation_id": trace_tag}).json()
@@ -45,11 +51,12 @@ def test_runs_events_endpoint_returns_timeline(http, trace_tag, picked_agent):
         json={
             "model": f"agent:{agent}",
             "messages": [{"role": "user", "content": "ack"}],
-            "timeout": 30,
+            # 120s for brig's slower first-call path; host/docker finish
+            # well under this.
+            "timeout": 120,
             "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
         },
     )
-    _skip_on_upstream_unavailable(r)
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
 
@@ -59,20 +66,18 @@ def test_runs_events_endpoint_returns_timeline(http, trace_tag, picked_agent):
 
 
 def test_traces_aggregates_groups_by_correlation(http, trace_tag, litellm_models):
-    if not _has_claude_haiku(litellm_models):
-        pytest.skip("claude-haiku not configured")
+    _assert_local(litellm_models)
     for _ in range(2):
         r = http.post(
             "/v1/chat/completions",
             json={
-                "model": "claude-haiku",
+                "model": "local",
                 "messages": [{"role": "user", "content": "ping"}],
                 "max_tokens": 5, "temperature": 0,
             },
             headers={"X-Correlation-Id": trace_tag},
         )
-        _skip_on_upstream_unavailable(r)
-        r.raise_for_status()
+        assert_upstream_ok(r)
 
     agg = http.get("/v1/traces/aggregates", params={
         "group_by": "model",
@@ -89,7 +94,7 @@ def test_schedule_crud_round_trip(http):
     created = http.post("/v1/schedules", json={
         "name": name,
         "task": {
-            "model": "claude-haiku",
+            "model": "local",
             "messages": [{"role": "user", "content": "ping"}],
         },
         "interval_seconds": 3600,

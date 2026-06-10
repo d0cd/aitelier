@@ -8,8 +8,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
-
 
 def _agent_body(agent: str, *, content: str = "Reply with exactly: ack",
                 inner_model: str | None = None,
@@ -32,7 +30,7 @@ def test_agent_sync_returns_chat_completion(http, trace_tag, picked_agent):
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent, aitelier_opts={"max_turns": 1,
                                               "trace_tag": trace_tag}),
-        "timeout": 60,
+        "timeout": 120,
     })
     assert r.status_code in (200, 500, 502), r.text
     if r.status_code == 200:
@@ -56,10 +54,12 @@ def test_agent_rejects_openai_tools(http, picked_agent):
 
 def test_agent_rejects_aitelier_namespace_on_llm_path(http, litellm_models):
     """`aitelier.*` is agent-only — must be rejected for LLM models."""
-    if "claude-haiku" not in litellm_models:
-        pytest.skip("claude-haiku not configured")
+    assert "local" in litellm_models, (
+        f"`local` (Ollama) must be advertised by /v1/discovery for this test. "
+        f"Got: {sorted(m for m in litellm_models if '/' not in m)}"
+    )
     r = http.post("/v1/chat/completions", json={
-        "model": "claude-haiku",
+        "model": "local",
         "messages": [{"role": "user", "content": "hi"}],
         "aitelier": {"workspace": "/tmp"},
     })
@@ -70,14 +70,16 @@ def test_agent_rejects_aitelier_namespace_on_llm_path(http, litellm_models):
 def test_agent_run_persists_agent_id_and_inner_model(http, trace_tag, picked_agent):
     """The run row should record agent_id=<backend> and model=<inner LLM>
     distinctly, not collapse them."""
-    from .conftest import skip_on_upstream_unavailable
     agent = picked_agent
+    # `local` (Ollama) as the inner model — verifies aitelier records what
+    # was requested, regardless of whether the agent CLI actually honors
+    # the inner-model hint (most agent CLIs use their own provider).
+    inner = "local"
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent, inner_model="claude-haiku",
+        **_agent_body(agent, inner_model=inner,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 60,
+        "timeout": 120,
     })
-    skip_on_upstream_unavailable(r)
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
 
@@ -86,7 +88,7 @@ def test_agent_run_persists_agent_id_and_inner_model(http, trace_tag, picked_age
     assert mine, f"could not find run {run_id} via /v1/runs"
     row = mine[0]
     assert row["agent_id"] == agent
-    assert row["model"] == "claude-haiku"
+    assert row["model"] == inner
 
 
 # ---------- /v1/chat/completions agent path (stream) ----------
@@ -100,7 +102,7 @@ def test_agent_stream_emits_openai_chunks(http, trace_tag, picked_agent):
     with http.stream("POST", "/v1/chat/completions", json={
         **_agent_body(agent, content="Say one word: hello",
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 60,
+        "timeout": 120,
         "stream": True,
     }) as resp:
         resp.raise_for_status()
@@ -134,14 +136,20 @@ def test_agent_prepare_files_round_trip(http, trace_tag, picked_agent):
     misconfigured, picked_agent gone). The only legitimate non-pass is
     a 502 if SA itself is unreachable — and that's a fixture-level
     failure (`picked_agent` would also have failed)."""
+    import os
     import tempfile
 
     agent = picked_agent
-    # Resolve to a real path; on macOS `/tmp` is a symlink to
-    # `/private/tmp` and Phase I's validator refuses any path with a
-    # symlinked component. We want to test prepare.files, not the
-    # symlink guard.
-    tmpdir = Path(tempfile.gettempdir()).resolve()
+    # Path must be (a) writable on the aitelier+SA side, (b) non-symlinked
+    # so Phase I's symlink-component guard accepts it. Host/docker deploys:
+    # both processes run on the host; `Path(tempfile.gettempdir()).resolve()`
+    # returns `/private/tmp` on macOS — writable, non-symlinked. Brig
+    # deploys: aitelier+SA run inside the cell; the host's `/private/tmp`
+    # doesn't exist there, but the cell's `/tmp` is a real (non-symlinked)
+    # writable tmpfs. AITELIER_LIVE_TMPDIR lets the test runner pin
+    # whichever path is correct for the target deployment.
+    tmpdir_str = os.environ.get("AITELIER_LIVE_TMPDIR")
+    tmpdir = Path(tmpdir_str) if tmpdir_str else Path(tempfile.gettempdir()).resolve()
     fname = str(tmpdir / f"aitelier-live-{trace_tag}.txt")
     content = f"live-test-{trace_tag}"
 
@@ -152,7 +160,7 @@ def test_agent_prepare_files_round_trip(http, trace_tag, picked_agent):
                           "prepare": {"files": [{"path": fname, "content": content}]},
                           "artifacts": {"fetch": [fname]},
                       }),
-        "timeout": 60,
+        "timeout": 120,
     })
 
     # Distinguish: prepare-layer breakage (the bug class this test
