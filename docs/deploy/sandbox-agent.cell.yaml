@@ -1,0 +1,94 @@
+# Example brig cell for Rivet's Sandbox Agent (SA).
+#
+# Architecture:
+#   - Only SA runs in this cell. Aitelier itself runs elsewhere (host,
+#     docker, k8s, …) and reaches SA-in-cell via brig's ingress reverse
+#     proxy on the host: http://127.0.0.1:8443/sandbox-agent/v1/...
+#     with `Authorization: Bearer <ingress-token>`.
+#   - SA's job is to sandbox agent CLI execution (claude-code, codex,
+#     opencode, …). brig is the isolation layer. Putting aitelier in the
+#     same cell would conflate aitelier's runtime with the agent
+#     execution sandbox — which defeats brig's purpose.
+#
+# Aitelier configuration (in aitelier.toml on whatever host runs it):
+#   [sandbox_agent]
+#   base_url = "http://127.0.0.1:8443/sandbox-agent"
+#   token    = "<the same bearer token in aitelier.secrets.toml>"
+#
+# Run with: brig run --file docs/deploy/sandbox-agent.cell.yaml -d
+# Attach:   brig cell shell sandbox-agent
+# Logs:     brig cell logs sandbox-agent -f
+# Network:  brig cell network sandbox-agent
+
+name: sandbox-agent
+image: localhost/sandbox-agent-brig:latest
+# Entrypoint stages secrets + trusts warden's MITM CA, then execs SA.
+command: ["/app/cell-entrypoint.sh"]
+memory: 8g
+cpus: 4
+pids_limit: 4096
+network: default
+detach: true
+workspace_quota: "20g"
+
+# --- Workspace passthrough ---
+# Brig auto-provides /work inside the cell (backed by the cell's
+# workspace dir under .brig/state/<cell>/workspace on the host).
+# Agent file operations (Read/Write/etc.) and `aitelier.workspace`
+# requests reference paths under /work.
+
+# --- Credentials + CA ---
+# Register with `brig secrets add <name>` before running the cell.
+# Aitelier never enters this cell — its config lives wherever aitelier
+# itself runs, not here.
+secrets:
+  - claude-credentials         # → $HOME/.claude/.credentials.json
+  - codex-credentials          # → $HOME/.codex/auth.json
+  - warden-ca-cert             # → trust store (SA's HTTPS to Anthropic)
+
+env: {}
+
+# --- Network policy ---
+# Warden enforces this; default deny + explicit allow.
+policy:
+  allow:
+    # LLM providers the agent CLIs hit at runtime.
+    - "api.anthropic.com"
+    - "api.openai.com"
+    # - "generativelanguage.googleapis.com"
+
+    # Sandbox-agent installer (one-time on cold cell boot; SA is baked
+    # into the image so this is just a safety net).
+    - "releases.rivet.dev"
+
+    # Agent CLI distribution mirrors. SA fetches binaries / npm packages
+    # on first agent invocation if they're not pre-baked.
+    - "storage.googleapis.com"
+    - "github.com"
+    - "api.github.com"
+    - "objects.githubusercontent.com"
+
+    # ACP "agent process" registry (manifest fetched on every
+    # initialize to pick which acp-bridge to spawn).
+    - "cdn.agentclientprotocol.com"
+
+    # npm registry (fallback if the bridge npm package isn't pre-baked).
+    - "registry.npmjs.org"
+
+  deny: []
+
+# --- Ingress ---
+# SA serves ACP on :2468 inside the cell. brig forwards
+# http://127.0.0.1:8443/sandbox-agent/v1/... → cell:2468/v1/...
+# with bearer-token auth. The bearer secret name is
+# `sandbox-agent-ingress-token` (brig's `<cell-name>-ingress-token`
+# convention).
+ingress:
+  - name: acp
+    port: 2468
+    path_prefix: /v1
+    auth: token
+
+labels:
+  purpose: agent-sandbox
+  consumers: aitelier
