@@ -12,10 +12,38 @@ def test_health_returns_ok_and_known_limitations(http):
     r = http.get("/v1/health")
     r.raise_for_status()
     body = r.json()
-    assert body["status"] == "ok"
+    # Phase K: status is "ok" when no deps have been probed (cold cache)
+    # or all probed deps are reachable; "degraded" when a tracked dep
+    # was unreachable on the last `/v1/discovery` probe. Both mean
+    # aitelier itself is alive — which is the entire promise of /v1/health.
+    assert body["status"] in ("ok", "degraded"), body
     assert body["version"]
     assert body["timestamp"]
     assert isinstance(body["known_limitations"], list)
+
+
+def test_health_status_reflects_discovery_dep_state(http):
+    """When `/v1/discovery` has populated the dep cache, the next
+    `/v1/health` MUST reflect whether any dep is unreachable. This is the
+    contract Phase K added — without it, k8s readiness probes can't
+    distinguish 'aitelier itself is up' from 'aitelier is up and ready
+    to serve.'"""
+    # Force a fresh discovery probe so the cache is populated.
+    d = http.get("/v1/discovery").json()
+    any_down = any(
+        not (info.get("reachable") if isinstance(info, dict) else True)
+        for info in (d.get("dependencies") or {}).values()
+    )
+    h = http.get("/v1/health").json()
+    # When all deps are reachable, status must be "ok". When any is
+    # unreachable, status must be "degraded". The deps summary must be
+    # present (cache is warm by definition after the discovery hit).
+    expected = "degraded" if any_down else "ok"
+    assert h["status"] == expected, (
+        f"discovery says any_down={any_down} but /v1/health says "
+        f"status={h['status']!r}. body={h}"
+    )
+    assert "dependencies" in h, h
 
 
 def test_discovery_advertises_endpoints_and_dependencies(http):
