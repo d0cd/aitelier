@@ -55,6 +55,12 @@ policy:
     # LLM providers the agent CLIs hit at runtime.
     - "api.anthropic.com"
     - "api.openai.com"
+    # codex CLI auths via ChatGPT subscription OAuth — it hits
+    # chatgpt.com for token refresh + session validation before
+    # any api.openai.com call. Without this, codex agent runs fail
+    # at the first auth step even with `codex-credentials` mounted.
+    - "chatgpt.com"
+    - "auth.openai.com"
     # - "generativelanguage.googleapis.com"
 
     # Sandbox-agent installer (one-time on cold cell boot; SA is baked

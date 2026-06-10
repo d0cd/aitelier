@@ -219,7 +219,11 @@ echo "=== Running live test suite against $AITELIER_BASE_URL ==="
 #     check passes through (the validator allows non-existent paths).
 #   - `/tmp` is a symlink on macOS host and would be rejected by
 #     aitelier's symlink-component guard before it ever reaches SA.
+# Curated to `claude` only in brig until warden gains TLS passthrough
+# for chatgpt.com — codex CLI's ChatGPT-OAuth flow can't complete
+# through mitmproxy's relayed handshake. See docs/deploy/brig-feedback.md
+# ("warden's mitmproxy can't MITM chatgpt.com").
 AITELIER_LIVE_URL="$AITELIER_BASE_URL" \
 AITELIER_LIVE_TMPDIR="/work" \
-AITELIER_LIVE_AGENT_BACKENDS="claude,codex" \
+AITELIER_LIVE_AGENT_BACKENDS="claude" \
     make test-live

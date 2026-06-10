@@ -158,6 +158,42 @@ keyword-only `map_file` and updated `allocate()`/`free()` to pass it
 explicitly. Our test script's regeneration workaround has been
 removed.
 
+
+## Bug: warden's mitmproxy can't MITM chatgpt.com (and similar)
+
+Found while adding codex to the brig matrix. With `chatgpt.com` in the
+allow list and the cell trusting warden's CA, a CONNECT tunnel succeeds
+but the upstream TLS handshake fails immediately:
+
+```
+[10.60.1.33:58181] No TLS context was provided, failing connection.
+[10.60.1.33:58181] server disconnect chatgpt.com:443 (172.64.155.209:443)
+```
+
+The cell-side curl gets `SSL_ERROR_SYSCALL` because warden never
+finishes negotiating with chatgpt.com. Cloudflare-fronted hosts often
+have strict SNI/ALPN/cipher constraints that mitmproxy's relayed
+handshake can't satisfy.
+
+This blocks codex agent runs in brig — codex CLI auths via ChatGPT
+subscription OAuth (`chatgpt.com` for token refresh + session
+validation) before any `api.openai.com` call. The `codex-credentials`
+secret is mounted and the policy allows the host, but the request
+dies at the TLS layer inside Warden.
+
+**Asks for brig (any of these unblock codex-in-brig):**
+1. `tls_strategy_passthrough` config — let operators list hosts where
+   Warden tunnels raw bytes instead of MITM'ing. Loses per-request
+   URL audit logs for those hosts, but preserves host-level policy.
+2. SNI-only allowlist mode — don't terminate TLS; route based on the
+   SNI extension in the client hello. Same trade-off as #1.
+3. Document which hosts won't work via mitmproxy so operators can
+   plan around it (e.g., "codex / OpenAI ChatGPT-OAuth is unsupported
+   in cells until passthrough lands").
+
+Until then: keep `claude` as the only curated brig backend; document
+the limitation in the test script.
+
 ## Smaller frictions (now that we hit them, worth flagging)
 
 ### `brig cell network` only logs egress
