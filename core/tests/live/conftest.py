@@ -152,7 +152,12 @@ def _live_auth_headers() -> dict[str, str]:
 
 @pytest.fixture(scope="session")
 def http(base_url):
-    with httpx.Client(base_url=base_url, timeout=120,
+    # 300s client-side timeout covers brig's cold-cache path (every
+    # outbound HTTPS hop goes through Warden's mitmproxy; first agent
+    # call can be 60-120s + the agent's own response time). Tests that
+    # request shorter aitelier-side timeouts via `"timeout": N` in the
+    # body still get aitelier's timeout enforced server-side.
+    with httpx.Client(base_url=base_url, timeout=300,
                       headers=_live_auth_headers()) as c:
         yield c
 

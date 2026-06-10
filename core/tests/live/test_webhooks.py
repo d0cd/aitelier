@@ -35,7 +35,7 @@ def test_webhook_fires_and_carries_run_payload(
         json={
             "model": "agent:claude",
             "messages": [{"role": "user", "content": "ack"}],
-            "timeout": 120,
+            "timeout": 240,
             "webhook_url": webhook_receiver.url,
             "aitelier": {"max_turns": 1},
         },
@@ -44,7 +44,7 @@ def test_webhook_fires_and_carries_run_payload(
     r.raise_for_status()
     run_id = r.json()["run_id"]
 
-    delivery = webhook_receiver.wait_for(run_id=run_id, timeout=180)
+    delivery = webhook_receiver.wait_for(run_id=run_id, timeout=300)
     payload = delivery["json"]
     assert payload["aitelier_run_id"] == run_id
     # Webhook payload is the final ChatCompletion (or error envelope) —
@@ -69,7 +69,7 @@ def test_webhook_signed_when_secret_configured(
         json={
             "model": "agent:claude",
             "messages": [{"role": "user", "content": "ack"}],
-            "timeout": 120,
+            "timeout": 240,
             "webhook_url": webhook_receiver.url,
             "aitelier": {"max_turns": 1},
         },
@@ -77,7 +77,7 @@ def test_webhook_signed_when_secret_configured(
     )
     r.raise_for_status()
     run_id = r.json()["run_id"]
-    delivery = webhook_receiver.wait_for(run_id=run_id, timeout=180)
+    delivery = webhook_receiver.wait_for(run_id=run_id, timeout=300)
 
     sig_header = delivery["headers"].get("X-Aitelier-Signature")
     assert sig_header, f"signature header missing: {delivery['headers']}"
@@ -103,7 +103,7 @@ def test_webhook_loopback_rejected_when_safety_on(isolated_aitelier):
         json={
             "model": "agent:claude",
             "messages": [{"role": "user", "content": "ack"}],
-            "timeout": 120,
+            "timeout": 240,
             "webhook_url": "http://127.0.0.1:9/will-not-be-hit",
             "aitelier": {"max_turns": 1},
         },

@@ -50,7 +50,7 @@ def test_agent_sync_returns_chat_completion(http, trace_tag, agent_backend):
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent_backend,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     })
     assert r.status_code == 200, r.text
     body = r.json()
@@ -84,7 +84,7 @@ def test_agent_run_persists_agent_id_and_inner_model(
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent_backend, inner_model=inner,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     })
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
@@ -107,7 +107,7 @@ def test_agent_stream_emits_openai_chunks(http, trace_tag, agent_backend):
     with http.stream("POST", "/v1/chat/completions", json={
         **_agent_body(agent_backend, content="Say one word: hello",
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
         "stream": True,
     }) as resp:
         resp.raise_for_status()
@@ -135,7 +135,7 @@ def test_agent_run_events_recorded(http, trace_tag, agent_backend):
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent_backend,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     })
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
@@ -150,7 +150,7 @@ def test_agent_run_events_stream_emits_sse(http, trace_tag, agent_backend):
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent_backend,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     })
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
@@ -201,7 +201,7 @@ def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend):
                           "prepare": {"files": [{"path": fname, "content": content}]},
                           "artifacts": {"fetch": [fname]},
                       }),
-        "timeout": 120,
+        "timeout": 240,
     })
 
     assert r.status_code != 400, (
@@ -244,7 +244,7 @@ def test_agent_idempotency_same_key_returns_cached(
     body = {
         **_agent_body(agent_backend,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     }
     r1 = http.post("/v1/chat/completions", headers={"Idempotency-Key": key},
                    json=body)
@@ -266,7 +266,7 @@ def test_agent_idempotency_different_body_returns_422(http, agent_backend):
         json={
             **_agent_body(agent_backend, content="first call",
                           aitelier_opts={"max_turns": 1}),
-            "timeout": 120,
+            "timeout": 240,
         },
     )
     r2 = http.post(
@@ -275,7 +275,7 @@ def test_agent_idempotency_different_body_returns_422(http, agent_backend):
         json={
             **_agent_body(agent_backend, content="DIFFERENT",
                           aitelier_opts={"max_turns": 1}),
-            "timeout": 120,
+            "timeout": 240,
         },
     )
     assert r1.status_code == 200, r1.text
@@ -289,7 +289,7 @@ def test_agent_idempotency_distinct_keys_produce_distinct_runs(
     body = {
         **_agent_body(agent_backend,
                       aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
-        "timeout": 120,
+        "timeout": 240,
     }
     r1 = http.post("/v1/chat/completions",
                    headers={"Idempotency-Key": str(uuid.uuid4())},

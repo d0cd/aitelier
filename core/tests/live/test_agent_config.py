@@ -37,7 +37,7 @@ def test_agent_workspace_dispatches_under_workspace(http, trace_tag, agent_backe
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "say ack"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {
             "max_turns": 1,
             "trace_tag": trace_tag,
@@ -70,7 +70,7 @@ def test_agent_prepare_commands_runs_setup_before_agent(
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ok"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {
             "max_turns": 1,
             "trace_tag": trace_tag,
@@ -113,7 +113,7 @@ def test_agent_prepare_sidecar_starts_and_records(
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {
             "max_turns": 1,
             "trace_tag": trace_tag,
@@ -147,7 +147,7 @@ def test_agent_tool_allowlist_is_recorded_on_the_run(
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {
             "max_turns": 1,
             "trace_tag": trace_tag,

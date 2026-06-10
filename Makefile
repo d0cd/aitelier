@@ -1,4 +1,4 @@
-.PHONY: install test test-py test-ts lint clean reset start stop restart logs status doctor
+.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -45,17 +45,37 @@ test-docker-mode-e2e:
 	@./scripts/test-docker-mode.sh
 
 # Local brig deployment e2e. Skips cleanly if `brig` isn't installed.
-# Launches aitelier from docs/deploy/aitelier.cell.yaml, polls the
-# ingress, and runs the live suite against the cell. Tears down on exit.
-# Not in CI — brig isn't a CI-installable artifact.
+# Brig cell hosts only Sandbox Agent (docs/deploy/sandbox-agent.cell.yaml);
+# aitelier itself runs on the host as a subprocess pointed at the cell's
+# ingress. Tears down on exit.
 test-brig-mode-e2e:
 	@./scripts/test-brig-mode.sh
 
-# End-to-end tests against a running aitelier. Boot the stack first
-# (`make start`), then `make test-live`. Auto-skipped without env var.
+# Host-mode e2e: aitelier on host (`make start` infra) + SA on host.
+# Assumes `make start` already ran. Run all three deployment paths via
+# `make test-all-modes-e2e`.
+test-host-mode-e2e:
+	@curl -sf http://127.0.0.1:7777/v1/health >/dev/null || { \
+		echo "✗ aitelier not running on :7777. Run 'make start' first."; \
+		exit 1; \
+	}
+	@$(MAKE) test-live
+
+# End-to-end tests against a running aitelier — same suite, different
+# deployment. `make test-live` is the underlying runner; the three
+# mode targets above (host / docker / brig) parameterize it with the
+# right AITELIER_LIVE_URL + AITELIER_LIVE_AGENT_BACKENDS for the mode.
 test-live:
 	AITELIER_LIVE_URL=$${AITELIER_LIVE_URL:-http://localhost:7777} \
 	  uv run pytest core/tests/live -v
+
+# Three-mode smoke — host + docker + brig in sequence. Each pulls its
+# own deployment up + tears down, so the modes don't interfere.
+# Total runtime ~5-10 minutes depending on cold caches.
+test-all-modes-e2e:
+	@$(MAKE) test-host-mode-e2e
+	@$(MAKE) test-docker-mode-e2e
+	@$(MAKE) test-brig-mode-e2e
 
 # ---------------------------------------------------------------------------
 # Lint

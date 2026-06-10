@@ -115,7 +115,7 @@ def test_failed_run_state_recorded(http, agent_backend, trace_tag):
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "should not run"}],
-        "timeout": 30,
+        "timeout": 240,
         "aitelier": {"max_turns": 0, "trace_tag": trace_tag},
     })
     # max_turns=0 is either rejected at validation (400) or executed and

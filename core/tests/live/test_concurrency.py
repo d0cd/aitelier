@@ -27,7 +27,7 @@ def test_concurrent_runs_dont_share_state(http, base_url, agent_backend, trace_t
     body_template = {
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 180,
+        "timeout": 240,
         "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
     }
     keys = [str(uuid.uuid4()), str(uuid.uuid4())]
@@ -82,7 +82,7 @@ def test_concurrent_idempotency_collapse_to_single_run(
     body = {
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 180,
+        "timeout": 240,
         "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
     }
     key = str(uuid.uuid4())

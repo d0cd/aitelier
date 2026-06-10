@@ -36,7 +36,7 @@ def test_async_run_lifecycle(http, agent_backend, trace_tag):
     submit = http.post("/v1/runs", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
     })
     submit.raise_for_status()
@@ -84,7 +84,7 @@ def test_async_run_idempotency_same_key_returns_same_run_id(
     body = {
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "ack"}],
-        "timeout": 120,
+        "timeout": 240,
         "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
     }
     r1 = http.post("/v1/runs", headers={"Idempotency-Key": key}, json=body)
