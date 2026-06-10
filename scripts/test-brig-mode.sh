@@ -221,4 +221,5 @@ echo "=== Running live test suite against $AITELIER_BASE_URL ==="
 #     aitelier's symlink-component guard before it ever reaches SA.
 AITELIER_LIVE_URL="$AITELIER_BASE_URL" \
 AITELIER_LIVE_TMPDIR="/work" \
+AITELIER_LIVE_AGENT_BACKENDS="claude" \
     make test-live

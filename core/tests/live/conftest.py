@@ -10,10 +10,11 @@ Test selection:
 
 Agent-test parameterization: tests that take an `agent_backend`
 parameter are parameterized over SA backends. Default
-`--agent-matrix=curated` runs only `claude` (the one we have OAuth
-for; fastest setup). `--agent-matrix=full` runs every backend
-advertised by /v1/discovery — catches per-backend regressions but is
-slow if every backend requires real provider calls.
+`--agent-matrix=curated` runs the three backends that the local
+deployment has credentials/CLI for (claude, codex, opencode).
+`--agent-matrix=full` runs every backend advertised by /v1/discovery
+— catches per-backend regressions but expects every backend to be
+runnable, which on this machine isn't the case for amp/cursor/pi.
 
 See ./README.md for the consumer contract.
 """
@@ -104,8 +105,21 @@ def pytest_generate_tests(metafunc):
     if matrix == "full":
         backends = advertised
     else:
-        # Curated: claude only if available; first-advertised otherwise.
-        backends = ["claude"] if "claude" in advertised else [advertised[0]]
+        # Curated trio (host default). Deploy scripts set
+        # AITELIER_LIVE_AGENT_BACKENDS to override per-mode — brig's
+        # image only pre-bakes claude, docker only ships claude, etc.
+        # Filter to what SA advertises so a missing backend silently
+        # drops rather than failing all dependent tests.
+        env_override = os.environ.get("AITELIER_LIVE_AGENT_BACKENDS")
+        if env_override:
+            curated = [b.strip() for b in env_override.split(",") if b.strip()]
+        else:
+            curated = ["claude", "codex", "opencode"]
+        backends = [b for b in curated if b in advertised]
+        if not backends:
+            # No curated backend available — fall back to whatever SA
+            # has so the suite still runs against *something*.
+            backends = [advertised[0]]
     metafunc.parametrize("agent_backend", backends,
                          ids=lambda b: f"backend={b}")
 

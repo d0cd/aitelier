@@ -584,14 +584,65 @@ _STREAM_IDEMPOTENCY_MAX_CHUNKS = 2000
 class _IdempotencyContext:
     """Carried between _check_idempotency and _record_idempotency. Cleaner
     than stashing fields on request.state where intervening middleware
-    could shadow them."""
+    could shadow them.
+
+    `_lock` is held when this context represents a fresh claim — the
+    caller is the first to see this key, and the lock is released when
+    `_record_idempotency` writes the result (or via the explicit
+    `_release_lock` helper on the error path). Cached-hit contexts have
+    `_lock = None`.
+    """
     key: str
     body_hash: str
     endpoint: str
     cached: dict | None
+    _lock: "asyncio.Lock | None" = None
 
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,200}$")
+
+
+# Per-key locks serialize the check-then-act window for `_check_idempotency`.
+# Without this, two parallel POSTs with the same Idempotency-Key both miss
+# the cache, both kick off runs, and end up with different run_ids — the
+# idempotency contract is broken. The lock makes the check + run + record
+# sequence atomic *within a single aitelier process*; cross-process aitelier
+# deployments would still need a DB-level claim (see _store.py's
+# `ON CONFLICT (key) DO NOTHING` on the record path).
+_IDEMPOTENCY_LOCKS: dict[str, "asyncio.Lock"] = {}
+_IDEMPOTENCY_LOCKS_GUARD: "asyncio.Lock | None" = None
+
+
+def _idempotency_locks_guard() -> "asyncio.Lock":
+    """Lazy-init guard for the locks dict. asyncio.Lock binds to the
+    running loop at construction, so we can't make this a module-level
+    constant — that'd bind to whatever loop existed at import time."""
+    global _IDEMPOTENCY_LOCKS_GUARD
+    if _IDEMPOTENCY_LOCKS_GUARD is None:
+        _IDEMPOTENCY_LOCKS_GUARD = asyncio.Lock()
+    return _IDEMPOTENCY_LOCKS_GUARD
+
+
+async def _acquire_idempotency_lock(key: str) -> "asyncio.Lock":
+    async with _idempotency_locks_guard():
+        lock = _IDEMPOTENCY_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _IDEMPOTENCY_LOCKS[key] = lock
+    await lock.acquire()
+    return lock
+
+
+def _release_idempotency_lock(key: str, lock: "asyncio.Lock") -> None:
+    if lock.locked():
+        lock.release()
+    # GC entries that have no waiters left so the dict doesn't grow
+    # unbounded under heavy key churn. asyncio.Lock has no public API
+    # for "do you have waiters" — _waiters is the private deque; check
+    # for emptiness defensively.
+    waiters = getattr(lock, "_waiters", None)
+    if (not lock.locked()) and (not waiters):
+        _IDEMPOTENCY_LOCKS.pop(key, None)
 
 
 async def _check_idempotency(
@@ -603,6 +654,12 @@ async def _check_idempotency(
     an `_IdempotencyContext`: `.cached` is the prior response on hit,
     None on miss/expiry. Raises 422 if the same key was used for a
     different body — almost always a consumer bug.
+
+    On miss, acquires a per-key asyncio lock and re-checks the cache
+    under the lock. This makes the check-then-act window atomic within a
+    single aitelier process. The lock is held by the returned context
+    and released by `_record_idempotency` (or `_release_idempotency_ctx`
+    on the error path).
 
     Keys are length-capped and charset-restricted at the boundary so a
     misbehaving (or hostile) client can't flood the `idempotency_keys`
@@ -623,10 +680,37 @@ async def _check_idempotency(
         )
     body_bytes = await request.body()
     body_hash = hashlib.sha256(body_bytes).hexdigest()
-    rec = await (await get_store()).get_idempotent(key)
-    if rec is None:
-        return _IdempotencyContext(key, body_hash, endpoint, cached=None)
-    if rec.body_hash != body_hash:
+    store = await get_store()
+
+    rec = await store.get_idempotent(key)
+    if rec is not None:
+        _enforce_body_hash_match(key, rec.body_hash, body_hash)
+        return _IdempotencyContext(key, body_hash, endpoint,
+                                    cached=rec.response, _lock=None)
+
+    # Cache miss: acquire the per-key lock + re-check. If another
+    # concurrent request claimed the slot while we were waiting, we'll
+    # see their cached response here and return it without re-running.
+    lock = await _acquire_idempotency_lock(key)
+    try:
+        rec = await store.get_idempotent(key)
+        if rec is not None:
+            _enforce_body_hash_match(key, rec.body_hash, body_hash)
+            _release_idempotency_lock(key, lock)
+            return _IdempotencyContext(key, body_hash, endpoint,
+                                        cached=rec.response, _lock=None)
+        # Genuine miss + we hold the lock. The caller owns the run and
+        # must call _record_idempotency (or _release_idempotency_ctx)
+        # to release.
+        return _IdempotencyContext(key, body_hash, endpoint,
+                                    cached=None, _lock=lock)
+    except BaseException:
+        _release_idempotency_lock(key, lock)
+        raise
+
+
+def _enforce_body_hash_match(key: str, stored: str, incoming: str) -> None:
+    if stored != incoming:
         raise HTTPException(
             status_code=422,
             detail=(
@@ -634,15 +718,15 @@ async def _check_idempotency(
                 f"request body. Use a fresh UUID for distinct requests."
             ),
         )
-    return _IdempotencyContext(key, body_hash, endpoint, cached=rec.response)
 
 
 async def _record_idempotency(
     ctx: _IdempotencyContext | None, response: dict,
 ) -> None:
     """Persist the response under this Idempotency-Key. No-op if ctx is None.
-    Best-effort: storage failure shouldn't fail the call — we already have
-    the response in hand."""
+    Best-effort on storage failure: we already have the response, and
+    the lock release MUST happen regardless. Lock is released here on
+    every path."""
     if ctx is None:
         return
     from aitelier.storage import IdempotencyRecord
@@ -656,6 +740,19 @@ async def _record_idempotency(
         ))
     except Exception as exc:
         logger.warning("Failed to record idempotency key %s: %s", ctx.key, exc)
+    finally:
+        if ctx._lock is not None:
+            _release_idempotency_lock(ctx.key, ctx._lock)
+
+
+def _release_idempotency_ctx(ctx: _IdempotencyContext | None) -> None:
+    """Error-path lock release. Used when the caller can't reach
+    _record_idempotency because the run raised before producing a
+    response. Safe to call multiple times."""
+    if ctx is None or ctx._lock is None:
+        return
+    _release_idempotency_lock(ctx.key, ctx._lock)
+    ctx._lock = None
 
 
 async def _check_webhook_url_or_die(url: str) -> None:
@@ -1302,9 +1399,13 @@ async def _agent_chat_completion_stream(
                 and final.get("status") != "error"
                 and len(recorded_chunks) <= _STREAM_IDEMPOTENCY_MAX_CHUNKS
             )
+            # Always pass `idem` (when present) so _finalize_stream_run
+            # releases the per-key lock regardless of caching. The
+            # `should_cache` decision controls whether we *record* the
+            # response, not whether we release the lock.
             asyncio.create_task(_finalize_stream_run(
                 run_id=run_id, final=final, state=state,
-                idem=idem if should_cache else None,
+                idem=idem,
                 recorded_chunks=recorded_chunks if should_cache else None,
             ))
 
@@ -1334,11 +1435,21 @@ async def _finalize_stream_run(
                 "chunks": recorded_chunks,
                 "run_id": run_id,
             })
+        elif idem is not None:
+            # Stream didn't complete cleanly enough to cache (truncated,
+            # too many chunks, etc.) — release the idempotency lock so a
+            # retry under the same key isn't blocked. We don't write a
+            # cache row in this case, so the retry will re-run.
+            _release_idempotency_ctx(idem)
     except Exception as exc:
         logger.warning(
             "background finalize for stream run %s failed: %s",
             run_id, exc,
         )
+        # On any exception in the finalize path, ensure the lock is
+        # released. _record_idempotency releases on its own try/finally,
+        # so this catches the pre-record exceptions.
+        _release_idempotency_ctx(idem)
 
 
 def _replay_cached_stream(cached: dict) -> StreamingResponse:
@@ -1563,18 +1674,28 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
                 return _replay_cached_stream(cached)
             return _render_chat_completion(cached)
         run_id = make_run_id("chat_agent")
-        if req.stream:
-            return await _agent_chat_completion_stream(
+        try:
+            if req.stream:
+                # Stream path's record happens in _agent_chat_completion_stream;
+                # if it raises before the record call, fall through to the
+                # error-path release below.
+                return await _agent_chat_completion_stream(
+                    req, request,
+                    agent_backend=agent_backend, inner_llm=inner_llm,
+                    run_id=run_id, idem=idem,
+                )
+            result = await _agent_chat_completion(
                 req, request,
-                agent_backend=agent_backend, inner_llm=inner_llm,
-                run_id=run_id, idem=idem,
+                agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
             )
-        result = await _agent_chat_completion(
-            req, request,
-            agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
-        )
-        await _record_idempotency(idem, result)
-        return _render_chat_completion(result)
+            await _record_idempotency(idem, result)
+            return _render_chat_completion(result)
+        except BaseException:
+            # The run failed before _record_idempotency could release the
+            # per-key lock — release it explicitly so a retry under the
+            # same Idempotency-Key isn't blocked.
+            _release_idempotency_ctx(idem)
+            raise
 
     # LLM path
     run_id = make_run_id("chat_llm")
@@ -1781,45 +1902,51 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
     if idem and idem.cached is not None:
         return idem.cached
 
-    if req.webhook_url:
-        await _check_webhook_url_or_die(req.webhook_url)
+    try:
+        if req.webhook_url:
+            await _check_webhook_url_or_die(req.webhook_url)
 
-    run_id = make_run_id("chat_agent_async")
-    webhook_url = req.webhook_url
-    inner_req = req  # ChatCompletionRequest fields are a subset
+        run_id = make_run_id("chat_agent_async")
+        webhook_url = req.webhook_url
+        inner_req = req  # ChatCompletionRequest fields are a subset
 
-    async def _run_and_callback() -> None:
-        try:
-            result = await _agent_chat_completion(
-                inner_req, request,
-                agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
-                webhook_url=webhook_url,
-            )
-        except Exception as exc:
-            result = {
-                "error": {
-                    "type": classify_error(exc), "message": str(exc),
-                },
-                "aitelier_run_id": run_id,
-            }
-        # Strip the rendering hint before persistence/delivery — it's only
-        # meaningful to a synchronous HTTP responder, not to webhook consumers.
-        result.pop("aitelier_status_code", None)
-        if webhook_url:
-            await _enqueue_webhook(webhook_url, result, run_id=run_id)
+        async def _run_and_callback() -> None:
+            try:
+                result = await _agent_chat_completion(
+                    inner_req, request,
+                    agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
+                    webhook_url=webhook_url,
+                )
+            except Exception as exc:
+                result = {
+                    "error": {
+                        "type": classify_error(exc), "message": str(exc),
+                    },
+                    "aitelier_run_id": run_id,
+                }
+            # Strip the rendering hint before persistence/delivery — it's only
+            # meaningful to a synchronous HTTP responder, not to webhook consumers.
+            result.pop("aitelier_status_code", None)
+            if webhook_url:
+                await _enqueue_webhook(webhook_url, result, run_id=run_id)
 
-    outer_task = asyncio.create_task(_run_and_callback())
-    # Pre-register so an immediate POST /v1/runs/{id}/cancel doesn't 404.
-    # `_agent_chat_completion` swaps this entry for the inner run task once
-    # it starts; the outer task is the safe placeholder.
-    _active_runs[run_id] = outer_task
-    accepted = {
-        "run_id": run_id,
-        "status": "accepted",
-        "correlation_id": cid,
-        "webhook_url": webhook_url,
-    }
-    await _record_idempotency(idem, accepted)
+        outer_task = asyncio.create_task(_run_and_callback())
+        # Pre-register so an immediate POST /v1/runs/{id}/cancel doesn't 404.
+        # `_agent_chat_completion` swaps this entry for the inner run task once
+        # it starts; the outer task is the safe placeholder.
+        _active_runs[run_id] = outer_task
+        accepted = {
+            "run_id": run_id,
+            "status": "accepted",
+            "correlation_id": cid,
+            "webhook_url": webhook_url,
+        }
+        await _record_idempotency(idem, accepted)
+    except BaseException:
+        # Release the idempotency lock without writing if anything above
+        # raised — otherwise a retry under the same key is wedged.
+        _release_idempotency_ctx(idem)
+        raise
     return accepted
 
 
