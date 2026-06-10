@@ -19,13 +19,9 @@ Conventions:
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 import time
 import uuid
 from pathlib import Path
-
-
 
 # ---------- helpers ----------
 
@@ -181,17 +177,11 @@ def test_agent_run_events_stream_emits_sse(http, trace_tag, agent_backend):
 # ---------- prepare → agent → artifacts loop ----------
 
 
-def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend):
+def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend, sa_writable_dir):
     """`aitelier.prepare.files` ships a file into the sandbox and
     `aitelier.artifacts.fetch` reads it back. Exercises SA's actual
     `/v1/fs/file` wire shape (path-as-query-param, not body)."""
-    # Path must be (a) writable on the SA side, (b) non-symlinked on
-    # the aitelier side so the symlink-component guard accepts it.
-    # AITELIER_LIVE_TMPDIR pins whichever path is correct for the target
-    # deployment.
-    tmpdir_str = os.environ.get("AITELIER_LIVE_TMPDIR")
-    tmpdir = Path(tmpdir_str) if tmpdir_str else Path(tempfile.gettempdir()).resolve()
-    fname = str(tmpdir / f"aitelier-live-{trace_tag}.txt")
+    fname = str(Path(sa_writable_dir) / f"aitelier-live-{trace_tag}.txt")
     content = f"live-test-{trace_tag}"
 
     r = http.post("/v1/chat/completions", json={

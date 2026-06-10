@@ -1,21 +1,18 @@
 """Live tests for the durable webhook delivery worker.
 
 Spawns a side aitelier configured with `allow_loopback_webhooks: true`
-(so it can fire at our in-process receiver) plus an optional signing
+(so it can fire at our in-process receiver) plus an optional shared
 secret. Fires real runs, asserts the receiver got the payload, verifies
-the HMAC signature.
+the Bearer header when configured.
 
 Retry-backoff math is unit-tested in test_webhook_worker.py; here we
-just verify the integration: signed delivery, payload shape, retry
-fires at least once on a 5xx receiver.
+just verify the integration: authenticated delivery, payload shape,
+loopback safety toggle.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
-import json
-import time
 
 import httpx
 
@@ -52,11 +49,12 @@ def test_webhook_fires_and_carries_run_payload(
     assert "choices" in payload or "error" in payload, payload
 
 
-def test_webhook_signed_when_secret_configured(
+def test_webhook_authenticated_when_secret_configured(
     isolated_aitelier, webhook_receiver,
 ):
-    """When `[service] webhook_secret` is set, aitelier signs each
-    delivery with `X-Aitelier-Signature: sha256=<hmac>`."""
+    """When `[service] webhook_secret` is set, aitelier authenticates
+    each delivery with `Authorization: Bearer <secret>`. Receivers
+    verify with a constant-time string compare."""
     secret = "live-test-secret-32-chars-or-more"
     aitelier = isolated_aitelier(service={
         "allow_loopback_webhooks": True,
@@ -79,16 +77,14 @@ def test_webhook_signed_when_secret_configured(
     run_id = r.json()["run_id"]
     delivery = webhook_receiver.wait_for(run_id=run_id, timeout=300)
 
-    sig_header = delivery["headers"].get("X-Aitelier-Signature")
-    assert sig_header, f"signature header missing: {delivery['headers']}"
-    assert sig_header.startswith("sha256="), sig_header
-    received_sig = sig_header.split("=", 1)[1]
-
-    # Recompute against the raw bytes the receiver got. Verify HMAC matches.
-    expected = hmac.new(secret.encode(), delivery["body"],
-                         hashlib.sha256).hexdigest()
-    assert hmac.compare_digest(expected, received_sig), (
-        f"signature mismatch: expected sha256={expected}, got {sig_header}"
+    auth_header = delivery["headers"].get("Authorization")
+    assert auth_header, (
+        f"Authorization header missing: {delivery['headers']}"
+    )
+    assert auth_header.startswith("Bearer "), auth_header
+    token = auth_header.removeprefix("Bearer ")
+    assert hmac.compare_digest(token, secret), (
+        "Bearer token mismatch — receiver got a different secret than configured"
     )
 
 

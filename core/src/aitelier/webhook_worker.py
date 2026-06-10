@@ -11,8 +11,6 @@ Retry delays: 1s, 5s, 30s, 5min, 1hr. Then `state='failed'`.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -62,16 +60,26 @@ async def _deliver_once(delivery) -> None:
             )
             return
 
-    # Sign the body so the receiver can verify it actually came from aitelier.
-    # Only active when service.webhook_secret is set — typically in hosted
-    # mode alongside api_key. Receiver verifies:
-    #   sha256_hex == hmac.new(secret.encode(), body, sha256).hexdigest()
+    # Authenticate the delivery via a pre-shared Bearer token in the
+    # Authorization header. Only active when `service.webhook_secret`
+    # is set. Receiver verifies with a constant-time string compare:
+    #   import hmac
+    #   token = auth_header.removeprefix("Bearer ")
+    #   if not hmac.compare_digest(token, expected_secret):
+    #       reject()
+    #
+    # Why Bearer rather than HMAC body signatures? Body-byte fidelity
+    # between sender serialization and receiver reception is easy to
+    # get wrong (header-set order, trailing newlines, intermediate
+    # proxies re-encoding) and provides no value over Bearer when
+    # transport is HTTPS. HTTPS already protects body integrity in
+    # transit; Bearer authenticates that the delivery came from a
+    # process holding the shared secret.
     body_bytes = json.dumps(delivery.payload, default=str).encode()
     headers: dict[str, str] = {"Content-Type": "application/json"}
     secret = get_config().service.webhook_secret
     if secret:
-        sig = hmac.new(secret.encode(), body_bytes, hashlib.sha256).hexdigest()
-        headers["X-Aitelier-Signature"] = f"sha256={sig}"
+        headers["Authorization"] = f"Bearer {secret}"
 
     try:
         client = await get_shared_client()

@@ -11,7 +11,6 @@ import time
 
 import httpx
 
-
 # ---------- Hosted-mode Bearer auth ----------
 
 
@@ -56,7 +55,7 @@ def test_correlation_id_propagates_through_run(http, litellm_models):
     body → run row → events. Consumers depend on this to thread requests
     through their own logging."""
     assert "local" in litellm_models, (
-        f"`local` must be advertised by /v1/discovery for this test."
+        "`local` must be advertised by /v1/discovery for this test."
     )
     cid = "live-cross-cutting-correlation-test"
 

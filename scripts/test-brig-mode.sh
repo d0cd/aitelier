@@ -79,6 +79,25 @@ if ! brig system doctor --quick >/dev/null 2>&1; then
     exit 1
 fi
 
+# Brig bug: `_write_subnet_map(state)` in
+# ~/projects/brig/src/brig/network/subnet.py doesn't accept a `map_file`
+# override, so brig's own pytest tests clobber the real
+# ~/.brig/state/system/subnet-map.json with test data (e.g. "cell-a").
+# Warden reads from this file to attribute traffic to cells; stale data
+# causes every egress to be denied with "cell 'cell-a' has no per-cell
+# policy". Rebuild the map from the authoritative subnets.json state.
+python3 - <<'PY' 2>/dev/null || true
+import json, pathlib
+sysdir = pathlib.Path.home() / ".brig" / "state" / "system"
+state_path = sysdir / "subnets.json"
+map_path = sysdir / "subnet-map.json"
+if state_path.exists():
+    st = json.loads(state_path.read_text())
+    m = {f'10.60.{info["index"]}.0/24': name
+         for name, info in (st.get("allocated") or {}).items()}
+    map_path.write_text(json.dumps(m, indent=2) + "\n")
+PY
+
 cleanup() {
     echo ""
     echo "=== Tearing down ==="

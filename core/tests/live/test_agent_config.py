@@ -13,27 +13,17 @@ see brig-feedback.md for the deferred-work note.
 
 from __future__ import annotations
 
-import os
-import tempfile
-import time
-from pathlib import Path
+# `sa_writable_dir` fixture (conftest.py) picks the right path based on
+# where SA actually runs (brig cell → /work, host/docker → host tempdir).
 
 
-def _writable_workdir() -> str:
-    """Path the agent (SA-side) can write to. Brig pins via env var;
-    elsewhere we resolve the host's tempdir to avoid macOS's /tmp
-    symlink trap."""
-    override = os.environ.get("AITELIER_LIVE_TMPDIR")
-    if override:
-        return override
-    return str(Path(tempfile.gettempdir()).resolve())
-
-
-def test_agent_workspace_dispatches_under_workspace(http, trace_tag, agent_backend):
+def test_agent_workspace_dispatches_under_workspace(
+    http, trace_tag, agent_backend, sa_writable_dir,
+):
     """Aitelier records the workspace in the run row. The agent CLI may
     or may not actually `chdir` there (backend-specific); the contract
     aitelier promises is that the path is forwarded + recorded."""
-    workdir = _writable_workdir()
+    workdir = sa_writable_dir
     r = http.post("/v1/chat/completions", json={
         "model": f"agent:{agent_backend}",
         "messages": [{"role": "user", "content": "say ack"}],
@@ -54,14 +44,13 @@ def test_agent_workspace_dispatches_under_workspace(http, trace_tag, agent_backe
 
 
 def test_agent_prepare_commands_runs_setup_before_agent(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, sa_writable_dir,
 ):
     """`prepare.commands` runs in the sandbox before the agent. Verify by
     having the prep step write a marker file, then artifacts.fetch it back.
     The agent itself isn't asked to do anything substantive — we only care
     that the prepare layer ran."""
-    workdir = _writable_workdir()
-    marker = f"{workdir}/aitelier-prep-{trace_tag}.txt"
+    marker = f"{sa_writable_dir}/aitelier-prep-{trace_tag}.txt"
     body = f"prep ran for {trace_tag}"
 
     # SA's `ProcessRunRequest` is a struct ({command, args, cwd?, …}),

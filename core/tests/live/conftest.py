@@ -65,8 +65,14 @@ _AGENT_BACKENDS_CACHE: list[str] | None = None
 def _discover_sa_agents() -> list[str]:
     """One-shot discovery probe for the agent_backend parametrization.
 
-    Called at collection time, before fixtures exist. Caches the result so
-    repeated parametrize() calls don't repeatedly hit the service.
+    Called at collection time, before fixtures exist. Caches the result.
+
+    Filters to backends that SA reports as `installed: True`. Aitelier's
+    /v1/discovery exposes only the advertised IDs (not install state),
+    so we hop directly to SA's /v1/agents endpoint via the same URL +
+    bearer the aitelier deployment is using. This way a brig SA cell
+    that only baked `claude` won't waste cycles parameterizing tests
+    over codex/opencode that can't run.
     """
     global _AGENT_BACKENDS_CACHE
     if _AGENT_BACKENDS_CACHE is not None:
@@ -81,14 +87,55 @@ def _discover_sa_agents() -> list[str]:
         r = httpx.get(f"{url}/v1/discovery", timeout=5, headers=headers)
         r.raise_for_status()
         d = r.json()
-        agents = d.get("dependencies", {}).get("sandbox_agent", {}).get("agents") or []
+        sa_info = d.get("dependencies", {}).get("sandbox_agent", {}) or {}
+        sa_url = sa_info.get("base_url")
+        advertised = sa_info.get("agents") or []
     except Exception as exc:
         pytest.exit(
             f"Failed to discover SA backends at {url}/v1/discovery: {exc}\n"
             f"Cannot parameterize agent tests."
         )
-    _AGENT_BACKENDS_CACHE = sorted(agents)
+    # Probe SA directly for `installed` per-agent. SA's auth lives in
+    # aitelier.secrets.toml under [sandbox_agent].token; load it from
+    # the repo's config so brig (which gates SA behind bearer auth)
+    # works too. The probe is best-effort — if SA is unreachable from
+    # the test runner, fall back to the advertised list.
+    installed_only: list[str] = list(advertised)
+    if sa_url:
+        sa_token = _read_sa_token_from_repo_config()
+        sa_headers = {"Authorization": f"Bearer {sa_token}"} if sa_token else {}
+        try:
+            sa_resp = httpx.get(f"{sa_url}/v1/agents",
+                                 timeout=5, headers=sa_headers)
+            if sa_resp.status_code == 200:
+                detail = sa_resp.json().get("agents") or []
+                installed_only = [a["id"] for a in detail if a.get("installed")]
+        except Exception:
+            pass
+    _AGENT_BACKENDS_CACHE = sorted(installed_only)
     return _AGENT_BACKENDS_CACHE
+
+
+def _read_sa_token_from_repo_config() -> str | None:
+    """Pull `[sandbox_agent].token` from the repo's aitelier config or
+    secrets overlay. Returns None if no token configured (host/docker
+    deploys without brig ingress)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        import tomli as tomllib
+    repo_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    for fname in ("aitelier.secrets.toml", "aitelier.toml"):
+        path = os.path.join(repo_root, fname)
+        try:
+            with open(path, "rb") as f:
+                token = (tomllib.load(f).get("sandbox_agent") or {}).get("token")
+                if token:
+                    return token
+        except (FileNotFoundError, OSError):
+            continue
+    return None
 
 
 def pytest_generate_tests(metafunc):
@@ -182,6 +229,32 @@ def litellm_models(discovery) -> list[str]:
 @pytest.fixture(scope="session")
 def sa_agents(discovery) -> list[str]:
     return discovery.get("dependencies", {}).get("sandbox_agent", {}).get("agents") or []
+
+
+@pytest.fixture(scope="session")
+def sa_writable_dir(discovery) -> str:
+    """Path that SA can write to, on SA's filesystem.
+
+    Override via env: `AITELIER_LIVE_TMPDIR=/some/path`.
+
+    Auto-detection: if SA's base_url is the brig ingress (port 8443),
+    SA runs inside a brig cell where `/work` is the auto-mounted
+    writable workspace. Otherwise SA shares the host's filesystem and
+    we use `tempfile.gettempdir().resolve()` (which on macOS resolves
+    `/tmp` to `/private/tmp` so the symlink-component guard accepts
+    it; cells don't have the symlink so /work is the cleaner choice
+    there).
+    """
+    import tempfile
+    from pathlib import Path
+    override = os.environ.get("AITELIER_LIVE_TMPDIR")
+    if override:
+        return override
+    sa_url = (discovery.get("dependencies", {})
+              .get("sandbox_agent", {}).get("base_url") or "")
+    if "127.0.0.1:8443" in sa_url or ".host.brig" in sa_url:
+        return "/work"
+    return str(Path(tempfile.gettempdir()).resolve())
 
 
 @pytest.fixture(scope="session")
@@ -348,24 +421,29 @@ def _free_port() -> int:
 
 
 def _discover_host_sa_url() -> str:
-    """Read the host's actual SA base_url from runs/.session.toml (written
-    by scripts/start.sh on dynamic-port pick). Falls back to the default
-    2468 if the session overlay isn't present."""
-    repo_root = os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    session_path = os.path.join(repo_root, "runs", ".session.toml")
+    """Find the host's actual SA base_url. Search order matches aitelier's
+    own config layering:
+      1. runs/.session.toml (written by scripts/start.sh for dev workflow)
+      2. aitelier.toml at repo root (persistent deploys, including the
+         SA-in-brig shape we set up via docs/deploy/sandbox-agent.cell.yaml)
+      3. fallback to 127.0.0.1:2468 (default port)
+    """
     try:
         import tomllib
     except ModuleNotFoundError:
         import tomli as tomllib
-    try:
-        with open(session_path, "rb") as f:
-            data = tomllib.load(f)
-        url = data.get("sandbox_agent", {}).get("base_url")
-        if url:
-            return url
-    except (FileNotFoundError, OSError):
-        pass
+    repo_root = os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    for fname in ("runs/.session.toml", "aitelier.toml"):
+        path = os.path.join(repo_root, fname)
+        try:
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+            url = data.get("sandbox_agent", {}).get("base_url")
+            if url:
+                return url
+        except (FileNotFoundError, OSError):
+            continue
     return "http://127.0.0.1:2468"
 
 

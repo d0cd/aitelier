@@ -596,7 +596,7 @@ class _IdempotencyContext:
     body_hash: str
     endpoint: str
     cached: dict | None
-    _lock: "asyncio.Lock | None" = None
+    _lock: asyncio.Lock | None = None
 
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,200}$")
@@ -609,11 +609,11 @@ _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._:\-]{1,200}$")
 # sequence atomic *within a single aitelier process*; cross-process aitelier
 # deployments would still need a DB-level claim (see _store.py's
 # `ON CONFLICT (key) DO NOTHING` on the record path).
-_IDEMPOTENCY_LOCKS: dict[str, "asyncio.Lock"] = {}
-_IDEMPOTENCY_LOCKS_GUARD: "asyncio.Lock | None" = None
+_IDEMPOTENCY_LOCKS: dict[str, asyncio.Lock] = {}
+_IDEMPOTENCY_LOCKS_GUARD: asyncio.Lock | None = None
 
 
-def _idempotency_locks_guard() -> "asyncio.Lock":
+def _idempotency_locks_guard() -> asyncio.Lock:
     """Lazy-init guard for the locks dict. asyncio.Lock binds to the
     running loop at construction, so we can't make this a module-level
     constant — that'd bind to whatever loop existed at import time."""
@@ -623,7 +623,7 @@ def _idempotency_locks_guard() -> "asyncio.Lock":
     return _IDEMPOTENCY_LOCKS_GUARD
 
 
-async def _acquire_idempotency_lock(key: str) -> "asyncio.Lock":
+async def _acquire_idempotency_lock(key: str) -> asyncio.Lock:
     async with _idempotency_locks_guard():
         lock = _IDEMPOTENCY_LOCKS.get(key)
         if lock is None:
@@ -633,7 +633,7 @@ async def _acquire_idempotency_lock(key: str) -> "asyncio.Lock":
     return lock
 
 
-def _release_idempotency_lock(key: str, lock: "asyncio.Lock") -> None:
+def _release_idempotency_lock(key: str, lock: asyncio.Lock) -> None:
     if lock.locked():
         lock.release()
     # GC entries that have no waiters left so the dict doesn't grow

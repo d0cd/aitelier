@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 
 def _assert_local(litellm_models: list[str]) -> None:
@@ -24,7 +24,7 @@ def test_one_shot_schedule_fires_and_creates_run(http, litellm_models):
     """A one-shot schedule with `at_iso` ~3s in the future creates a run
     within ~10s, with the schedule id reflected in the run's correlation_id."""
     _assert_local(litellm_models)
-    fire_at = datetime.now(timezone.utc) + timedelta(seconds=3)
+    fire_at = datetime.now(UTC) + timedelta(seconds=3)
     name = f"live-fire-{uuid.uuid4().hex[:6]}"
     created = http.post("/v1/schedules", json={
         "name": name,
@@ -81,7 +81,7 @@ def test_one_shot_schedule_next_run_at_clears_after_firing(http, litellm_models)
     the tick loop doesn't re-fire it. The row remains (operators can
     inspect last_run_at); just the next-fire slot is cleared."""
     _assert_local(litellm_models)
-    fire_at = datetime.now(timezone.utc) + timedelta(seconds=3)
+    fire_at = datetime.now(UTC) + timedelta(seconds=3)
     name = f"live-once-{uuid.uuid4().hex[:6]}"
     created = http.post("/v1/schedules", json={
         "name": name,
