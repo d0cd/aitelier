@@ -276,3 +276,20 @@ def test_embeddings_returns_correct_dimensions(http, litellm_models):
     dims = len(body["data"][0]["embedding"])
     assert dims > 0
     assert body["aitelier_run_id"]
+
+
+# ---------- LLM-path validation ----------
+
+
+def test_llm_path_rejects_aitelier_namespace(http, litellm_models):
+    """`aitelier.*` is agent-only — must be rejected for LLM models.
+    Mirror of the agent-path test that rejects `tools`; both guard against
+    silent drops on the wrong route."""
+    _assert_curated_model("local", litellm_models)
+    r = http.post("/v1/chat/completions", json={
+        "model": "local",
+        "messages": [{"role": "user", "content": "hi"}],
+        "aitelier": {"workspace": "/tmp"},
+    })
+    assert r.status_code == 400, r.text
+    assert "aitelier" in r.json()["detail"]

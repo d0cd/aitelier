@@ -44,27 +44,6 @@ def test_runs_list_filterable_by_trace_tag(http, trace_tag, litellm_models):
     assert mine["kind"] == "complete"
 
 
-def test_runs_events_endpoint_returns_timeline(http, trace_tag, picked_agent):
-    agent = picked_agent
-    r = http.post(
-        "/v1/chat/completions",
-        json={
-            "model": f"agent:{agent}",
-            "messages": [{"role": "user", "content": "ack"}],
-            # 120s for brig's slower first-call path; host/docker finish
-            # well under this.
-            "timeout": 120,
-            "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
-        },
-    )
-    assert r.status_code == 200, r.text
-    run_id = r.json()["aitelier_run_id"]
-
-    events = http.get(f"/v1/runs/{run_id}/events").json()
-    kinds = [e["kind"] for e in events]
-    assert "start" in kinds, kinds
-
-
 def test_traces_aggregates_groups_by_correlation(http, trace_tag, litellm_models):
     _assert_local(litellm_models)
     for _ in range(2):
@@ -113,14 +92,15 @@ def test_schedule_crud_round_trip(http):
     assert d2.status_code == 404
 
 
-def test_schedule_accepts_agent_task_shape(http, picked_agent):
-    """Schedules can carry agent tasks too — same body shape as chat/completions."""
-    agent = picked_agent
+def test_schedule_accepts_agent_task_shape(http, agent_backend):
+    """Schedules can carry agent tasks too — same body shape as chat/completions.
+    Parameterized over backends since the schedule task body validation
+    depends on the backend being recognized."""
     name = f"live-agent-sched-{uuid.uuid4().hex[:6]}"
     created = http.post("/v1/schedules", json={
         "name": name,
         "task": {
-            "model": f"agent:{agent}",
+            "model": f"agent:{agent_backend}",
             "messages": [{"role": "user", "content": "scheduled work"}],
             "aitelier": {"max_turns": 1},
         },

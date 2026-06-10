@@ -8,6 +8,13 @@ Test selection:
 - `AITELIER_LIVE_URL` unset → live/ dir is not collected (collect_ignore).
 - `AITELIER_LIVE_URL` set    → live tests run; everything they need must work.
 
+Agent-test parameterization: tests that take an `agent_backend`
+parameter are parameterized over SA backends. Default
+`--agent-matrix=curated` runs only `claude` (the one we have OAuth
+for; fastest setup). `--agent-matrix=full` runs every backend
+advertised by /v1/discovery — catches per-backend regressions but is
+slow if every backend requires real provider calls.
+
 See ./README.md for the consumer contract.
 """
 
@@ -27,6 +34,77 @@ import pytest
 # `make test-brig-mode-e2e`) DO set it and require everything to work.
 if not os.environ.get("AITELIER_LIVE_URL"):
     collect_ignore_glob = ["*"]
+
+
+# ---------------------------------------------------------------------------
+# Agent-backend parameterization (collection time)
+# ---------------------------------------------------------------------------
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--agent-matrix",
+        action="store",
+        default="curated",
+        choices=("curated", "full"),
+        help=(
+            "Which SA backends to parameterize agent tests over. "
+            "`curated` = claude only (fast, default); "
+            "`full` = every backend /v1/discovery advertises."
+        ),
+    )
+
+
+_AGENT_BACKENDS_CACHE: list[str] | None = None
+
+
+def _discover_sa_agents() -> list[str]:
+    """One-shot discovery probe for the agent_backend parametrization.
+
+    Called at collection time, before fixtures exist. Caches the result so
+    repeated parametrize() calls don't repeatedly hit the service.
+    """
+    global _AGENT_BACKENDS_CACHE
+    if _AGENT_BACKENDS_CACHE is not None:
+        return _AGENT_BACKENDS_CACHE
+    url = os.environ.get("AITELIER_LIVE_URL")
+    if not url:
+        # collect_ignore_glob already kicked in; this path shouldn't fire.
+        return []
+    bearer = os.environ.get("AITELIER_LIVE_BEARER")
+    headers = {"Authorization": f"Bearer {bearer}"} if bearer else {}
+    try:
+        r = httpx.get(f"{url}/v1/discovery", timeout=5, headers=headers)
+        r.raise_for_status()
+        d = r.json()
+        agents = d.get("dependencies", {}).get("sandbox_agent", {}).get("agents") or []
+    except Exception as exc:
+        pytest.exit(
+            f"Failed to discover SA backends at {url}/v1/discovery: {exc}\n"
+            f"Cannot parameterize agent tests."
+        )
+    _AGENT_BACKENDS_CACHE = sorted(agents)
+    return _AGENT_BACKENDS_CACHE
+
+
+def pytest_generate_tests(metafunc):
+    """Parameterize tests that take `agent_backend` over SA-advertised
+    backends, gated by `--agent-matrix` for runtime control."""
+    if "agent_backend" not in metafunc.fixturenames:
+        return
+    advertised = _discover_sa_agents()
+    assert advertised, (
+        "/v1/discovery reports no sandbox-agent backends — SA is "
+        "misconfigured. Cannot parameterize agent tests."
+    )
+    matrix = metafunc.config.getoption("--agent-matrix")
+    if matrix == "full":
+        backends = advertised
+    else:
+        # Curated: claude only if available; first-advertised otherwise.
+        backends = ["claude"] if "claude" in advertised else [advertised[0]]
+    metafunc.parametrize("agent_backend", backends,
+                         ids=lambda b: f"backend={b}")
 
 
 @pytest.fixture(scope="session")

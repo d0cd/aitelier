@@ -1,13 +1,8 @@
-"""Live tests for /v1/runs/active and /v1/runs/{id}/cancel.
-
-Cancellation has its own per-process active-run registry; this verifies
-the registry actually surfaces in-flight runs and that cancel signals
-land on them.
-"""
+"""Live tests for /v1/runs/active and /v1/runs/{id}/cancel that are
+backend-agnostic. Agent-path cancellation lives in test_agent_contract.py
+(parameterized over backends)."""
 
 from __future__ import annotations
-
-import time
 
 
 def test_active_runs_endpoint_shape(http):
@@ -25,63 +20,3 @@ def test_cancel_unknown_run_returns_404(http):
     not 500 — the consumer can tell missing vs failure apart."""
     r = http.post("/v1/runs/some-nonexistent-run/cancel")
     assert r.status_code == 404
-
-
-def test_cancel_active_run_returns_cancelled_ack(http, trace_tag, picked_agent):
-    """Start an async agent run, cancel while it's active, verify two contracts:
-      1. /v1/runs/{id}/cancel returns 200 with cancelled=True
-      2. The run reaches a terminal state durably (any of cancelled / failed /
-         completed — a fast backend can race the cancel to a natural finish)
-    """
-    agent = picked_agent
-    r = http.post("/v1/runs", json={
-        "model": f"agent:{agent}",
-        "messages": [{"role": "user", "content": "a" * 1000}],
-        "timeout": 60,
-        "aitelier": {"max_turns": 5, "trace_tag": trace_tag},
-    })
-    r.raise_for_status()
-    run_id = r.json()["run_id"]
-
-    # Observe the run as active. If the backend finishes faster than we can
-    # poll, the test design is racy and needs to be redesigned (e.g.,
-    # against a slow `mock` backend with a deliberate delay). Failing
-    # here is the honest signal: cancellation can't be tested if we can't
-    # see the run in flight.
-    deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        active = http.get("/v1/runs/active").json()["active"]
-        if run_id in active:
-            break
-        time.sleep(0.05)
-    else:
-        raise AssertionError(
-            f"run {run_id} never appeared in /v1/runs/active within 10s. "
-            f"Either the backend is too fast to observe (test needs a "
-            f"deterministic-slow backend) or the active registry has a bug."
-        )
-
-    cancel = http.post(f"/v1/runs/{run_id}/cancel")
-    assert cancel.status_code == 200, (
-        f"cancel returned HTTP {cancel.status_code}: {cancel.text}. "
-        f"If 404, the run finalized between active-check and cancel — "
-        f"that's a race in the test design, not a cancellation bug, but "
-        f"it still needs fixing (use a slower backend so the race window "
-        f"closes deterministically)."
-    )
-    assert cancel.json() == {"run_id": run_id, "cancelled": True}
-
-    # The run must transition to *some* terminal state, never stuck in
-    # pending/running. The exact terminal label depends on which step the
-    # cancel signal interrupted. Real coding-agent backends can take ~30s
-    # to wind down a Claude/Codex subprocess after CancelledError fires.
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        runs = http.get("/v1/runs", params={"trace_tag": trace_tag}).json()
-        mine = next((r for r in runs if r["run_id"] == run_id), None)
-        if mine and mine["state"] in ("cancelled", "completed", "failed"):
-            return
-        time.sleep(0.5)
-    raise AssertionError(
-        f"run {run_id} never reached a terminal state after cancel"
-    )
