@@ -2,7 +2,7 @@
 #
 # Variant of `docker/sandbox-agent.Dockerfile` with the bits brig
 # specifically needs:
-#   - Pre-bake the claude binary + claude-agent-acp npm package
+#   - Pre-bake the claude + codex agent CLIs and their ACP bridges
 #     (warden's mitmproxy + Lima networking is too slow for SA's 30s
 #     install timeout — verified empirically).
 #   - Bundle a brig-aware entrypoint that relocates HOME under /tmp
@@ -39,18 +39,26 @@ RUN apt-get update \
 COPY docker/prebaked-agents/claude/claude /usr/local/bin/claude
 RUN chmod +x /usr/local/bin/claude && /usr/local/bin/claude --version
 
-# Pre-install the ACP bridge as a global npm package so its launcher
-# binary lands on PATH. SA's `find_in_path("claude-agent-acp")` at
-# agent-management/src/agents.rs:453 then short-circuits the runtime
-# `npm install` (which would otherwise go through warden's mitmproxy
-# and miss SA's 30s install window). Pin matches the ACP registry's
-# `npx.package` field — bump when the registry bumps.
+# Pre-install the codex CLI + both ACP bridges as global npm packages
+# so their binaries land on PATH. SA's `find_in_path(<name>)` then
+# short-circuits the runtime `npm install` (which would otherwise go
+# through warden's mitmproxy and miss SA's 30s install window).
+# Pins match the ACP registry's `npx.package` field — bump when the
+# registry bumps.
+#   - `@openai/codex`: codex CLI itself (claude is pre-baked above)
+#   - `@agentclientprotocol/claude-agent-acp`: ACP bridge for claude
+#   - `@zed-industries/codex-acp`: ACP bridge for codex
 RUN npm config set fetch-retries 5 \
  && npm config set fetch-retry-mintimeout 20000 \
  && npm config set fetch-retry-maxtimeout 120000 \
  && npm config set fetch-timeout 600000 \
- && npm install -g @agentclientprotocol/claude-agent-acp@0.36.1 \
- && command -v claude-agent-acp
+ && npm install -g \
+        @openai/codex@0.132.0 \
+        @agentclientprotocol/claude-agent-acp@0.36.1 \
+        @zed-industries/codex-acp@0.14.0 \
+ && command -v codex \
+ && command -v claude-agent-acp \
+ && command -v codex-acp
 
 WORKDIR /app
 COPY scripts/cell-entrypoint.sh /app/cell-entrypoint.sh

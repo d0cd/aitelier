@@ -151,28 +151,12 @@ on first cold cell still takes several minutes — most of our 5 m e2e
 runtime was warden-MITM'd npm fetches. Cached after first run.
 
 
-## Bug: brig's own pytest tests clobber the real subnet-map.json
+## ✅ Fixed: brig's own pytest tests clobber the real subnet-map.json
 
-`brig/network/subnet.py:_write_subnet_map(state, map_file=SUBNET_MAP_FILE)`
-defaults to the REAL `~/.brig/state/system/subnet-map.json`. The
-`allocate()` and `free()` callers invoke it as `_write_subnet_map(state)`
-without overriding `map_file`. Brig's own pytest test suite
-(`tests/test_network_subnet.py`) builds an isolated `state_file` in a
-tmpdir, but doesn't pass `map_file` — so every test that allocates
-("cell-a", "cell-b", etc.) writes to the user's real subnet-map.
-
-Net effect: after running `pytest` in the brig repo, the real
-`subnet-map.json` says `{"10.60.1.0/24": "cell-a"}` instead of the
-real cell name. Warden reads that file and attributes every cell's
-traffic to "cell-a", which has no per-cell policy → every egress is
-blocked with `BLOCKED: api.anthropic.com - cell 'cell-a' has no
-per-cell policy`. Until the test suite is fixed, our test script
-regenerates `subnet-map.json` from `subnets.json` on startup; see
-`scripts/test-brig-mode.sh`.
-
-**Fix on brig side:** the test should pass a `map_file=tmp_map`
-override, OR `_write_subnet_map` should refuse to write when called
-without an explicit path during testing.
+Reported during this session. Brig flipped `_write_subnet_map` to
+keyword-only `map_file` and updated `allocate()`/`free()` to pass it
+explicitly. Our test script's regeneration workaround has been
+removed.
 
 ## Smaller frictions (now that we hit them, worth flagging)
 
