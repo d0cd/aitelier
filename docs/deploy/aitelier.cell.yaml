@@ -30,10 +30,11 @@
 
 name: aitelier
 image: localhost/aitelier:latest
-# `aitelier serve` reads the mounted TOML and starts the FastAPI app.
-# We bypass scripts/start.sh — that script provisions host services
-# (docker compose, host SA install) which don't apply inside a cell.
-command: ["aitelier", "serve", "--host", "0.0.0.0", "--port", "7777"]
+# /app/cell-entrypoint.sh starts SA in the background, waits for it,
+# then execs `aitelier serve`. Both processes live inside this cell —
+# brig has no inter-cell routing primitive yet (per brig-feedback's
+# "longer-term asks"), so co-locating them is the simplest path.
+command: ["/app/cell-entrypoint.sh"]
 memory: 8g
 cpus: 4
 pids_limit: 4096
