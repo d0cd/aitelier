@@ -94,13 +94,16 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
     # will silently burn the `num_predict` budget on hidden reasoning under
     # tight max_tokens, returning `content=""` with `finish_reason=length`
     # — deepread hit this in production for 8 days on qwen3:8b summarize.
-    # `minimal`/`none` are the OpenAI signals for "least reasoning" — map
-    # both to `think: false`. `low`/`medium`/`high` enable thinking. When
-    # the caller doesn't set `reasoning_effort` we leave the field
-    # unspecified so Ollama applies the model default.
+    #
+    # OpenAI's canonical ReasoningEffort enum is `minimal | low | medium |
+    # high | null`. We map `minimal` → `think: false` (Ollama's binary
+    # toggle has no gradient; `minimal` is the OpenAI signal for "least
+    # reasoning possible"), and `low|medium|high` → `think: true`.
+    # Omitting `reasoning_effort` leaves the field unspecified so Ollama
+    # applies the model default.
     effort = body.get("reasoning_effort")
     if isinstance(effort, str):
-        out["think"] = effort.lower() not in ("none", "minimal")
+        out["think"] = effort.lower() != "minimal"
     if options:
         out["options"] = options
     rf = body.get("response_format")

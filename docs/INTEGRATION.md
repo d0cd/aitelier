@@ -188,13 +188,14 @@ to OpenAI's:
 | `eval_count` | `usage.completion_tokens` |
 
 For Ollama hybrid-reasoning models (qwen3, deepseek-r1, …) aitelier
-maps OpenAI's `reasoning_effort` to Ollama's binary `think` toggle:
+maps OpenAI's canonical `reasoning_effort` enum (`minimal`, `low`,
+`medium`, `high`) to Ollama's binary `think` toggle:
 
 | `reasoning_effort` | Ollama `think` | Behavior |
 |---|---|---|
 | omitted | (unset) | Model default. Qwen3 family defaults to thinking ON; deepseek-r1 always thinks. |
-| `"minimal"` or `"none"` | `false` | Disable thinking entirely. Use this for structured-output tasks that don't benefit from chain-of-thought. |
-| `"low"`, `"medium"`, `"high"` | `true` | Enable thinking. |
+| `"minimal"` | `false` | Disable thinking entirely. Use this for structured-output tasks that don't benefit from chain-of-thought. |
+| `"low"`, `"medium"`, `"high"` | `true` | Enable thinking. Ollama's `think` is binary; aitelier doesn't translate the gradient further. |
 
 ```ts
 // Structured-output workflow — disable thinking explicitly to avoid
