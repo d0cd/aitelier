@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 
 import httpx
-from aitelier.errors import classify_error
+from aitelier.errors import classify_error, scrub_error_text
 
 
 def test_connect_error():
@@ -141,3 +141,66 @@ def test_http_status_pattern_does_not_overmatch():
     Request`, ` 400 `) — not bare digits in any context."""
     assert classify_error(RuntimeError("processed 400 lines")) == "RuntimeError"
     assert classify_error(RuntimeError("got 500 results back")) == "RuntimeError"
+
+
+# --- scrub_error_text -------------------------------------------------------
+
+
+def test_scrub_error_text_redacts_bare_bearer_token():
+    """The most common leak path: an upstream 401 echoes back the
+    Authorization header value. The token is the operator's OAuth bearer
+    or API key — must not reach API consumers or persist in `runs.error_msg`."""
+    msg = "Anthropic rejected the request: Bearer sk-ant-api03-AbCdEf1234567890XyZ"
+    scrubbed = scrub_error_text(msg)
+    assert "Bearer [redacted]" in scrubbed
+    assert "sk-ant-api03" not in scrubbed
+
+
+def test_scrub_error_text_redacts_authorization_header_form():
+    """When the upstream echoes the full header line, keep the `Authorization:`
+    prefix so operators reading logs can still see WHICH header leaked
+    without seeing the value."""
+    msg = "request failed: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"
+    scrubbed = scrub_error_text(msg)
+    assert "Authorization: Bearer [redacted]" in scrubbed
+    assert "eyJhbGciOiJIUzI1NiJ9" not in scrubbed
+
+
+def test_scrub_error_text_redacts_url_credentials():
+    """OAuth tokens and API keys sometimes appear in query strings inside
+    upstream error envelopes (legacy auth methods, callback URLs)."""
+    msg = "GET https://api.example.com/v1/things?api_key=secret123&filter=foo failed"
+    scrubbed = scrub_error_text(msg)
+    assert "api_key=[redacted]" in scrubbed
+    assert "secret123" not in scrubbed
+    assert "filter=foo" in scrubbed  # non-credential params preserved
+
+
+def test_scrub_error_text_redacts_json_token_field():
+    """Stringified dicts can carry credential fields by name. Match
+    `'token': 'value'` / `"token": "value"` patterns and redact the value."""
+    msg = "ACP error: {'token': 'sk-abc123', 'session_id': 'xyz'}"
+    scrubbed = scrub_error_text(msg)
+    assert "'token': '[redacted]'" in scrubbed
+    assert "sk-abc123" not in scrubbed
+    assert "session_id" in scrubbed  # only credential-named fields hit
+
+
+def test_scrub_error_text_leaves_non_credential_content_alone():
+    """Conservative: the scrubber must not mangle ordinary error prose."""
+    msg = "Connection refused to api.anthropic.com:443 after 30s timeout"
+    assert scrub_error_text(msg) == msg
+
+
+def test_scrub_error_text_handles_empty_and_none_safe():
+    """Defensive — `error_msg` is sometimes empty or never set."""
+    assert scrub_error_text("") == ""
+    assert scrub_error_text(None) is None
+
+
+def test_scrub_error_text_does_not_match_short_words_after_bearer():
+    """The `\\bBearer\\s+...{16,}` pattern requires at least 16 chars after
+    `Bearer` to avoid false positives like 'Bearer of bad news' (where
+    `of` is too short to look like a token)."""
+    msg = "Server is bearer of bad news"
+    assert scrub_error_text(msg) == msg

@@ -16,7 +16,7 @@ import logging
 from collections.abc import Awaitable
 from typing import Any
 
-from aitelier.errors import classify_error
+from aitelier.errors import classify_error, scrub_error_text
 from aitelier.storage import RunSpec, get_store
 
 logger = logging.getLogger("aitelier.runs")
@@ -67,7 +67,7 @@ async def record_run(spec: RunSpec, work: Awaitable[dict[str, Any]]) -> dict:
         await _finalize_terminal(
             store, spec.run_id,
             status="error",
-            error_type=classify_error(exc), error_msg=str(exc),
+            error_type=classify_error(exc), error_msg=scrub_error_text(str(exc)),
             finish_reason="error", state="failed",
         )
         raise

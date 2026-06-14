@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import httpx
 
 # Maps Python exception class names to consumer-facing error types
@@ -145,3 +147,61 @@ def classify_error(exc: Exception) -> str:
         return "ProviderError"
 
     return _ERROR_MAP.get(cls_name, cls_name)
+
+
+# Patterns that match credentials embedded in free-form error text.
+# Order matters: more specific patterns first so the generic
+# `Bearer <token>` match doesn't accidentally swallow a structured one.
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # `Authorization: Bearer <token>` (header echoed back in errors)
+    (
+        re.compile(r"(?i)(Authorization:\s*Bearer\s+)[A-Za-z0-9._\-+/=]+"),
+        r"\1[redacted]",
+    ),
+    # Bare `Bearer <token>` (Anthropic/OpenAI error envelopes often quote
+    # the Authorization header value without the key).
+    (
+        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-+/=]{16,}"),
+        "Bearer [redacted]",
+    ),
+    # Query-string credentials (`?api_key=...`, `&token=...`, `&password=...`)
+    # — URLs sometimes appear in upstream error envelopes.
+    (
+        re.compile(
+            r"(?i)([?&](?:api[_-]?key|access[_-]?token|token|secret|password|auth)=)[^&\s\"']+"
+        ),
+        r"\1[redacted]",
+    ),
+    # JSON-ish field=value pairs that name a credential explicitly
+    # (e.g., `'token': 'sk-...'` inside a stringified dict).
+    (
+        re.compile(
+            r"(?i)(['\"](?:api[_-]?key|access[_-]?token|token|secret|password)['\"]\s*[:=]\s*['\"])[^'\"]+(['\"])"
+        ),
+        r"\1[redacted]\2",
+    ),
+)
+
+
+def scrub_error_text(message: str) -> str:
+    """Redact credential-shaped substrings from free-form error text.
+
+    `error_msg` is captured from `str(exc)` and persisted in
+    `runs.error_msg` + surfaced in API responses and webhook payloads.
+    When the underlying exception is a wrapped upstream error
+    (Anthropic 401, ACP `-32603 Internal error`, httpx response body),
+    the message can carry the OAuth bearer or API key that triggered
+    the failure. Structured redaction (`_redact_secrets` on dict/list)
+    doesn't help here because the secret is inside a string.
+
+    Conservative: only redacts shapes that are unambiguously credentials
+    (`Bearer <jwt>`, `?api_key=…`, `'token': '…'`). Doesn't try to
+    pattern-match prefixed keys (`sk-…`, `eyJ…`) — too aggressive, and
+    would mangle legitimate non-secret content.
+    """
+    if not message:
+        return message
+    out = message
+    for pattern, replacement in _SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
