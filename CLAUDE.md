@@ -50,9 +50,10 @@ The agent path **hard-rejects** OpenAI fields it can't honestly map:
 - `POST /v1/runs` — submit a long-running async agent; webhook on completion
 - `GET  /v1/runs[/{id}[/events[/stream]]]` — durable runs + append-only event timeline
 - `GET  /v1/runs/active`, `POST /v1/runs/{id}/cancel` — in-flight registry + cancel
+- `POST /v1/runs/{id}/wait` — block until a run reaches a terminal state
 - `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
 - `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
-- `GET  /v1/health`, `GET /v1/discovery` — liveness + endpoint inventory + dependency probes
+- `GET  /v1/health`, `GET /v1/discovery`, `GET /v1/metrics` — liveness + endpoint inventory + dependency probes + runtime counters
 
 All requests accept `X-Correlation-Id` (generated if absent), echoed in
 response header + body field + SSE chunks + run metadata.

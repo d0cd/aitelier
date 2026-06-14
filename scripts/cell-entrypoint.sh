@@ -24,18 +24,16 @@ if [ -f /run/secrets/codex-credentials ]; then
     ln -sf /run/secrets/codex-credentials "$HOME/.codex/auth.json"
 fi
 
-# Warden MITM-intercepts cell egress to enforce the per-cell allowlist.
-# Without trusting warden's CA, every outbound HTTPS handshake fails
-# with "unknown ca." We mount the CA pem as a secret and stitch a
-# combined trust bundle under /tmp (the rootfs is RO).
-if [ -f /run/secrets/warden-ca-cert ]; then
-    CA_BUNDLE=/tmp/ca-bundle.crt
-    cat /etc/ssl/certs/ca-certificates.crt /run/secrets/warden-ca-cert > "$CA_BUNDLE"
-    export SSL_CERT_FILE="$CA_BUNDLE"
-    export REQUESTS_CA_BUNDLE="$CA_BUNDLE"
-    export CURL_CA_BUNDLE="$CA_BUNDLE"
-    export NODE_EXTRA_CA_CERTS=/run/secrets/warden-ca-cert
-fi
+# Warden MITM-intercepts cell egress; HTTPS clients need warden's CA
+# in their trust store or every handshake fails with "unknown ca."
+# Brig 0.3.0+ does this automatically: `trust_warden_ca: true` (default
+# in cell yaml) stages a combined system+warden bundle at
+# /run/brig/ca-bundle.crt and auto-exports SSL_CERT_FILE,
+# REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE, NODE_EXTRA_CA_CERTS. We used to
+# stitch this ourselves from a `warden-ca-cert` secret, but that
+# cached the CA in the secret and broke on every warden restart
+# (warden regenerates its CA, secret stays stale → silent TLS hangs).
+# Nothing to do here.
 
 # `--no-token` is fine because brig's ingress already gates inbound
 # traffic with bearer auth (`<cell-name>-ingress-token` secret).

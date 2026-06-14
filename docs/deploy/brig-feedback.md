@@ -1,7 +1,7 @@
 # Feedback from running Sandbox Agent in a brig cell
 
 **First report:** 2026-05-18 (brig 0.3.0 base, aitelier+SA co-located in cell)
-**Update:** 2026-05-19 (refactored to SA-only cell + brig fixes shipped)
+**Latest update:** 2026-05-20 (latest 0.3.0 — CA bugs fixed, SSE buffering surfaced)
 **Consumer:** aitelier (runs on host; talks to SA-in-cell via brig ingress)
 **Test artifact:** `docs/deploy/sandbox-agent.cell.yaml`,
 `docker/sandbox-agent.brig.Dockerfile`, `scripts/test-brig-mode.sh`
@@ -15,12 +15,13 @@ HTTP-service runtime — brig isolates what needs isolating (the agent
 processes) without conflating it with the rest of aitelier's
 infrastructure.
 
-**Live e2e status: 30 / 30 tests pass, 0 skip, 0 fail.** After
-removing all skips and switching LLM-mode tests to Ollama (no Anthropic
-key needed), the suite is fully green against the SA-in-brig +
-aitelier-on-host deployment. The items below are the things that
-surprised us along the way — either bugs that brig has since fixed, or
-design gaps still open.
+**Status today:** brig SA cell starts cleanly on a fresh `brig system
+up`, claude-acp authenticates and reaches `api.anthropic.com` through
+warden's MITM, and streamed agent message chunks now arrive
+incrementally through ingress. Aitelier-on-host + SA-in-brig is a
+working deployment. The items below are the surprises we hit — most
+are bugs brig has since shipped fixes for, with a couple of
+adoption-quality items still open.
 
 
 ## Fixed since first report
@@ -53,6 +54,89 @@ a cell declares `ingress: auth: token` but no `<cell-name>-ingress-token`
 secret is registered. We hit the prior silent-401 behavior the first
 time around — clean fix, thanks.
 
+### ✅ Warden MITM CA is auto-trusted in cells (`trust_warden_ca: true`)
+Cells now get a combined system+warden CA bundle mounted at
+`/run/brig/ca-bundle.crt` with `SSL_CERT_FILE` /
+`REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS`
+auto-exported. We deleted our manual `warden-ca-cert` secret + the
+entrypoint-side stitching when we migrated.
+
+**Three implementation bugs caught mid-session and fixed by brig the
+same day:**
+- Bug A — `vm_run` auto-sudo didn't apply to `sh -c` scripts that
+  contained `podman exec`; `brig/cell/ca_bundle.py:87` ran unprivileged
+  and couldn't see the rootful warden container.
+- Bug B — `WARDEN_CA_PATH_IN_CONTAINER` doesn't exist on a fresh
+  warden (mitmproxy generates the CA lazily on first traffic), making
+  `brig run` fail 100% of the time on the first cell after
+  `brig system up`. Fix: brig now primes the CA at warden startup.
+- Bug C — `/home/mitmproxy/.mitmproxy/` was owned by `root:root` so
+  mitmproxy couldn't write its own state. Fixed in warden's image.
+
+**Migration foot-gun worth documenting:** if a cell-author's entrypoint
+ALSO sets `SSL_CERT_FILE` (common pre-0.3.0 workaround), it overrides
+brig's auto-mount. When warden's CA rotates on the next `brig system up`,
+the cell-author's cached secret goes stale → silent TLS hangs with no
+error inside the cell. mitmproxy's MITM presents the client-side
+handshake as "succeeded" (cell trusts warden), but the UPSTREAM
+handshake fails and the proxy drops with no signal back. We burned
+~30 minutes on this. Suggestions:
+1. `brig system doctor` could include
+   `[OK] Warden CA matches all cells' staged bundles`.
+2. Cell-definition docs could include a "do not also set `SSL_CERT_FILE`
+   in your entrypoint" note in the `trust_warden_ca:` section.
+3. Fail (or warn loudly) when an entrypoint's `Config.Env` overrides
+   `SSL_CERT_FILE` differently from what brig set.
+
+### ✅ `tls_passthrough` in cell yaml (principled fix for credentialed flows)
+Brig 0.3.0 shipped exactly the API we sketched: per-cell
+`tls_passthrough: [<host>]` declarations let cells skip mitmproxy
+termination for hosts whose TLS won't survive MITM (Cloudflare-fronted
+strict TLS, HPKP, ECH). The cell-definition docs include the threat-
+model contrast (URL audit vs. handshake compat + credential
+confidentiality).
+
+Verified end-to-end: with
+```yaml
+policy:
+  tls_passthrough:
+    - "chatgpt.com"
+    - "auth.openai.com"
+```
+in the cell yaml, codex's OAuth refresh completes through warden and
+the agent responds normally:
+```
+agent:codex (max_turns=1) → 'HI' in 6s
+```
+Pre-`tls_passthrough` this hung at the first TLS handshake against
+chatgpt.com. Codex is now a viable brig backend alongside claude.
+
+### ✅ `brig` pytest fixtures no longer clobber the real subnet-map.json
+`_write_subnet_map` is now keyword-only on `map_file` and `allocate()` /
+`free()` pass it explicitly. Our regeneration workaround in
+`scripts/test-brig-mode.sh` has been removed.
+
+### ✅ Ingress passes SSE through unbuffered
+Brig now flushes streaming responses on ingress routes — `Content-Type:
+text/event-stream` responses no longer get buffered by warden's
+mitmproxy. End-to-end verification against the live brig SA:
+
+```
+$ curl -N -X POST aitelier/v1/chat/completions -d '{"model":"agent:claude",
+    "messages":[{"role":"user","content":"Count from 1 to 5 separated by commas."}],
+    "stream":true,"aitelier":{"max_turns":2}}'
+
+data: {... "delta": {"role": "assistant"} ...}
+data: {... "delta": {"content": ""} ...}
+data: {... "delta": {"content": "1, 2, 3, 4, 5"} ...}
+data: {... "delta": {}, "finish_reason": "stop", "usage": {...} ...}
+```
+
+3-second end-to-end. Chunks arrive incrementally during the agent run,
+not in a single post-completion flush. This unblocks aitelier running
+on brig SA — claude-acp's `session/update` notifications flow through
+the ingress in real time. 🎉
+
 
 ## Still blocking real-shaped deployments
 
@@ -79,32 +163,7 @@ is what `make start` boots), we'd need either:
 This is no longer blocking aitelier's deployment, but the next consumer
 will hit it again.
 
-### 2. Warden MITM CA isn't auto-trusted in cells
-
-Every cell egress goes through Warden's mitmproxy, which terminates
-TLS with warden's own CA. Cells using HTTPS need warden's CA in their
-trust store, or the TLS handshake fails with:
-
-```
-Client TLS handshake failed. The client does not trust the proxy's
-certificate for api.anthropic.com (tlsv1 alert unknown ca)
-```
-
-We worked around it by extracting warden's CA from
-`/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem`, registering it as
-the brig secret `warden-ca-cert`, mounting it in the cell yaml, and
-having `cell-entrypoint.sh` concatenate it onto `/etc/ssl/certs/...`
-into `/tmp/ca-bundle.crt`, then exporting `SSL_CERT_FILE`,
-`REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`. Works,
-but every brig-cell consumer is going to rediscover this and roll
-their own fragile copy.
-
-**Suggested:** brig should mount its CA into every cell automatically
-(e.g., at `/run/brig/warden-ca.pem`), and ideally also export `SSL_CERT_FILE`
-in the cell's default env so common Python/Rust/Go/Node clients pick it
-up without per-image work.
-
-### 3. Outbound TLS through warden is too slow for SA's install timeouts
+### 2. Outbound TLS through warden is too slow for SA's install timeouts
 
 This isn't a brig bug per se, but it's a pattern-collision worth
 flagging. Sandbox Agent (Rivet's coding-agent runtime) does a lot of
@@ -151,108 +210,66 @@ on first cold cell still takes several minutes — most of our 5 m e2e
 runtime was warden-MITM'd npm fetches. Cached after first run.
 
 
-## ✅ Fixed: brig's own pytest tests clobber the real subnet-map.json
-
-Reported during this session. Brig flipped `_write_subnet_map` to
-keyword-only `map_file` and updated `allocate()`/`free()` to pass it
-explicitly. Our test script's regeneration workaround has been
-removed.
-
-
-## Bug: warden's mitmproxy can't MITM chatgpt.com (and similar)
-
-Found while adding codex to the brig matrix. With `chatgpt.com` in the
-allow list and the cell trusting warden's CA, a CONNECT tunnel succeeds
-but the upstream TLS handshake fails immediately:
-
-```
-[10.60.1.33:58181] No TLS context was provided, failing connection.
-[10.60.1.33:58181] server disconnect chatgpt.com:443 (172.64.155.209:443)
-```
-
-The cell-side curl gets `SSL_ERROR_SYSCALL` because warden never
-finishes negotiating with chatgpt.com. Cloudflare-fronted hosts often
-have strict SNI/ALPN/cipher constraints that mitmproxy's relayed
-handshake can't satisfy.
-
-This blocks codex agent runs in brig — codex CLI auths via ChatGPT
-subscription OAuth (`chatgpt.com` for token refresh + session
-validation) before any `api.openai.com` call. The `codex-credentials`
-secret is mounted and the policy allows the host, but the request
-dies at the TLS layer inside Warden.
-
-**Asks for brig (any of these unblock codex-in-brig):**
-1. `tls_strategy_passthrough` config — let operators list hosts where
-   Warden tunnels raw bytes instead of MITM'ing. Loses per-request
-   URL audit logs for those hosts, but preserves host-level policy.
-2. SNI-only allowlist mode — don't terminate TLS; route based on the
-   SNI extension in the client hello. Same trade-off as #1.
-3. Document which hosts won't work via mitmproxy so operators can
-   plan around it (e.g., "codex / OpenAI ChatGPT-OAuth is unsupported
-   in cells until passthrough lands").
-
-Until then: keep `claude` as the only curated brig backend; document
-the limitation in the test script.
-
-
-### The principled fix for outbound credentialed traffic
-
-Beyond the specific chatgpt.com symptom, this is a general class
-problem: any host with **strict TLS** — public-key pinning (HPKP),
-Certificate Transparency expectations, Encrypted Client Hello (ECH),
-tight ALPN/cipher negotiation, or Cloudflare's bot-fingerprinting
-TLS — will refuse mitmproxy's relayed handshake. The list will only
-grow as more providers harden their edges.
-
-mitmproxy can't be expected to satisfy every modern TLS endpoint.
-Brig's design needs to accept that constraint and offer operators an
-explicit, audited way to opt out of MITM per host.
-
-**Threat-model framing brig should adopt:**
-
-| Concern | MITM mode | Passthrough mode |
-|---|---|---|
-| Host allowlist enforcement (SNI match) | ✓ | ✓ — Warden reads SNI from client hello |
-| Per-request URL / method audit | ✓ | ✗ — only SNI + connection metadata |
-| Body inspection / DLP | ✓ | ✗ |
-| Credential confidentiality (cell ↔ provider) | ✗ — warden sees the cleartext | ✓ — warden never sees the body |
-| Handshake compatibility with strict TLS | ✗ | ✓ |
-
-For an agent runtime that holds the OPERATOR'S provider credentials
-(claude OAuth, codex OAuth, OpenAI API keys), the passthrough mode is
-arguably more secure than MITM: warden in MITM mode sees every bearer
-token on every request. Operators trust warden today only because
-they own it; in a multi-tenant brig (when it lands), passthrough
-becomes the only acceptable mode for credentialed flows.
-
-**Concrete API ask:**
-
-```yaml
-# cells/<name>.yaml
-policy:
-  allow:
-    - "api.anthropic.com"     # default: MITM, full URL audit
-    - "registry.npmjs.org"
-  passthrough_tls:
-    - "chatgpt.com"           # raw TCP tunnel after CONNECT; SNI-only audit
-    - "auth.openai.com"       # codex OAuth refresh
-```
-
-Keeping `allow` and `passthrough_tls` as separate lists (rather than
-overloading the allow entries with per-host attributes) gives a clear
-visual signal that these hosts are NOT being inspected and forces an
-explicit operator decision per-host. Warden's audit log should
-distinguish the two modes so operators can tell from log lines whether
-a request was inspected or just SNI-routed.
-
-**Implementation pointer** (for the brig devs): mitmproxy supports
-this natively via the `tls_strategy` addon hooks. Setting
-`flow.client_conn.tls_passthrough = True` in `tls_clienthello`
-based on the matched SNI is a ~10-line addon. Warden's existing
-host-policy resolution gives us the matched host name; the only new
-logic is the passthrough_tls allowlist match + the metadata flip.
-
 ## Smaller frictions (now that we hit them, worth flagging)
+
+### `brig cell start` doesn't re-register ingress routes after a brig restart
+
+After `brig system up` (e.g., reboot, or `brig system down/up`), any
+existing cells are present in `brig cell list` but in `exited` state.
+Running `brig cell start <name>` flips them to `running` and the cell's
+process binds its internal port — but the **ingress reverse proxy on
+:8443 doesn't know how to route to it**, so external requests get
+HTTP 502 indefinitely.
+
+Reproduction (confirmed 2026-05-26 against latest 0.3.0):
+
+```
+$ brig cell list
+NAME            STATUS    IMAGE
+sandbox-agent   exited    localhost/sandbox-agent-brig:latest
+
+$ brig cell start sandbox-agent
+[INFO] Cell 'sandbox-agent' started
+
+$ brig cell list
+NAME            STATUS    IMAGE
+sandbox-agent   running   localhost/sandbox-agent-brig:latest    # ✓ running
+
+$ for i in $(seq 15); do curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8443/sandbox-agent/v1/agents; sleep 1; done
+502
+502
+502   # … for at least 15 seconds with no recovery
+```
+
+Workaround: `brig cell rm <name> --keep-workspace && brig run --file
+<cell.yaml> -d`. Workspace data is preserved, but the cell is rebuilt
+from yaml and ingress routes get re-registered:
+
+```
+$ brig run --file docs/deploy/sandbox-agent.cell.yaml -d
+[INFO] Registered 1 ingress routes for 'sandbox-agent'
+[INFO] Cell 'sandbox-agent' started
+
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8443/sandbox-agent/v1/agents
+200
+```
+
+The `Registered 1 ingress routes` line is the diagnostic — it only
+appears on `brig run --file`, not on `brig cell start`. The natural
+mental model is that `start` should fully restore a cell to its prior
+working state; "you must rm + run-from-yaml after every brig restart"
+is surprising and not documented.
+
+**Suggestion:** `brig cell start` should re-register ingress routes
+from the cell's stored yaml (which brig already knows — it staged the
+cell from yaml originally). Or, at minimum, surface a warning when
+starting a cell with declared ingress: "ingress routes will not be
+re-registered; use `brig run --file` if your ingress isn't reachable
+after start."
+
 
 ### `brig cell network` only logs egress
 
@@ -317,13 +334,13 @@ That also removes the misleading warden log lines.
 
 | # | Severity | Item |
 |---|---|---|
-| 1 | **Adoption** | Auto-mount Warden CA in cells + export `SSL_CERT_FILE` so common HTTPS clients trust it without per-image work |
-| 2 | Adoption | Raw TCP host_services, OR a documented socat-bridge recipe for unix sockets → host TCP services. (Aitelier sidesteps by running outside the cell; the next consumer will hit this.) |
-| 3 | **Quality** | TLS passthrough mode for specific allowed large-blob hosts (or feed warden into build path) so first-run agent installs aren't multi-minute |
-| 4 | Minor | `brig cell network` to include ingress hits |
-| 5 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the exemption metadata is actually populated when the check runs |
-| 6 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source) |
+| 1 | Adoption | Raw TCP host_services, OR a documented socat-bridge recipe for unix sockets → host TCP services. Aitelier sidesteps by running outside the cell; the next consumer will hit this. |
+| 2 | Quality | Feed warden into `brig image build` so first-run agent installs (`npm install`, agent CLI binary fetch) aren't multi-minute through MITM. Today the build/runtime asymmetry forces pre-baking large binaries into the image. |
+| 3 | Minor | `brig system doctor`: add `[OK] Warden CA matches all cells' staged bundles` to surface stale entrypoint-managed `SSL_CERT_FILE` overrides before they become silent TLS hangs. |
+| 4 | Minor | `brig cell network` to include ingress hits (currently egress-only). |
+| 5 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the ingress-route / host-service exemption metadata is actually populated when the check runs. |
+| 6 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source). |
 
-Items 1–3 are the difference between "brig hosts a real service" and
-"brig hosts a service that mostly works after a lot of build-side
-gymnastics."
+With SSE flowing, aitelier-on-host + SA-in-brig is a real, working
+shape. Items 1 and 2 are about widening the adoption surface for the
+next consumer; the rest are quality-of-life polish.

@@ -37,14 +37,21 @@ workspace_quota: "20g"
 # Agent file operations (Read/Write/etc.) and `aitelier.workspace`
 # requests reference paths under /work.
 
-# --- Credentials + CA ---
+# --- Credentials ---
 # Register with `brig secrets add <name>` before running the cell.
 # Aitelier never enters this cell — its config lives wherever aitelier
 # itself runs, not here.
+#
+# Warden's MITM CA is auto-mounted by brig at /run/brig/ca-bundle.crt
+# via `trust_warden_ca: true` (default since brig 0.3.0). All four
+# common SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE /
+# NODE_EXTRA_CA_CERTS env vars are auto-exported. Do NOT add a
+# `warden-ca-cert` secret here — that path was a pre-0.3.0 workaround
+# and competing with brig's auto-mount caused CA mismatches when
+# warden rotated its cert across brig restarts.
 secrets:
   - claude-credentials         # → $HOME/.claude/.credentials.json
   - codex-credentials          # → $HOME/.codex/auth.json
-  - warden-ca-cert             # → trust store (SA's HTTPS to Anthropic)
 
 env: {}
 
@@ -54,6 +61,12 @@ policy:
   allow:
     # LLM providers the agent CLIs hit at runtime.
     - "api.anthropic.com"
+    # claude-code now hits platform.claude.com for OAuth quota /
+    # plan info on every session prompt (added by Anthropic around
+    # April 2026 as part of the Agent SDK / extra-usage rollout).
+    # Without this, session/prompt 200s the JSON-RPC envelope but
+    # the bridge hangs indefinitely waiting on the blocked CONNECT.
+    - "platform.claude.com"
     - "api.openai.com"
     # codex CLI auths via ChatGPT subscription OAuth — it hits
     # chatgpt.com for token refresh + session validation before
@@ -82,6 +95,16 @@ policy:
     - "registry.npmjs.org"
 
   deny: []
+
+  # Hosts whose TLS won't survive warden's mitmproxy relay (Cloudflare-
+  # fronted strict TLS, HPKP, ECH). Warden tunnels raw TCP after the
+  # CONNECT and routes by SNI — per-URL audit is lost for these, but
+  # the handshake completes and credentials stay confidential cell↔upstream.
+  # Each entry must also be in `allow:` above.
+  tls_passthrough:
+    # codex CLI's ChatGPT-OAuth flow (Cloudflare fronts both).
+    - "chatgpt.com"
+    - "auth.openai.com"
 
 # --- Ingress ---
 # SA serves ACP on :2468 inside the cell. brig forwards
