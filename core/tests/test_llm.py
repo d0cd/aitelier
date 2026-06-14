@@ -9,14 +9,16 @@ from aitelier.providers.llm import (
     LLMError,
     UnsupportedResponseFormat,
     _apply_response_format_gates,
-    _build_ollama_request,
-    _ollama_to_chat_completion,
-    _resolve_ollama_model,
-    _routes_to_ollama,
     _wants_anthropic_prompt_caching,
     chat_completion,
     chat_completion_stream,
     list_models,
+)
+from aitelier.providers.ollama import (
+    _build_ollama_request,
+    _ollama_to_chat_completion,
+    _resolve_ollama_model,
+    routes_to_ollama as _routes_to_ollama,
 )
 
 # --- Response-format gating -------------------------------------------------
