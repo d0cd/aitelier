@@ -32,6 +32,7 @@ from aitelier.openai_compat import (
     AitelierAgentOpts,
     ChatCompletionRequest,
     EmbeddingsRequest,
+    ScheduleRequest,
     agent_error_to_chat_completion_error,
     agent_result_to_chat_completion,
     agent_usage_to_openai,
@@ -52,7 +53,7 @@ from aitelier.providers.llm import (
     model_response_format_capabilities,
 )
 from aitelier.runner import make_run_id
-from aitelier.runs import hash_system_prompt, record_run, start_run
+from aitelier.runs import _finalize_terminal, hash_system_prompt, record_run, start_run
 from aitelier.sandbox_proxy import (
     fetch_artifacts as _fetch_artifacts,
 )
@@ -95,7 +96,6 @@ class _JsonFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        import json as _json
         payload = {
             "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S%z"),
             "level": record.levelname,
@@ -105,7 +105,7 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
-        return _json.dumps(payload, default=str)
+        return json.dumps(payload, default=str)
 
 
 def _install_correlation_logging() -> None:
@@ -199,8 +199,41 @@ async def _schedule_handler(entry: dict) -> None:
             )
     except Exception as exc:
         logger.warning("Scheduled run %s failed: %s", run_id, exc)
+        # Persist a synthetic failed run row so /v1/runs and /v1/traces
+        # surface this failure. Without this, schedule-side failures (bad
+        # task body, model-route parse error, validator rejection) only
+        # fire the webhook — there's no durable record. _finalize_terminal
+        # tolerates a missing row; create_run is best-effort so a Postgres
+        # outage during the schedule tick doesn't mask the original error.
+        try:
+            store = await get_store()
+            try:
+                await store.create_run(RunSpec(
+                    run_id=run_id,
+                    kind="agent" if "agent:" in str(task.get("model", "")) else "complete",
+                    model=str(task.get("model", "")) or None,
+                    correlation_id=fake_req_state.correlation_id,
+                    metadata={
+                        "schedule_id": entry.get("id"),
+                        "schedule_name": entry.get("name"),
+                    },
+                ))
+            except Exception:
+                pass  # row may already exist if the failure happened post-record_run
+            await _finalize_terminal(
+                store, run_id,
+                status="error",
+                error_type=classify_error(exc),
+                error_msg=scrub_error_text(str(exc)),
+                finish_reason="error", state="failed",
+            )
+        except Exception as persist_exc:
+            logger.warning(
+                "Schedule %s: failed to persist run row for %s: %s",
+                entry.get("id"), run_id, persist_exc,
+            )
         result = {
-            "error": {"type": classify_error(exc), "message": str(exc)},
+            "error": {"type": classify_error(exc), "message": scrub_error_text(str(exc))},
             "aitelier_run_id": run_id,
         }
     if entry.get("webhook_url"):
@@ -539,26 +572,6 @@ def _cancelled_result(run_id: str, kind: str) -> dict:
 
 
 # --- Request/Response models ---
-
-
-class ScheduleRequest(BaseModel):
-    """Schedule a recurring or one-shot task. `task` mirrors the chat-
-    completions request body and is validated when the schedule fires.
-
-    `name` is charset-restricted because it flows into log lines and into
-    the inner agent's `<aitelier_context>` system-prompt block via
-    `make_run_id`; permitting arbitrary text would enable stored prompt-
-    injection across team users on the same aitelier."""
-    model_config = ConfigDict(extra="forbid")
-
-    name: str = Field(
-        default="scheduled", min_length=1, max_length=64,
-        pattern=r"^[A-Za-z0-9_\-\.]+$",
-    )
-    task: dict
-    interval_seconds: int | None = None
-    at_iso: str | None = None
-    webhook_url: str | None = None
 
 
 # --- Primitive endpoints ---
@@ -1962,64 +1975,6 @@ def _run_to_trace_dict(run) -> dict:
     return {k: full[k] for k in _TRACE_RECORD_KEYS if k in full}
 
 
-@app.get("/v1/traces")
-async def traces_endpoint(
-    since: str | None = None,
-    trace_tag: str | None = None,
-    parent_run_id: str | None = None,
-    status: str | None = None,
-    limit: int = Query(50, ge=1, le=500),
-) -> list[dict]:
-    """Query recent runs as TraceRecord summaries (counts, tokens, cost).
-
-    `parent_run_id` narrows to children of a specific parent — useful
-    for rendering a multi-agent workflow's subtree as a flat trace list.
-    """
-    store = await get_store()
-    since_dt = datetime.fromisoformat(since) if since else None
-    flt = RunFilter(
-        trace_tag=trace_tag, parent_run_id=parent_run_id,
-        since=since_dt, limit=limit,
-    )
-    runs = await store.list_runs(flt)
-    if status:
-        runs = [r for r in runs if r.status == status]
-    return [_run_to_trace_dict(r) for r in runs]
-
-
-@app.get("/v1/traces/aggregates")
-async def traces_aggregates_endpoint(
-    group_by: str = "trace_tag",
-    since: str | None = None,
-    until: str | None = None,
-    trace_tag: str | None = None,
-) -> dict:
-    """Roll up run stats.
-
-    `group_by` ∈ {trace_tag, kind, model, agent_id, status, error_type, day}.
-    """
-    store = await get_store()
-    since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
-    try:
-        return await store.aggregate_runs(
-            group_by=group_by, since=since_dt, until=until_dt, trace_tag=trace_tag,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-
-
-@app.get("/v1/traces/{trace_id}")
-async def get_trace_endpoint(trace_id: str) -> dict:
-    """Get a single trace by ID. Same data as /v1/runs/{id} in TraceRecord shape."""
-    _validate_path_component(trace_id, "trace_id")
-    store = await get_store()
-    run = await store.get_run(trace_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="Trace not found")
-    return _run_to_trace_dict(run)
-
-
 def _event_to_dict(event) -> dict:
     """tool_call/tool_result payloads carry raw user arguments + tool
     outputs — both can contain credentials (a `bash` tool call's argv,
@@ -2283,44 +2238,6 @@ _discovery_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _discovery_lock = asyncio.Lock()
 
 
-@app.get("/v1/schedules")
-async def list_schedules_endpoint() -> list[dict]:
-    """List persisted schedules."""
-    from aitelier.schedules import list_schedules
-    return await list_schedules()
-
-
-@app.post("/v1/schedules")
-async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
-    """Register a recurring or one-shot scheduled task."""
-    from aitelier.schedules import create_schedule
-    if req.webhook_url:
-        await _check_webhook_url_or_die(req.webhook_url)
-    try:
-        return await create_schedule(req.model_dump(exclude_none=True))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from None
-
-
-@app.get("/v1/schedules/{schedule_id}")
-async def get_schedule_endpoint(schedule_id: str) -> dict:
-    _validate_path_component(schedule_id, "schedule_id")
-    from aitelier.schedules import get_schedule
-    entry = await get_schedule(schedule_id)
-    if not entry:
-        raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
-    return entry
-
-
-@app.delete("/v1/schedules/{schedule_id}")
-async def delete_schedule_endpoint(schedule_id: str) -> dict:
-    _validate_path_component(schedule_id, "schedule_id")
-    from aitelier.schedules import delete_schedule
-    if not await delete_schedule(schedule_id):
-        raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
-    return {"id": schedule_id, "deleted": True}
-
-
 @app.get("/v1/discovery")
 async def discovery() -> dict:
     """Capability + endpoint inventory for peer services.
@@ -2453,5 +2370,9 @@ def _now_iso() -> str:
 # the time the first request fires. New endpoint surfaces should follow
 # the same pattern (one APIRouter per resource, registered here).
 from aitelier.endpoints.runs import router as _runs_router  # noqa: E402
+from aitelier.endpoints.schedules import router as _schedules_router  # noqa: E402
+from aitelier.endpoints.traces import router as _traces_router  # noqa: E402
 
 app.include_router(_runs_router)
+app.include_router(_schedules_router)
+app.include_router(_traces_router)

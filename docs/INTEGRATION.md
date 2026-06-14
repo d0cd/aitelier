@@ -109,7 +109,7 @@ Routing decided by `model`:
 | `claude-sonnet-4-6`, `nomic-embed-text`, `local`, … | LiteLLM (alias) | Curated short names from `docker/litellm/config.yaml` |
 | `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (wildcard) | Pass-through; LiteLLM resolves the provider |
 | `agent:<backend>` | Sandbox Agent | Backend's default inner LLM |
-| `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM (e.g. `agent:claude/claude-opus-4-7`) |
+| `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM (e.g. `agent:claude/claude-sonnet-4-5`) |
 
 ### `POST /v1/embeddings`
 

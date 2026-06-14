@@ -91,7 +91,11 @@ class ChatCompletionRequest(BaseModel):
     n: int | None = None
     response_format: dict | None = None
     reasoning_effort: str | None = None
-    tools: list[dict] | None = None
+    # `tools` is capped at 256 to match the practical limit any provider
+    # would honor — Anthropic accepts dozens, OpenAI hundreds. The cap
+    # exists to bound the parse cost when a hostile caller maxes out
+    # the body-size limit with millions of tiny tool entries.
+    tools: list[dict] | None = Field(default=None, max_length=256)
     tool_choice: Any = None
     user: str | None = None
     timeout: int | None = None
@@ -111,6 +115,26 @@ class AsyncRunRequest(ChatCompletionRequest):
     """POST /v1/runs body. Same shape as /v1/chat/completions plus an
     optional webhook_url that fires with the final ChatCompletion (or error)
     when the run completes."""
+    webhook_url: str | None = None
+
+
+class ScheduleRequest(BaseModel):
+    """Schedule a recurring or one-shot task. `task` mirrors the chat-
+    completions request body and is validated when the schedule fires.
+
+    `name` is charset-restricted because it flows into log lines and into
+    the inner agent's `<aitelier_context>` system-prompt block via
+    `make_run_id`; permitting arbitrary text would enable stored prompt-
+    injection across team users on the same aitelier."""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(
+        default="scheduled", min_length=1, max_length=64,
+        pattern=r"^[A-Za-z0-9_\-\.]+$",
+    )
+    task: dict
+    interval_seconds: int | None = None
+    at_iso: str | None = None
     webhook_url: str | None = None
 
 

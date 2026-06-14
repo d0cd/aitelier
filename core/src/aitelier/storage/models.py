@@ -95,9 +95,31 @@ class RunSpec:
 
 @dataclass
 class Run:
-    """A run row as returned from the store."""
+    """A run row as returned from the store.
+
+    `state` and `status` are intentionally separate and BOTH meaningful:
+
+    - `state` (RunState literal) is the lifecycle position:
+      pending → running → {completed | failed | cancelled | orphaned}.
+      Used by the operational surface (/v1/runs/active, /v1/runs/{id}/wait)
+      and by the on-startup orphan reconciliation that flips any
+      pending/running rows from a previous process to `orphaned`.
+
+    - `status` (free-form: "ok" | "error" | "cancelled" | None) is the
+      outcome category surfaced in TraceRecord.status. It diverges
+      from `state` only on user-initiated cancellation:
+        state="cancelled", status="cancelled"   (user cancelled)
+        state="failed",    status="error"        (provider/internal error)
+        state="completed", status="ok"           (success)
+      During pending/running, `status` is None.
+
+    Consumers filtering for genuine failures should query `status="error"`;
+    consumers wanting user-initiated stops should query `status="cancelled"`.
+    `state` is the right filter for "still in flight" (in {pending, running}).
+    """
     run_id: str
     state: RunState
+    """Lifecycle position. See class docstring for the relationship to `status`."""
     kind: str
     started_at: datetime
     ended_at: datetime | None = None
@@ -120,6 +142,8 @@ class Run:
     tool_call_count: int = 0
     system_prompt_hash: str | None = None
     status: str | None = None
+    """Outcome category. None during pending/running; set at terminal state.
+    See class docstring for the relationship to `state`."""
     error_type: str | None = None
     error_msg: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
