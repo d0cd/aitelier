@@ -73,11 +73,11 @@ from aitelier.storage import RunFilter, RunSpec, get_store
 logger = logging.getLogger("aitelier")
 
 
-# Correlation ID is set per-request by middleware and propagates through
-# any logging done inside that request's task tree via contextvars.
-_correlation_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "correlation_id", default="-",
-)
+# Correlation ID is set per-request by middleware.correlation_id_middleware
+# and propagates through any logging done inside that request's task tree
+# via contextvars. Imported from middleware.py since that's where it's
+# mutated; this module only reads it (via the LogRecord factory).
+from aitelier.middleware import _correlation_id_var  # noqa: E402
 
 
 _AITELIER_LOG_FORMAT = (
@@ -367,158 +367,22 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="aitelier", version="0.1.0", lifespan=lifespan)
 
 
-_AUTH_EXEMPT_PATHS = {"/v1/health"}
+# Re-exports for backward-compat with tests that import these from
+# `aitelier.server.*`. Canonical state lives in middleware.py.
+from aitelier.middleware import (  # noqa: E402
+    _AUTH_EXEMPT_PATHS,
+    _RATE_LIMIT_BUCKET_CAP,
+    _rate_limit_buckets,
+    register_middleware as _register_middleware,
+)
 
 
-# Rate limit state — in-process token bucket keyed by (api_key or remote_addr).
-# Single-process assumption; horizontal scaling would move this to Redis.
-# OrderedDict so the LRU eviction below has O(1) `popitem(last=False)`.
-_rate_limit_buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
-_RATE_LIMIT_EXEMPT_PATHS = {"/v1/health"}
-_RATE_LIMIT_BUCKET_CAP = 10_000
-
-
-def _rate_limit_key(request: Request) -> str:
-    """Identify the caller for rate-limiting. Bearer token if present (so
-    a single key shared by N clients is one bucket), else remote IP.
-    No X-Forwarded-For parsing: behind a reverse proxy every external
-    caller shares one IP bucket — a hosted-mode deployment should either
-    set per-key budgets via api_key + rate_limit_per_minute, or run the
-    rate limit in the proxy itself."""
-    auth = request.headers.get("Authorization") or ""
-    if auth.startswith("Bearer "):
-        return f"bearer:{auth[7:]}"
-    client = request.client
-    return f"ip:{client.host}" if client else "ip:unknown"
-
-
-# Registered FIRST so it executes LAST in the middleware stack — auth runs
-# before rate-limit, so unauthenticated traffic can't fill the bucket map.
-@app.middleware("http")
-async def _rate_limit_middleware(request: Request, call_next):
-    """Per-caller token bucket. Returns 429 with Retry-After when the
-    bucket is empty. 0 = disabled (default). Excludes /v1/health.
-
-    Bucket capacity equals the per-minute budget; the bucket refills
-    linearly at budget/60 tokens per second. The bucket map is LRU-
-    capped at _RATE_LIMIT_BUCKET_CAP entries so a caller cycling Bearer
-    values can't grow it without bound."""
-    from fastapi.responses import JSONResponse
-
-    budget = get_config().service.rate_limit_per_minute
-    if budget <= 0 or request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
-        return await call_next(request)
-
-    now = time.monotonic()
-    refill_rate = budget / 60.0
-    key = _rate_limit_key(request)
-    tokens, last = _rate_limit_buckets.get(key, (float(budget), now))
-    tokens = min(float(budget), tokens + (now - last) * refill_rate)
-    if tokens < 1.0:
-        retry_after = max(1, int((1.0 - tokens) / refill_rate))
-        _rate_limit_buckets[key] = (tokens, now)
-        _rate_limit_buckets.move_to_end(key)
-        return JSONResponse(
-            {"detail": "Rate limit exceeded"},
-            status_code=429,
-            headers={"Retry-After": str(retry_after)},
-        )
-    _rate_limit_buckets[key] = (tokens - 1.0, now)
-    _rate_limit_buckets.move_to_end(key)
-    while len(_rate_limit_buckets) > _RATE_LIMIT_BUCKET_CAP:
-        _rate_limit_buckets.popitem(last=False)
-    return await call_next(request)
-
-
-@app.middleware("http")
-async def _body_size_middleware(request: Request, call_next):
-    """Reject requests whose Content-Length exceeds the configured cap
-    with 413, before any handler runs.
-
-    Blocks the trivial memory-exhaustion vector where a hostile caller
-    POSTs gigabytes into idempotency hashing or JSON parsing. Honors
-    `service.max_request_body_bytes`; 0 disables the check.
-
-    Notes:
-      - Header-only check: clients that omit Content-Length (chunked
-        transfer-encoding) are not blocked here. Put a reverse proxy
-        in front of hosted aitelier if you need a hard cap.
-      - /v1/health is exempt — k8s probes shouldn't bounce off this.
-    """
-    from fastapi.responses import JSONResponse
-
-    if request.url.path == "/v1/health":
-        return await call_next(request)
-
-    cap = get_config().service.max_request_body_bytes
-    if cap:
-        raw_len = request.headers.get("Content-Length")
-        if raw_len:
-            try:
-                body_len = int(raw_len)
-            except ValueError:
-                body_len = 0
-            if body_len < 0 or body_len > cap:
-                return JSONResponse(
-                    {"detail": (
-                        f"Request body {body_len} bytes exceeds cap "
-                        f"{cap} bytes. Adjust service.max_request_body_bytes."
-                    )},
-                    status_code=413,
-                )
-    return await call_next(request)
-
-
-_CORRELATION_ID_CHARSET = re.compile(r"^[A-Za-z0-9._:\-]{1,128}$")
-
-
-@app.middleware("http")
-async def _correlation_id_middleware(request: Request, call_next):
-    """Echo or generate X-Correlation-Id so consumers can tie their logs
-    to ours. Untrusted input — length-cap and charset-restrict to keep
-    log lines parseable and to block log-injection / terminal-escape
-    vectors when the CID is rendered into structured log output."""
-    raw = request.headers.get("X-Correlation-Id")
-    if raw and _CORRELATION_ID_CHARSET.match(raw):
-        cid = raw
-    else:
-        cid = str(uuid.uuid4())
-    request.state.correlation_id = cid
-    token = _correlation_id_var.set(cid)
-    try:
-        response = await call_next(request)
-    finally:
-        _correlation_id_var.reset(token)
-    response.headers["X-Correlation-Id"] = cid
-    return response
-
-
-# Registered LAST so it executes FIRST — every other middleware runs only
-# for authenticated callers (in hosted mode).
-@app.middleware("http")
-async def _auth_middleware(request: Request, call_next):
-    """Gate every /v1/* endpoint on Authorization: Bearer <api_key> *if*
-    service.api_key is configured. When unset (default), no auth is enforced
-    — preserves the localhost-trust model.
-
-    /v1/health is always public so liveness probes (k8s, load balancers)
-    can hit it without a token.
-    """
-    from fastapi.responses import JSONResponse
-
-    if request.url.path not in _AUTH_EXEMPT_PATHS:
-        configured = get_config().service.api_key
-        if configured:
-            auth = request.headers.get("Authorization") or ""
-            # Constant-time compare so an attacker can't reconstruct the
-            # key byte-by-byte via response timing.
-            if not auth.startswith("Bearer ") or not hmac.compare_digest(
-                auth[7:], configured,
-            ):
-                return JSONResponse(
-                    {"detail": "Unauthorized"}, status_code=401,
-                )
-    return await call_next(request)
+# Middleware stack (auth → correlation → body_size → rate_limit → handler)
+# is defined in `middleware.py` and registered here on the FastAPI app.
+# Rate-limit bucket state, AUTH_EXEMPT_PATHS, and the correlation contextvar
+# are also imported above from middleware.py — test code references them via
+# `aitelier.server.*` for backward compat.
+_register_middleware(app)
 
 
 # Per-process registry of in-flight runs, for cancellation.
