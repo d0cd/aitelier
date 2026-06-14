@@ -751,7 +751,7 @@ def test_embeddings_passthrough(client):
         "model": "nomic-embed-text",
         "usage": {"prompt_tokens": 5, "total_tokens": 5},
     }
-    with patch("aitelier.server.embeddings",
+    with patch("aitelier.endpoints.inference.embeddings",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/embeddings", json={
             "model": "nomic-embed-text", "input": ["hello world"],
@@ -784,7 +784,7 @@ def test_filter_chat_capable_drops_non_chat_routes():
     transcription, realtime voice, and web-search routes that can't
     drive a code agent. Filter them out of the inner-LLM picklist so
     consumers don't see options that would fail at first call."""
-    from aitelier.server import _filter_chat_capable
+    from aitelier.endpoints.inference import _filter_chat_capable
     ids = [
         "claude-sonnet",
         "openai/gpt-4o",
@@ -857,7 +857,7 @@ def test_models_endpoint_logs_warning_when_sa_probe_fails(client, caplog):
     diagnose zero-agent-row symptoms without enabling debug logging."""
     async def boom():
         raise RuntimeError("connection refused")
-    with patch("aitelier.server.list_models",
+    with patch("aitelier.endpoints.inference.list_models",
                 new_callable=AsyncMock,
                 return_value=[{"id": "claude-sonnet", "object": "model",
                                 "owned_by": "litellm",
@@ -888,7 +888,7 @@ def test_embeddings_endpoint_encodes_base64_when_upstream_returns_floats(client)
         "model": "nomic-embed-text",
         "usage": {"prompt_tokens": 1, "total_tokens": 1},
     }
-    with patch("aitelier.server.embeddings",
+    with patch("aitelier.endpoints.inference.embeddings",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/embeddings", json={
             "model": "nomic-embed-text",
@@ -913,7 +913,7 @@ def test_embeddings_endpoint_noop_when_upstream_already_base64(client):
         "model": "openai/text-embedding-3-small",
         "usage": {"prompt_tokens": 1, "total_tokens": 1},
     }
-    with patch("aitelier.server.embeddings",
+    with patch("aitelier.endpoints.inference.embeddings",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/embeddings", json={
             "model": "openai/text-embedding-3-small",
@@ -930,7 +930,7 @@ def test_embeddings_endpoint_preserves_float_when_format_omitted(client):
         "model": "nomic-embed-text",
         "usage": {"prompt_tokens": 1, "total_tokens": 1},
     }
-    with patch("aitelier.server.embeddings",
+    with patch("aitelier.endpoints.inference.embeddings",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/embeddings", json={
             "model": "nomic-embed-text", "input": "hi",
@@ -1568,7 +1568,7 @@ def test_embeddings_records_trace(client):
         "model": "nomic-embed-text",
         "usage": {"prompt_tokens": 1, "total_tokens": 1},
     }
-    with patch("aitelier.server.embeddings", new_callable=AsyncMock,
+    with patch("aitelier.endpoints.inference.embeddings", new_callable=AsyncMock,
                 return_value=upstream):
         resp = client.post(
             "/v1/embeddings",
