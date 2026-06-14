@@ -89,14 +89,18 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
         "messages": body["messages"],
         "stream": stream,
     }
-    # Gate Ollama's `think` on consumer intent. Forcing it on caused
-    # thinking-capable models like qwen3 to silently burn the entire
-    # `num_predict` budget on hidden reasoning under tight max_tokens,
-    # returning `content=""` even though tokens were generated. OpenAI's
-    # `reasoning_effort` is the standard signal that the caller wants
-    # reasoning; we map any non-None value to `think: True`.
-    if body.get("reasoning_effort") is not None:
-        out["think"] = True
+    # Map OpenAI's `reasoning_effort` to Ollama's binary `think` toggle.
+    # Hybrid-reasoning models (qwen3 family) default to thinking ON and
+    # will silently burn the `num_predict` budget on hidden reasoning under
+    # tight max_tokens, returning `content=""` with `finish_reason=length`
+    # — deepread hit this in production for 8 days on qwen3:8b summarize.
+    # `minimal`/`none` are the OpenAI signals for "least reasoning" — map
+    # both to `think: false`. `low`/`medium`/`high` enable thinking. When
+    # the caller doesn't set `reasoning_effort` we leave the field
+    # unspecified so Ollama applies the model default.
+    effort = body.get("reasoning_effort")
+    if isinstance(effort, str):
+        out["think"] = effort.lower() not in ("none", "minimal")
     if options:
         out["options"] = options
     rf = body.get("response_format")

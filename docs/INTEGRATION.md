@@ -187,21 +187,31 @@ to OpenAI's:
 | `prompt_eval_count` | `usage.prompt_tokens` |
 | `eval_count` | `usage.completion_tokens` |
 
-For Ollama reasoning models (qwen3, deepseek-r1, …), thinking is **off
-by default** — set OpenAI's `reasoning_effort` to enable it:
+For Ollama hybrid-reasoning models (qwen3, deepseek-r1, …) aitelier
+maps OpenAI's `reasoning_effort` to Ollama's binary `think` toggle:
+
+| `reasoning_effort` | Ollama `think` | Behavior |
+|---|---|---|
+| omitted | (unset) | Model default. Qwen3 family defaults to thinking ON; deepseek-r1 always thinks. |
+| `"minimal"` or `"none"` | `false` | Disable thinking entirely. Use this for structured-output tasks that don't benefit from chain-of-thought. |
+| `"low"`, `"medium"`, `"high"` | `true` | Enable thinking. |
 
 ```ts
+// Structured-output workflow — disable thinking explicitly to avoid
+// silent empty-content failures when reasoning exhausts max_tokens.
 await openai.chat.completions.create({
-  model: "local",
+  model: "ollama/qwen3:8b",
   messages: [...],
-  reasoning_effort: "medium",   // ← enables Ollama `think: true`
+  reasoning_effort: "minimal",
+  response_format: { type: "json_schema", json_schema: {...} },
 });
 ```
 
-Forcing `think` on unconditionally caused a class of bug where qwen3
-under a tight `max_tokens` budget consumed the entire budget on hidden
-thoughts and returned `content=""`. With the gate, default calls produce
-content; reasoning is opt-in via the standard OpenAI signal.
+Why this matters: qwen3 in thinking mode under a tight `max_tokens`
+budget can burn the entire budget on hidden chain-of-thought and
+return `content=""` with `finish_reason: "length"` — a silent failure
+shape that's easy to miss in batch pipelines. Setting
+`reasoning_effort: "minimal"` is the explicit opt-out.
 
 When thinking is enabled:
 

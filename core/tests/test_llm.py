@@ -572,6 +572,47 @@ def test_build_ollama_request_omits_think_without_reasoning_signal():
     assert "think" not in out
 
 
+def test_build_ollama_request_disables_think_for_minimal_effort():
+    """`reasoning_effort: minimal` is OpenAI's signal for least reasoning.
+    Hybrid-reasoning Ollama models (qwen3) default to thinking ON; this
+    maps to `think: False` so callers running structured-output tasks can
+    suppress reasoning and avoid silent empty-content failures under
+    `finish_reason=length`. Deepread filed this after qwen3:8b returned
+    empty content on 8 days of summarize calls."""
+    out = _build_ollama_request({
+        "model": "ollama/qwen3:8b",
+        "messages": [{"role": "user", "content": "Reply OK"}],
+        "reasoning_effort": "minimal",
+    }, stream=False)
+    assert out["think"] is False
+
+
+def test_build_ollama_request_disables_think_for_none_effort():
+    """`none` isn't standard OpenAI but is the natural "off" signal —
+    accept it the same as `minimal` so callers can express intent
+    explicitly regardless of which convention they're following."""
+    out = _build_ollama_request({
+        "model": "ollama/qwen3:8b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "none",
+    }, stream=False)
+    assert out["think"] is False
+
+
+def test_build_ollama_request_think_mapping_is_case_insensitive():
+    """`MINIMAL` / `Low` from a less-careful caller still map correctly."""
+    for effort, expected in (
+        ("MINIMAL", False), ("None", False),
+        ("LOW", True), ("Medium", True), ("HIGH", True),
+    ):
+        out = _build_ollama_request({
+            "model": "ollama/qwen3:8b",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": effort,
+        }, stream=False)
+        assert out["think"] is expected, f"effort={effort!r} mapped wrong"
+
+
 def test_build_ollama_request_prefers_max_completion_tokens():
     """OpenAI reasoning-model field wins over legacy `max_tokens`."""
     out = _build_ollama_request({
