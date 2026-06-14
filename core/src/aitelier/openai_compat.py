@@ -107,6 +107,13 @@ class ChatCompletionRequest(BaseModel):
     aitelier: AitelierAgentOpts | None = None
 
 
+class AsyncRunRequest(ChatCompletionRequest):
+    """POST /v1/runs body. Same shape as /v1/chat/completions plus an
+    optional webhook_url that fires with the final ChatCompletion (or error)
+    when the run completes."""
+    webhook_url: str | None = None
+
+
 class EmbeddingsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

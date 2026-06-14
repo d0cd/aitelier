@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 import httpx
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error
+from aitelier.errors import classify_error, scrub_error_text
 
 logger = logging.getLogger("aitelier.sandbox_agent")
 
@@ -374,9 +374,58 @@ class _RunEventEmitter:
             )
 
 
+def _build_session_new_meta(
+    agent_name: str,
+    *,
+    system_prompt: str | None,
+    agent_model: str | None,
+    tool_allowlist: list[str] | None,
+    max_turns: int | None,
+    plan_mode: bool | None,
+) -> dict | None:
+    """Build the backend-specific `_meta` block for ACP `session/new`.
+
+    Each ACP bridge reads config from a different place. The
+    standardized `session/setConfigOption` path is for client-facing
+    config the bridge advertises (e.g. claude's "effort"), not for
+    pushing SDK options downstream — which is why we silently dropped
+    every option before we started using `_meta`.
+
+    claude-agent-acp ≥0.36 (dist/acp-agent.js:1371-1450) reads:
+      - `_meta.systemPrompt`         → system prompt override
+      - `_meta.claudeCode.options.*` → spread into Claude Agent SDK
+        options (maxTurns, model, allowedTools, …).
+
+    Other backends (codex-acp, opencode, …) ignore `_meta` keys they
+    don't recognize, so passing claude-shaped meta to them is safe.
+    """
+    if agent_name != "claude":
+        return None
+
+    options: dict = {}
+    if agent_model:
+        options["model"] = agent_model
+    if tool_allowlist:
+        options["allowedTools"] = list(tool_allowlist)
+    if max_turns is not None:
+        options["maxTurns"] = max_turns
+
+    meta: dict = {}
+    if system_prompt:
+        meta["systemPrompt"] = system_prompt
+    if options:
+        meta["claudeCode"] = {"options": options}
+    if plan_mode is not None:
+        # claude-agent-acp doesn't expose plan mode through SDK options;
+        # it surfaces a runtime `session/set_mode` instead. Skip here.
+        pass
+    return meta or None
+
+
 async def _open_acp_session(
     client: AcpClient,
     *,
+    agent_name: str,
     workspace: str | None,
     mcp_servers: list[dict] | None,
     system_prompt: str | None,
@@ -388,7 +437,7 @@ async def _open_acp_session(
 ) -> str:
     """Drive the ACP handshake up to a usable session_id.
 
-    initialize → session/new → start_stream → best-effort config notifications.
+    initialize → session/new (with backend-specific `_meta`) → start_stream.
 
     Capabilities are advertised honestly: aitelier doesn't service fs/*
     or terminal/* (the SSE consumer rejects them in `_respond_to_agent_request`),
@@ -418,10 +467,22 @@ async def _open_acp_session(
             f"{ctx_block}\n\n{system_prompt}" if system_prompt else ctx_block
         )
 
-    session_resp = await client.call("session/new", {
+    session_new_params: dict = {
         "cwd": workspace or ".",
         "mcpServers": _adapt_mcp_servers(mcp_servers, run_id=run_id),
-    })
+    }
+    meta = _build_session_new_meta(
+        agent_name,
+        system_prompt=system_prompt,
+        agent_model=agent_model,
+        tool_allowlist=tool_allowlist,
+        max_turns=max_turns,
+        plan_mode=plan_mode,
+    )
+    if meta is not None:
+        session_new_params["_meta"] = meta
+
+    session_resp = await client.call("session/new", session_new_params)
     if isinstance(session_resp, dict):
         session_id = session_resp.get("sessionId")
         if not session_id:
@@ -441,32 +502,31 @@ async def _open_acp_session(
 
     client.start_stream()
 
-    # Best-effort config options. Agent backends accept different keys
-    # (claude-code: model, systemPrompt, allowedTools, maxTurns; codex:
-    # similar). Failures here are silent on purpose — sandbox-agent passes
-    # the option through and the backend ignores unknowns.
-    for option, value in (
-        ("systemPrompt", system_prompt),
-        ("model", agent_model),
-        ("allowedTools", tool_allowlist),
-        ("maxTurns", max_turns),
-        ("planMode", plan_mode),
-    ):
-        # `False` is a meaningful value for planMode — don't filter it
-        # the way None / "" / [] are filtered.
-        if value is None or value == "" or value == []:
-            continue
-        try:
-            await client.notify("session/set_config_option", {
-                "sessionId": session_id,
-                "option": option,
-                "value": value,
-            })
-        except Exception as exc:
-            logger.debug(
-                "session/set_config_option %s ignored: %s: %s",
-                option, type(exc).__name__, exc,
-            )
+    # Backends that don't read `_meta` (today: everyone except claude)
+    # get a best-effort fallback through `session/set_config_option`.
+    # That method returns "Method not found" on claude-agent-acp, but
+    # claude already received its config via `_meta` above.
+    if agent_name != "claude":
+        for option, value in (
+            ("systemPrompt", system_prompt),
+            ("model", agent_model),
+            ("allowedTools", tool_allowlist),
+            ("maxTurns", max_turns),
+            ("planMode", plan_mode),
+        ):
+            if value is None or value == "" or value == []:
+                continue
+            try:
+                await client.notify("session/set_config_option", {
+                    "sessionId": session_id,
+                    "option": option,
+                    "value": value,
+                })
+            except Exception as exc:
+                logger.debug(
+                    "session/set_config_option %s ignored: %s: %s",
+                    option, type(exc).__name__, exc,
+                )
 
     return session_id
 
@@ -672,6 +732,7 @@ async def call_via_sandbox_stream(
             try:
                 session_id = await _open_acp_session(
                     client,
+                    agent_name=name,
                     workspace=workspace, mcp_servers=mcp_servers,
                     system_prompt=system_prompt, agent_model=agent_model,
                     tool_allowlist=tool_allowlist, max_turns=max_turns,
@@ -706,7 +767,9 @@ async def call_via_sandbox_stream(
                         prompt_err = {
                             "type": "error",
                             "error_type": classify_error(exc),
-                            "error_msg": _scrub_sandbox_url(str(exc), cfg.base_url),
+                            "error_msg": scrub_error_text(
+                                _scrub_sandbox_url(str(exc), cfg.base_url)
+                            ),
                         }
 
                     # Drain phase: surface trailing notifications even on
@@ -752,7 +815,9 @@ async def call_via_sandbox_stream(
         err = {
             "type": "error",
             "error_type": classify_error(exc),
-            "error_msg": _scrub_sandbox_url(str(exc), cfg.base_url),
+            "error_msg": scrub_error_text(
+                _scrub_sandbox_url(str(exc), cfg.base_url)
+            ),
         }
         await emitter.emit("error", err)
         yield err

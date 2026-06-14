@@ -338,6 +338,62 @@ def test_adapt_mcp_servers_no_injection_when_run_id_empty():
     assert out[0]["env"] == []
 
 
+# --- Session/new metadata construction --------------------------------------
+
+
+def test_build_session_new_meta_claude_packs_options_and_system_prompt():
+    """claude-agent-acp reads config from `_meta.systemPrompt` and
+    `_meta.claudeCode.options.*` (dist/acp-agent.js:1371-1450). Anything
+    else gets silently dropped. Verify we route through the right keys
+    so max_turns/model/allowlist actually reach the agent."""
+    from aitelier.providers.sandbox_agent import _build_session_new_meta
+
+    meta = _build_session_new_meta(
+        "claude",
+        system_prompt="be brief",
+        agent_model="claude-sonnet-4-5",
+        tool_allowlist=["Read", "Glob"],
+        max_turns=1,
+        plan_mode=None,
+    )
+    assert meta == {
+        "systemPrompt": "be brief",
+        "claudeCode": {
+            "options": {
+                "model": "claude-sonnet-4-5",
+                "allowedTools": ["Read", "Glob"],
+                "maxTurns": 1,
+            },
+        },
+    }
+
+
+def test_build_session_new_meta_claude_omits_unset_fields():
+    """`None`/empty inputs must not leak into the meta block — otherwise
+    the bridge spreads bogus keys into Claude Agent SDK options."""
+    from aitelier.providers.sandbox_agent import _build_session_new_meta
+
+    meta = _build_session_new_meta(
+        "claude",
+        system_prompt=None, agent_model=None,
+        tool_allowlist=None, max_turns=None, plan_mode=None,
+    )
+    assert meta is None
+
+
+def test_build_session_new_meta_non_claude_returns_none():
+    """codex-acp / opencode / amp don't read `_meta.claudeCode`. Returning
+    None keeps the fallback `session/set_config_option` path live for them."""
+    from aitelier.providers.sandbox_agent import _build_session_new_meta
+
+    meta = _build_session_new_meta(
+        "codex",
+        system_prompt="x", agent_model="gpt-5",
+        tool_allowlist=["Read"], max_turns=2, plan_mode=False,
+    )
+    assert meta is None
+
+
 @pytest.mark.asyncio
 async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
     """ACP backends that respond to session/new without a sessionId must
@@ -361,6 +417,7 @@ async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
     with pytest.raises(AcpError, match="sessionId"):
         await _open_acp_session(
             _FakeClient(),
+            agent_name="mock",
             workspace=None, mcp_servers=None,
             system_prompt=None, agent_model=None,
             tool_allowlist=None, max_turns=None,
