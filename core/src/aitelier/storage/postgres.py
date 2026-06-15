@@ -25,6 +25,7 @@ from aitelier.storage.models import (
     Run,
     RunEvent,
     RunFilter,
+    RunScore,
     RunSpec,
     RunState,
     Schedule,
@@ -518,6 +519,46 @@ class PostgresStore:
             return int(result.rsplit(" ", 1)[-1])
         except ValueError:
             return 0
+
+    # Run scores --------------------------------------------------------------
+
+    async def add_run_score(self, score: RunScore) -> RunScore:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO run_scores
+                    (run_id, name, value, evaluator, comment, metadata)
+                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                RETURNING id, created_at
+                """,
+                score.run_id, score.name, float(score.value),
+                score.evaluator, score.comment,
+                json.dumps(score.metadata) if score.metadata is not None else None,
+            )
+        return RunScore(
+            run_id=score.run_id, name=score.name, value=float(score.value),
+            evaluator=score.evaluator, comment=score.comment,
+            metadata=score.metadata,
+            created_at=row["created_at"], id=row["id"],
+        )
+
+    async def list_run_scores(self, run_id: str) -> list[RunScore]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, run_id, name, value, evaluator, comment, "
+                "       metadata, created_at "
+                "FROM run_scores WHERE run_id = $1 ORDER BY created_at ASC",
+                run_id,
+            )
+        return [
+            RunScore(
+                run_id=r["run_id"], name=r["name"], value=r["value"],
+                evaluator=r["evaluator"], comment=r["comment"],
+                metadata=_as_dict_or_none(r["metadata"]),
+                created_at=r["created_at"], id=r["id"],
+            )
+            for r in rows
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,49 @@ relevant section.
 
 ## Unreleased
 
+### Added — Phase L (eval framework substrate: scoring sink + bulk export)
+
+Two small additions that turn aitelier into the runtime substrate any
+eval framework (Langfuse, Phoenix, PromptFoo, custom) sits on. Sticking
+strictly to primitives — no rubric DSL, no grader catalog, no scoring
+UI. Aitelier owns durable state; the eval framework owns grading.
+
+- **Storage migration v5**: new `run_scores` table —
+  `(id, run_id, name, value, evaluator, comment, metadata, created_at)`.
+  No uniqueness on `(run_id, name, evaluator)`: re-grading is a write,
+  not an update. Indexed by `run_id` (write path) and `name` (aggregate
+  path).
+- **`POST /v1/runs/{run_id}/scores`** — write a score back against a
+  run. Returns 201 with the persisted row (`id`, `created_at`
+  populated). 404 when the run doesn't exist. `name` /  `evaluator` are
+  charset-restricted so they're safe in log lines and downstream
+  aggregation queries.
+- **`GET /v1/runs/{run_id}/scores`** — list all scores against a run,
+  oldest first. Empty `data` when no grader has scored it yet.
+- **`GET /v1/runs/export`** — streams `application/x-ndjson`, one full
+  `Run` per line including the captured `request_body` and
+  `rendered_messages` from migration v4. Lets a grader load history
+  without paging through 500-row windows. Filters mirror `GET /v1/runs`
+  (`since`, `until`, `trace_tag`, `kind`, `state`). Default cap 10k,
+  bumpable to 100k.
+- **SDK lockstep**: Python `Aitelier.add_run_score()`,
+  `list_run_scores()`, and `export_runs()` (async-iterator); TypeScript
+  `Aitelier.addRunScore()`, `listRunScores()`, and `exportRuns()`
+  (async-iterable). New `RunScore` dataclass exported from both SDKs.
+- **Route ordering fix**: registered `/v1/runs/export` before
+  `/v1/runs/{run_id}` so the literal path doesn't get matched as a
+  `run_id` capture. (Same fix applies to any future literal-after-
+  parameter route added under `/v1/runs/`.)
+- **14 new tests** in `test_storage.py` (InMemoryStore round-trip,
+  history, unknown-run rejection, empty-list contract; Postgres
+  integration round-trip against migration v5) and `test_server.py`
+  (POST happy path + 404 + charset rejection + extra-field rejection,
+  GET history, NDJSON streaming + filter + ISO-8601 validation +
+  request_body inclusion).
+
+Net: 426 unit tests pass (was 412 at the end of Phase K). No new
+configuration required; OFF-by-default behavior unchanged.
+
 ### Added — Phase K (OpenTelemetry GenAI semantic conventions export)
 
 Opt-in OTLP span export per inference call, tagged with the [GenAI

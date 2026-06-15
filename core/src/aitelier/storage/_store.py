@@ -27,6 +27,7 @@ from aitelier.storage.models import (
     Run,
     RunEvent,
     RunFilter,
+    RunScore,
     RunSpec,
     RunState,
     Schedule,
@@ -94,6 +95,10 @@ class Store(Protocol):
     async def get_idempotent(self, key: str) -> IdempotencyRecord | None: ...
     async def record_idempotent(self, rec: IdempotencyRecord) -> None: ...
     async def purge_expired_idempotency_keys(self) -> int: ...
+
+    # Run scores (eval framework write-back)
+    async def add_run_score(self, score: RunScore) -> RunScore: ...
+    async def list_run_scores(self, run_id: str) -> list[RunScore]: ...
 
 
 # ---------------------------------------------------------------------------

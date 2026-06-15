@@ -148,6 +148,26 @@ class EmbeddingsRequest(BaseModel):
     user: str | None = None
 
 
+class ScoreRequest(BaseModel):
+    """One score written back against a run by an external grader.
+
+    `name` and `evaluator` are charset-restricted because they flow into
+    aggregate queries and log lines; permitting arbitrary text invites
+    log-line confusion and accidental SQL-like input in custom
+    aggregators. `value` is unconstrained on purpose — different rubrics
+    use different ranges (0..1, 1..5, raw token counts, latency
+    budgets). Consumers normalize as they need."""
+    model_config = ConfigDict(extra="forbid")
+
+    name:      str = Field(min_length=1, max_length=128,
+                            pattern=r"^[A-Za-z0-9_\-\.]+$")
+    value:     float
+    evaluator: str = Field(min_length=1, max_length=128,
+                            pattern=r"^[A-Za-z0-9_\-\.:/]+$")
+    comment:   str | None = Field(default=None, max_length=4096)
+    metadata:  dict | None = None
+
+
 # --- Model routing ---------------------------------------------------------
 
 

@@ -44,6 +44,14 @@ phase-by-phase history, read the code or `git log`.
   Honeycomb, Datadog, Phoenix, Langfuse-via-OTel) ingests without
   adapter code. Content opt-in (`capture_content = true`) emits message
   bodies as span events; off by default.
+- **Eval framework substrate** (migration v5).
+  - `POST /v1/runs/{run_id}/scores` — write-back scoring sink. No
+    uniqueness on (run, name, evaluator) so re-grading is a write.
+  - `GET /v1/runs/{run_id}/scores` — history, oldest first.
+  - `GET /v1/runs/export` — NDJSON stream of full Run rows (with the
+    captured `request_body`) for backfill grading. Filters mirror
+    `GET /v1/runs`.
+  - SDKs surface `add_run_score` / `list_run_scores` / `export_runs`.
 
 ### Schedules + webhooks
 
@@ -190,33 +198,10 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
   N+1 onward — is the missing piece. Same storage; one new endpoint
   shape. Closes the practical gap between "SSE" and "reliable SSE."
 
-- **Substrate-grade for bolt-on eval frameworks.** Aitelier already
-  records per-call rows with model/tokens/cost/timing/error class,
-  append-only event timelines, `trace_tag` grouping, `parent_run_id`
-  hierarchies, AND (as of migration v4) the captured `request_body` +
-  `rendered_messages` — exactly the substrate any eval framework
-  (Langfuse, Phoenix, PromptFoo, OpenEval, internal tools) needs to
-  grade historical runs. Two small additions turn aitelier into
-  "point your eval tool at it and it works":
-
-  - **Scoring sink.** New `run_scores` table (`run_id`, `name`,
-    `value`, `evaluator`, `comment`, `created_at`) + `POST
-    /v1/runs/{id}/scores` + filter/aggregate (`/v1/traces/aggregates`
-    gains `group_by=score_name`). Per-evaluator-per-run scoring keeps
-    multiple graders distinct (rubric A vs rubric B; model-graded vs
-    human-graded). Most eval frameworks become a 50-line adapter
-    against this surface.
-  - **Bulk NDJSON export.** `GET /v1/runs/export?since=Y&trace_tag=X`
-    streams `application/x-ndjson` of full run rows (including the
-    captured request body) for backfill grading without paging through
-    500-row windows. One new endpoint; no new storage.
-
-  Sticking strictly to "substrate that other tools sit on" — no
-  rubric DSL, no grader catalog, no scoring UI. Aitelier owns
-  durable state; the eval framework owns the grading logic. Same
-  refusal as "Memory / threads / prompt registry / scoring DSL"
-  applied at a higher granularity — provide the primitives, let
-  consumers compose.
+- **`group_by=score_name` aggregate.** Built scoring sink lets graders
+  write back, but `/v1/traces/aggregates` doesn't yet group by score
+  name. Adding it lets a dashboard show "avg helpfulness across runs
+  in trace X" in one query. Pure SQL change; no new storage.
 
 ### Tier 2 — table stakes; ship when pain forces it
 

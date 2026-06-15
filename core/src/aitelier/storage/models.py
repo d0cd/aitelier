@@ -204,6 +204,24 @@ class RunEvent:
 
 
 @dataclass
+class RunScore:
+    """One score written back against a run by an external grader.
+
+    No uniqueness on (run_id, name, evaluator) — re-grading is expected.
+    Consumers that want "latest" sort by `created_at` and take the
+    first; consumers that want history take all rows.
+    """
+    run_id: str
+    name: str
+    value: float
+    evaluator: str
+    comment: str | None = None
+    metadata: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    id: int | None = None  # set by store on insert
+
+
+@dataclass
 class Schedule:
     id: str
     name: str

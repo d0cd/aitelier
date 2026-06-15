@@ -25,6 +25,7 @@ import type {
   HealthResponse,
   Run,
   RunEvent,
+  RunScore,
   Schedule,
   TraceRecord,
   TracesAggregate,
@@ -286,6 +287,82 @@ export class Aitelier {
     });
     if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status}`);
     return snakeToCamelDeep(await resp.json()) as CancelAck;
+  }
+
+  // --- Run scores (eval framework write-back) -----------------------------
+
+  async addRunScore(
+    runId: string,
+    body: {
+      name: string;
+      value: number;
+      evaluator: string;
+      comment?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<RunScore> {
+    const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/scores`, {
+      method: "POST",
+      headers: { ...this.authHeader(), "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`addRunScore failed: ${resp.status}`);
+    return snakeToCamelDeep(await resp.json()) as RunScore;
+  }
+
+  async listRunScores(runId: string): Promise<RunScore[]> {
+    const data = await this.getJson<{ data: RunScore[] }>(
+      `/v1/runs/${runId}/scores`,
+    );
+    return data.data;
+  }
+
+  /** NDJSON-stream every run matching the filters. One yield per run.
+   * Use for backfill grading; the server returns the captured request_body
+   * on each row so graders see what the model saw. */
+  async *exportRuns(opts: {
+    since?: string; until?: string; traceTag?: string;
+    kind?: string; state?: string; limit?: number;
+  } = {}): AsyncIterableIterator<Run> {
+    const params = new URLSearchParams();
+    params.set("limit", String(opts.limit ?? 10000));
+    if (opts.since) params.set("since", opts.since);
+    if (opts.until) params.set("until", opts.until);
+    if (opts.traceTag) params.set("trace_tag", opts.traceTag);
+    if (opts.kind) params.set("kind", opts.kind);
+    if (opts.state) params.set("state", opts.state);
+
+    const resp = await fetch(
+      `${this.baseUrl}/v1/runs/export?${params}`,
+      { headers: { ...this.authHeader() } },
+    );
+    if (!resp.ok) throw new Error(`exportRuns failed: ${resp.status}`);
+    if (!resp.body) return;
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim()) {
+            yield snakeToCamelDeep(JSON.parse(line)) as Run;
+          }
+        }
+      }
+      if (buf.trim()) {
+        yield snakeToCamelDeep(JSON.parse(buf)) as Run;
+      }
+    } finally {
+      reader.releaseLock();
+    }
   }
 
   // --- Control plane: traces ----------------------------------------------

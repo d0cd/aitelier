@@ -21,6 +21,7 @@ from aitelier.storage.models import (
     Run,
     RunEvent,
     RunFilter,
+    RunScore,
     RunSpec,
     RunState,
     Schedule,
@@ -43,8 +44,10 @@ class InMemoryStore:
         self._schedules: dict[str, Schedule] = {}
         self._webhooks: dict[int, WebhookDelivery] = {}
         self._idempotency: dict[str, IdempotencyRecord] = {}
+        self._scores: list[RunScore] = []
         self._next_webhook_id = 1
         self._next_event_id = 1
+        self._next_score_id = 1
 
     async def connect(self) -> None: pass
     async def close(self) -> None: pass
@@ -335,6 +338,25 @@ class InMemoryStore:
         for k in expired:
             self._idempotency.pop(k, None)
         return len(expired)
+
+    # Run scores --------------------------------------------------------------
+
+    async def add_run_score(self, score: RunScore) -> RunScore:
+        if score.run_id not in self._runs:
+            raise KeyError(f"run not found: {score.run_id}")
+        stored = RunScore(
+            run_id=score.run_id, name=score.name, value=score.value,
+            evaluator=score.evaluator, comment=score.comment,
+            metadata=score.metadata,
+            created_at=datetime.now(UTC),
+            id=self._next_score_id,
+        )
+        self._next_score_id += 1
+        self._scores.append(stored)
+        return stored
+
+    async def list_run_scores(self, run_id: str) -> list[RunScore]:
+        return [s for s in self._scores if s.run_id == run_id]
 
 
 # ---------------------------------------------------------------------------

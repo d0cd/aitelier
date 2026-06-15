@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2878,3 +2879,156 @@ def test_correlation_id_in_sse_events(client):
     assert resp.status_code == 200
     body = resp.text
     assert '"correlation_id": "sse-cid"' in body or '"correlation_id":"sse-cid"' in body
+
+
+# --- Run scores (eval framework write-back) --------------------------------
+
+
+def _seed_run(client, run_id: str = "scored-1"):
+    """Insert a finalized run via the InMemoryStore so score endpoints
+    have something to attach to. Avoids dispatching a real model."""
+    import asyncio
+
+    from aitelier.runs import record_run
+    from aitelier.storage import RunSpec
+
+    async def _do():
+        return {"status": "ok", "kind": "complete",
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "total_tokens": 2}}
+    spec = RunSpec(run_id=run_id, kind="complete", model="claude-sonnet")
+    asyncio.run(record_run(spec, _do()))
+
+
+def test_post_run_score_creates_row(client):
+    _seed_run(client, "score-r-1")
+    resp = client.post("/v1/runs/score-r-1/scores", json={
+        "name": "helpfulness",
+        "value": 0.85,
+        "evaluator": "gpt-4o-judge",
+        "comment": "clear answer",
+    })
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["run_id"] == "score-r-1"
+    assert body["value"] == 0.85
+    assert body["id"] is not None
+    assert body["created_at"] is not None
+
+
+def test_post_run_score_404_when_run_missing(client):
+    resp = client.post("/v1/runs/does-not-exist/scores", json={
+        "name": "x", "value": 1.0, "evaluator": "e",
+    })
+    assert resp.status_code == 404
+
+
+def test_post_run_score_validates_name_charset(client):
+    """Forbid runtime injection into log lines via score names."""
+    _seed_run(client, "score-r-charset")
+    resp = client.post("/v1/runs/score-r-charset/scores", json={
+        "name": "bad name with spaces",
+        "value": 1.0,
+        "evaluator": "e",
+    })
+    assert resp.status_code == 422
+
+
+def test_get_run_scores_returns_history(client):
+    _seed_run(client, "score-r-hist")
+    for v in (0.5, 0.7, 0.9):
+        client.post("/v1/runs/score-r-hist/scores", json={
+            "name": "helpfulness", "value": v, "evaluator": "judge-v1",
+        })
+    resp = client.get("/v1/runs/score-r-hist/scores")
+    assert resp.status_code == 200
+    data = resp.json()["data"]
+    assert [s["value"] for s in data] == [0.5, 0.7, 0.9]
+
+
+def test_get_run_scores_404_when_run_missing(client):
+    resp = client.get("/v1/runs/missing/scores")
+    assert resp.status_code == 404
+
+
+def test_post_run_score_rejects_unknown_field(client):
+    """`extra = "forbid"` catches typos like `score` vs `value`."""
+    _seed_run(client, "score-r-extra")
+    resp = client.post("/v1/runs/score-r-extra/scores", json={
+        "name": "x", "value": 1.0, "evaluator": "e",
+        "score": 0.5,  # not a field
+    })
+    assert resp.status_code == 422
+
+
+# --- Bulk NDJSON export ----------------------------------------------------
+
+
+def test_export_runs_streams_ndjson(client):
+    _seed_run(client, "exp-r-1")
+    _seed_run(client, "exp-r-2")
+    resp = client.get("/v1/runs/export")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/x-ndjson")
+    lines = [ln for ln in resp.text.splitlines() if ln]
+    assert len(lines) >= 2
+    # Every line must be valid JSON with `run_id`.
+    parsed = [json.loads(ln) for ln in lines]
+    ids = {r["run_id"] for r in parsed}
+    assert {"exp-r-1", "exp-r-2"}.issubset(ids)
+
+
+def test_export_runs_filters_by_trace_tag(client):
+    import asyncio
+
+    from aitelier.runs import record_run
+    from aitelier.storage import RunSpec
+
+    async def _do():
+        return {"status": "ok", "kind": "complete",
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "total_tokens": 2}}
+    for rid, tag in (("exp-tag-a-1", "audit"), ("exp-tag-a-2", "audit"),
+                     ("exp-tag-b-1", "other")):
+        asyncio.run(record_run(
+            RunSpec(run_id=rid, kind="complete", model="m", trace_tag=tag),
+            _do(),
+        ))
+
+    resp = client.get("/v1/runs/export?trace_tag=audit")
+    assert resp.status_code == 200
+    lines = [json.loads(ln) for ln in resp.text.splitlines() if ln]
+    ids = {r["run_id"] for r in lines}
+    assert "exp-tag-a-1" in ids and "exp-tag-a-2" in ids
+    assert "exp-tag-b-1" not in ids
+
+
+def test_export_runs_rejects_invalid_since(client):
+    resp = client.get("/v1/runs/export?since=not-a-date")
+    assert resp.status_code == 400
+    assert "ISO-8601" in resp.json()["detail"]
+
+
+def test_export_runs_includes_request_body(client):
+    """The whole point of v4 + export: graders see the captured input."""
+    import asyncio
+
+    from aitelier.runs import record_run
+    from aitelier.storage import RunSpec
+
+    async def _do():
+        return {"status": "ok", "kind": "complete",
+                "usage": {"input_tokens": 1, "output_tokens": 1,
+                          "total_tokens": 2}}
+    rb = {"model": "claude-sonnet",
+          "messages": [{"role": "user", "content": "audit"}]}
+    asyncio.run(record_run(
+        RunSpec(run_id="exp-r-body", kind="complete", model="claude-sonnet",
+                request_body=rb),
+        _do(),
+    ))
+    resp = client.get("/v1/runs/export?limit=100")
+    matching = [json.loads(ln) for ln in resp.text.splitlines()
+                if ln and '"exp-r-body"' in ln]
+    assert matching
+    assert matching[0]["request_body"] == rb

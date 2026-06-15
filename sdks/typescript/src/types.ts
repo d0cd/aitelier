@@ -131,6 +131,19 @@ export interface RunEvent {
   payload?: Record<string, unknown>;
 }
 
+// --- Run scores (eval framework write-back) ---
+
+export interface RunScore {
+  id?: number | null;
+  runId: string;
+  name: string;
+  value: number;
+  evaluator: string;
+  comment?: string | null;
+  metadata?: Record<string, unknown> | null;
+  createdAt?: string | null;
+}
+
 // --- Schedules (/v1/schedules) ---
 
 export interface Schedule {

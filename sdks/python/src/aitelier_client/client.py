@@ -27,6 +27,7 @@ from aitelier_client._generated.models import (
     Discovery,
     Run,
     RunEvent,
+    RunScore,
     Schedule,
     TraceRecord,
     TracesAggregate,
@@ -216,6 +217,59 @@ class Aitelier:
         resp = await self._ensure_client().post(f"/v1/runs/{run_id}/cancel")
         resp.raise_for_status()
         return CancelAck(**resp.json())
+
+    async def add_run_score(
+        self, run_id: str, *,
+        name: str, value: float, evaluator: str,
+        comment: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> RunScore:
+        """Write a grader's score back against a run. Aitelier owns
+        durable storage; the grading logic lives in the caller."""
+        body: dict[str, Any] = {
+            "name": name, "value": value, "evaluator": evaluator,
+        }
+        if comment is not None:
+            body["comment"] = comment
+        if metadata is not None:
+            body["metadata"] = metadata
+        resp = await self._ensure_client().post(
+            f"/v1/runs/{run_id}/scores", json=body,
+        )
+        resp.raise_for_status()
+        return RunScore(**resp.json())
+
+    async def list_run_scores(self, run_id: str) -> list[RunScore]:
+        resp = await self._ensure_client().get(f"/v1/runs/{run_id}/scores")
+        resp.raise_for_status()
+        return [RunScore(**s) for s in resp.json()["data"]]
+
+    async def export_runs(
+        self, *,
+        since: str | None = None,
+        until: str | None = None,
+        trace_tag: str | None = None,
+        kind: str | None = None,
+        state: str | None = None,
+        limit: int = 10000,
+    ) -> AsyncIterator[Run]:
+        """Stream historical runs as NDJSON — one Run per line. Use for
+        backfill grading. The server returns the captured request_body
+        on each Run so graders see exactly what the model saw."""
+        import json
+
+        params: dict[str, Any] = {"limit": limit}
+        for k, v in (("since", since), ("until", until),
+                      ("trace_tag", trace_tag), ("kind", kind), ("state", state)):
+            if v is not None:
+                params[k] = v
+        async with self._ensure_client().stream(
+            "GET", "/v1/runs/export", params=params,
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line:
+                    yield Run(**json.loads(line))
 
     async def wait_for_run(
         self, run_id: str, *,

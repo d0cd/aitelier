@@ -32,9 +32,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
-from aitelier.openai_compat import AsyncRunRequest, parse_model_route
+from aitelier.openai_compat import AsyncRunRequest, ScoreRequest, parse_model_route
 from aitelier.runner import make_run_id
-from aitelier.storage import RunFilter, get_store
+from aitelier.storage import RunFilter, RunScore, get_store
 
 router = APIRouter()
 
@@ -233,6 +233,56 @@ async def list_active_runs() -> dict:
     return {"active": sorted(_active_runs.keys())}
 
 
+# Bulk NDJSON export. Registered before `/v1/runs/{run_id}` so the
+# literal "/export" path doesn't get matched as a `run_id` capture.
+@router.get("/v1/runs/export")
+async def export_runs_endpoint(
+    since: str | None = Query(default=None),
+    until: str | None = Query(default=None),
+    trace_tag: str | None = Query(default=None),
+    kind: str | None = Query(default=None),
+    state: str | None = Query(default=None),
+    limit: int = Query(default=10000, ge=1, le=100000),
+):
+    """Stream `application/x-ndjson` — one full run row per line,
+    including the captured `request_body` + `rendered_messages` from
+    migration v4. Lets an eval framework grade history without paging
+    through 500-row windows.
+
+    Filters mirror `GET /v1/runs`. `since`/`until` accept ISO-8601.
+    Default cap is 10k rows; bumpable to 100k for one-shot backfills.
+    """
+    from fastapi.responses import StreamingResponse
+
+    from aitelier.server import _run_to_dict
+
+    flt_kwargs: dict = {"limit": limit}
+    if trace_tag is not None:
+        flt_kwargs["trace_tag"] = trace_tag
+    if kind is not None:
+        flt_kwargs["kind"] = kind
+    if state is not None:
+        flt_kwargs["state"] = state
+    for key, val in (("since", since), ("until", until)):
+        if val is not None:
+            try:
+                flt_kwargs[key] = datetime.fromisoformat(val)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{key} must be ISO-8601: {exc}",
+                ) from None
+
+    store = await get_store()
+    runs = await store.list_runs(RunFilter(**flt_kwargs))
+
+    async def _gen():
+        for r in runs:
+            yield (json.dumps(_run_to_dict(r), default=str) + "\n").encode()
+
+    return StreamingResponse(_gen(), media_type="application/x-ndjson")
+
+
 @router.post("/v1/runs/{run_id}/wait")
 async def wait_for_run(
     run_id: str,
@@ -342,3 +392,61 @@ async def get_run(run_id: str) -> dict:
             body["prompt"] = prompt_path.read_text()
 
     return body
+
+
+# --- Scoring sink (eval framework write-back) ------------------------------
+
+
+@router.post("/v1/runs/{run_id}/scores", status_code=201)
+async def add_run_score_endpoint(run_id: str, req: ScoreRequest) -> dict:
+    """Write a score against a finalized (or in-flight) run. Aitelier
+    is the durable substrate; the grading logic lives in the caller
+    (Langfuse, Phoenix, PromptFoo, custom).
+
+    No uniqueness on (run_id, name, evaluator) — re-grading writes a
+    new row. Consumers reading via `GET /v1/runs/{id}/scores` get all
+    rows ordered by `created_at`; latest-wins is `[-1]`.
+    """
+    from aitelier.server import _validate_path_component
+
+    _validate_path_component(run_id, "run_id")
+    store = await get_store()
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    score = RunScore(
+        run_id=run_id, name=req.name, value=float(req.value),
+        evaluator=req.evaluator, comment=req.comment, metadata=req.metadata,
+    )
+    stored = await store.add_run_score(score)
+    return _score_to_dict(stored)
+
+
+@router.get("/v1/runs/{run_id}/scores")
+async def list_run_scores_endpoint(run_id: str) -> dict:
+    """All scores written against `run_id`, oldest first. Empty `data`
+    when no grader has scored this run yet."""
+    from aitelier.server import _validate_path_component
+
+    _validate_path_component(run_id, "run_id")
+    store = await get_store()
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+    scores = await store.list_run_scores(run_id)
+    return {"object": "list", "data": [_score_to_dict(s) for s in scores]}
+
+
+def _score_to_dict(s: RunScore) -> dict:
+    return {
+        "id":         s.id,
+        "run_id":     s.run_id,
+        "name":       s.name,
+        "value":      s.value,
+        "evaluator":  s.evaluator,
+        "comment":    s.comment,
+        "metadata":   s.metadata,
+        "created_at": s.created_at.isoformat() if s.created_at else None,
+    }
+
+

@@ -555,6 +555,47 @@ Per-process registry of run IDs currently in flight. Useful for ops
 dashboards. **Per-process only** — if aitelier scales horizontally, this
 reflects only the contacted instance.
 
+### `POST /v1/runs/{run_id}/scores` / `GET /v1/runs/{run_id}/scores`
+
+Scoring sink for bolt-on eval frameworks (Langfuse / Phoenix / PromptFoo
+/ custom). Aitelier owns durable storage; the grading logic lives in
+the caller.
+
+```bash
+curl -X POST http://localhost:7777/v1/runs/run-123/scores -d '{
+  "name": "helpfulness",
+  "value": 0.85,
+  "evaluator": "gpt-4o-judge",
+  "comment": "answer was concrete and on-topic",
+  "metadata": {"rubric_version": 2}
+}'
+```
+
+- **No uniqueness** on `(run_id, name, evaluator)` — re-grading writes
+  a new row. `GET` returns all rows ordered by `created_at`; consumers
+  that want "latest" take `[-1]`.
+- **`name` and `evaluator`** are charset-restricted (`[A-Za-z0-9_\-.]`
+  and `[A-Za-z0-9_\-.:/]` respectively) so they're safe to use in log
+  lines and downstream aggregation queries.
+- **`value`** is unconstrained — different rubrics use different ranges
+  (0..1 normalized, 1..5 Likert, raw token counts, latency budgets).
+
+### `GET /v1/runs/export`
+
+Bulk NDJSON stream — one full `Run` row per line, including the
+captured `request_body` and `rendered_messages`. Designed for backfill
+grading: a one-shot export feeds a grader without paging through 500-
+row windows.
+
+```bash
+curl 'http://localhost:7777/v1/runs/export?since=2026-04-01&trace_tag=audit'
+# {"run_id": "run-1", "request_body": {...}, ...}
+# {"run_id": "run-2", "request_body": {...}, ...}
+```
+
+Filters mirror `GET /v1/runs` (`since`, `until`, `trace_tag`, `kind`,
+`state`). Default `limit` is 10000, bumpable to 100000.
+
 ### `GET /v1/traces[/{id}|/aggregates]`
 
 Trace-record summaries of runs (a narrower projection focused on

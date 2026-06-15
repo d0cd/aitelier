@@ -21,6 +21,7 @@ export type {
   Run,
   RunState,
   RunEvent,
+  RunScore,
   // Schedules
   Schedule,
   CreateScheduleOpts,

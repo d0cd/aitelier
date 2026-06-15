@@ -16,6 +16,7 @@ from aitelier.storage import (
     PostgresStore,
     RunEvent,
     RunFilter,
+    RunScore,
     RunSpec,
     Schedule,
 )
@@ -257,6 +258,44 @@ async def test_list_runs_filters(store):
 
 
 @pytest.mark.asyncio
+async def test_run_score_round_trip_and_history(store):
+    """Scoring sink: write, read back, allow multiple rows per
+    (run_id, name, evaluator) — re-grading is a write, not an update."""
+    await store.create_run(RunSpec(run_id="scored", kind="agent"))
+    s1 = await store.add_run_score(RunScore(
+        run_id="scored", name="helpfulness", value=0.8,
+        evaluator="gpt-4o-judge", comment="clear",
+    ))
+    s2 = await store.add_run_score(RunScore(
+        run_id="scored", name="helpfulness", value=0.9,
+        evaluator="gpt-4o-judge", comment="re-grade after rubric update",
+        metadata={"rubric_version": 2},
+    ))
+    assert s1.id is not None and s2.id is not None and s1.id != s2.id
+    rows = await store.list_run_scores("scored")
+    assert [r.value for r in rows] == [0.8, 0.9]
+    assert rows[1].metadata == {"rubric_version": 2}
+
+
+@pytest.mark.asyncio
+async def test_run_score_rejects_unknown_run(store):
+    """Foreign-key analog: writing a score against a non-existent run
+    raises so consumers see the error immediately instead of
+    accumulating orphan rows."""
+    with pytest.raises(KeyError):
+        await store.add_run_score(RunScore(
+            run_id="does-not-exist", name="x", value=1.0, evaluator="e",
+        ))
+
+
+@pytest.mark.asyncio
+async def test_run_score_empty_when_run_unscored(store):
+    """A run with no scores returns an empty list, not None."""
+    await store.create_run(RunSpec(run_id="unscored", kind="agent"))
+    assert await store.list_run_scores("unscored") == []
+
+
+@pytest.mark.asyncio
 async def test_events_append_and_list(store):
     await store.create_run(RunSpec(run_id="r", kind="agent"))
     await store.append_event(RunEvent(run_id="r", seq=1, kind="start",
@@ -427,6 +466,35 @@ async def test_postgres_round_trip():
         # Cleanup so reruns work
         async with store._pool.acquire() as conn:
             await conn.execute("DELETE FROM runs WHERE run_id = $1", "pg-test-1")
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_postgres_run_scores_round_trip():
+    """v5 migration: write + list scores against a real Postgres.
+    Verifies the table, indices, and JSONB metadata column."""
+    store = PostgresStore(_require_database_url())
+    await store.connect()
+    try:
+        await store.create_run(RunSpec(run_id="pg-score-1", kind="agent"))
+        s1 = await store.add_run_score(RunScore(
+            run_id="pg-score-1", name="helpfulness", value=0.75,
+            evaluator="gpt-4o-judge",
+        ))
+        await store.add_run_score(RunScore(
+            run_id="pg-score-1", name="helpfulness", value=0.85,
+            evaluator="gpt-4o-judge", comment="re-grade",
+            metadata={"rubric_version": 2},
+        ))
+        rows = await store.list_run_scores("pg-score-1")
+        assert [r.value for r in rows] == [0.75, 0.85]
+        assert rows[1].metadata == {"rubric_version": 2}
+        assert s1.id is not None and rows[0].id == s1.id
+    finally:
+        async with store._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM runs WHERE run_id = $1", "pg-score-1",
+            )
         await store.close()
 
 

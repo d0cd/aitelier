@@ -139,6 +139,18 @@ class RunEvent(BaseModel):
     payload: dict[str, Any] = {}
 
 
+class RunScore(BaseModel):
+    """One score written against a run by an external grader."""
+    id: int | None = None
+    run_id: str
+    name: str
+    value: float
+    evaluator: str
+    comment: str | None = None
+    metadata: dict[str, Any] | None = None
+    created_at: str | None = None
+
+
 class Schedule(BaseModel):
     """A persisted schedule entry."""
     id: str
