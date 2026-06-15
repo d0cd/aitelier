@@ -176,12 +176,53 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
   N+1 onward — is the missing piece. Same storage; one new endpoint
   shape. Closes the practical gap between "SSE" and "reliable SSE."
 
+- **Substrate-grade for bolt-on eval frameworks.** Aitelier already
+  records per-call rows with model/tokens/cost/timing/error class,
+  append-only event timelines, `trace_tag` grouping, and `parent_run_id`
+  hierarchies — exactly the substrate any eval framework (Langfuse,
+  Phoenix, PromptFoo, OpenEval, internal tools) needs to grade
+  historical runs. Three small additions turn aitelier into "point
+  your eval tool at it and it works":
+
+  1. **Persist request body alongside each run.** Today only
+     `system_prompt_hash` survives. Evaluators can't grade what they
+     can't see; capturing this is also the precondition for the Phase
+     H replay endpoint above. Two new columns: `request_body_json`
+     (the full ChatCompletionRequest as received) and `rendered_messages_json`
+     (post-fold, post-translate — what actually went on the wire).
+     Stored encrypted-at-rest or with PII-stripping is the operator's
+     choice; the schema decision is the one to make.
+  2. **Scoring sink.** New `run_scores` table (`run_id`, `name`,
+     `value`, `evaluator`, `comment`, `created_at`) + `POST
+     /v1/runs/{id}/scores` + filter/aggregate (`/v1/traces/aggregates`
+     gains `group_by=score_name`). Per-evaluator-per-run scoring
+     keeps multiple graders distinct (rubric A vs rubric B; model-
+     graded vs human-graded). Most eval frameworks become a 50-line
+     adapter against this surface.
+  3. **Bulk NDJSON export.** `GET /v1/runs/export?since=Y&trace_tag=X`
+     streams `application/x-ndjson` of full run rows (now including
+     the request body from #1) for backfill grading without paging
+     through 500-row windows. One new endpoint; no new storage.
+
+  Sticking strictly to "substrate that other tools sit on" — no
+  rubric DSL, no grader catalog, no scoring UI. Aitelier owns durable
+  state; the eval framework owns the grading logic. PLAN.md already
+  refuses the framework path under "Memory / threads / prompt registry
+  / scoring DSL"; this is the same refusal applied at a higher
+  granularity — provide the primitives, let consumers compose.
+
 ### Tier 2 — table stakes; ship when pain forces it
 
-- **OpenTelemetry export.** Emit run/event/trace data via OTLP so the
-  existing observability ecosystem (Grafana, Datadog, Jaeger,
-  Honeycomb) can consume it. Standards-compliant alternative to
-  building an aitelier-specific dashboard.
+- **OpenTelemetry GenAI semantic conventions.** Emit run/event/trace
+  data via OTLP using the GenAI semantic conventions (`gen_ai.*`
+  attributes) so the existing observability ecosystem (Grafana,
+  Datadog, Jaeger, Honeycomb, Langfuse, Phoenix) consumes it without
+  custom adapters. Highest-leverage interop move: converts the
+  N×M (every eval/observability tool × every gateway) into N+M.
+  Complement to the eval-substrate Tier-1 item above — that one
+  exposes raw data on aitelier's API; this one exposes the same
+  data through the standard wire format every eval/observability
+  tool already speaks.
 - **Response caching (exact + semantic).** Builds on `/v1/embeddings`
   for semantic match, Postgres for storage. Opt-in via
   `aitelier.cache: {mode, ttl}`. Real cost savings; commoditized
