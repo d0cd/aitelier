@@ -18,6 +18,8 @@ from aitelier.providers.ollama import (
     _build_ollama_request,
     _ollama_to_chat_completion,
     _resolve_ollama_model,
+    chat_completion_via_ollama,
+    chat_completion_via_ollama_stream,
     routes_to_ollama as _routes_to_ollama,
 )
 
@@ -729,3 +731,186 @@ async def test_chat_completion_bypasses_litellm_for_ollama(monkeypatch):
     # Acceptance: thinking surfaces as reasoning_content.
     assert out["choices"][0]["message"]["reasoning_content"] == "thinking text"
     assert out["choices"][0]["finish_reason"] == "length"
+
+
+
+# --- chat_completion_via_ollama (direct) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_via_ollama_raises_llm_error_on_transport_failure(monkeypatch):
+    """When the httpx POST itself raises (DNS, connect refused, read timeout),
+    surface as LLMError so the endpoint layer can render a typed envelope
+    instead of a bare 500."""
+    import httpx
+
+    fake_client = MagicMock()
+
+    async def fake_post(*args, **kwargs):
+        raise httpx.ConnectError("ECONNREFUSED")
+
+    fake_client.post = fake_post
+
+    async def fake_get_shared():
+        return fake_client
+
+    monkeypatch.setattr(
+        "aitelier.providers.llm.get_shared_client", fake_get_shared,
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        await chat_completion_via_ollama(
+            {"model": "local",
+             "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        )
+    assert exc_info.value.error_type == "ProviderUnavailable"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_via_ollama_raises_llm_error_on_5xx(monkeypatch):
+    """A 5xx from Ollama (model OOM, runtime crash) maps to LLMError with
+    the upstream status code preserved so the caller's retry policy and
+    the run row's error classification line up."""
+    fake_client = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.status_code = 503
+    fake_resp.text = "model unavailable"
+
+    async def fake_post(*args, **kwargs):
+        return fake_resp
+
+    fake_client.post = fake_post
+
+    async def fake_get_shared():
+        return fake_client
+
+    monkeypatch.setattr(
+        "aitelier.providers.llm.get_shared_client", fake_get_shared,
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        await chat_completion_via_ollama(
+            {"model": "local",
+             "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        )
+    assert exc_info.value.status_code == 503
+    # 5xx falls into ProviderError per _classify_llm_status
+    assert exc_info.value.error_type == "ProviderError"
+
+
+# --- chat_completion_via_ollama_stream (direct) -----------------------------
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_via_ollama_stream_yields_openai_chunks(monkeypatch):
+    """Ollama emits NDJSON: one JSON object per line. The stream wrapper
+    must yield OpenAI chunk shape for each, then a final usage chunk on
+    `done: true`. Verify role-on-first-chunk + content delta + finish_reason."""
+    ndjson_lines = [
+        '{"message": {"role": "assistant", "content": "Hi"}, "done": false}',
+        '{"message": {"content": "!"}, "done": false}',
+        ('{"message": {}, "done": true, "done_reason": "stop", '
+         '"prompt_eval_count": 3, "eval_count": 2}'),
+    ]
+
+    class FakeStreamCtx:
+        def __init__(self):
+            self.status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aiter_lines(self):
+            for line in ndjson_lines:
+                yield line
+
+        async def aread(self):
+            return b""
+
+    fake_client = MagicMock()
+    fake_client.stream = lambda *a, **kw: FakeStreamCtx()
+
+    async def fake_get_shared():
+        return fake_client
+
+    monkeypatch.setattr(
+        "aitelier.providers.llm.get_shared_client", fake_get_shared,
+    )
+
+    chunks = []
+    async for ch in chat_completion_via_ollama_stream(
+        {"model": "local",
+         "messages": [{"role": "user", "content": "hi"}]},
+        timeout=10,
+    ):
+        chunks.append(ch)
+
+    # First chunk should carry role + content "Hi"
+    first_choices = chunks[0]["choices"]
+    assert first_choices[0]["delta"]["role"] == "assistant"
+    assert first_choices[0]["delta"]["content"] == "Hi"
+
+    # Some chunk in the middle should carry content "!"
+    contents = [
+        c["choices"][0]["delta"].get("content")
+        for c in chunks if c["choices"][0].get("delta", {}).get("content")
+    ]
+    assert "Hi" in contents and "!" in contents
+
+    # Final chunk must carry usage + finish_reason
+    final = chunks[-1]
+    assert final["usage"]["prompt_tokens"] == 3
+    assert final["usage"]["completion_tokens"] == 2
+    finish_reasons = [c.get("finish_reason") for c in final["choices"]]
+    assert "stop" in finish_reasons
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_via_ollama_stream_raises_on_5xx(monkeypatch):
+    """A 5xx mid-stream-open must surface as LLMError before any chunks
+    are yielded, mirroring the sync error path."""
+
+    class FakeStreamCtx:
+        def __init__(self):
+            self.status_code = 502
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def aiter_lines(self):
+            return
+            yield  # pragma: no cover — never reached
+
+        async def aread(self):
+            return b""
+
+        @property
+        def text(self):
+            return "bad gateway"
+
+    fake_client = MagicMock()
+    fake_client.stream = lambda *a, **kw: FakeStreamCtx()
+
+    async def fake_get_shared():
+        return fake_client
+
+    monkeypatch.setattr(
+        "aitelier.providers.llm.get_shared_client", fake_get_shared,
+    )
+
+    with pytest.raises(LLMError) as exc_info:
+        async for _ in chat_completion_via_ollama_stream(
+            {"model": "local",
+             "messages": [{"role": "user", "content": "hi"}]},
+            timeout=10,
+        ):
+            pass
+    assert exc_info.value.status_code == 502
