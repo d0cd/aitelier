@@ -114,19 +114,32 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
 
 ### Tier 1 — leans into aitelier's unique position
 
+- **Persist the request body alongside each run** (foundation for
+  several items below). Today only `system_prompt_hash` survives —
+  rich enough to detect prompt drift but not to replay, grade, or
+  inspect. Two new `runs` columns: `request_body_json` (the full
+  ChatCompletionRequest as received) and `rendered_messages_json`
+  (post-fold, post-translate — what actually went on the wire to
+  the provider). Encrypted-at-rest is the operator's choice; the
+  schema decision is the one to make. Precondition for:
+  - The Phase H replay endpoint (re-dispatch a finalized run with
+    one field changed).
+  - The static `/ui` browser (need to render what the model actually
+    saw).
+  - Bolt-on eval frameworks (graders can't grade what they can't see).
+  - OpenTelemetry GenAI export (the conventions include `gen_ai.prompt`).
+
 - **Agent trace observability + replay** (the "Phase H" idea).
   Existing observability platforms (LangSmith, Langfuse, Phoenix)
-  instrument from the application; aitelier intercepts at the HTTP edge
-  and already stores rich per-run data. Three small additions unlock a
-  trace-reading workflow no competing tool offers end-to-end:
-  - Persist the actual system prompt + messages alongside each run
-    (currently only `system_prompt_hash` survives the request).
+  instrument from the application; aitelier intercepts at the HTTP
+  edge and already stores rich per-run data. Two small additions on
+  top of the request-body capture above:
   - `POST /v1/runs/{id}/replay?model=X` — re-dispatch a finalized run
     with one field changed; new run linked via `parent_run_id`.
   - Static web UI at `/ui` — read-only browser over `/v1/runs`,
     `/v1/runs/{id}/events`, `/v1/traces/aggregates`. No build step.
-  Pays off as both an observability tool *and* the foundation for evals
-  (`trace_tag` + replay + aggregates already cover the eval workflow
+  Pays off as both an observability tool *and* the foundation for
+  evals (`trace_tag` + replay + aggregates cover the eval workflow
   pattern; no DSL needed).
 
 - **Agent behavior graphs (multi-resolution).**
@@ -181,35 +194,28 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
   append-only event timelines, `trace_tag` grouping, and `parent_run_id`
   hierarchies — exactly the substrate any eval framework (Langfuse,
   Phoenix, PromptFoo, OpenEval, internal tools) needs to grade
-  historical runs. Three small additions turn aitelier into "point
-  your eval tool at it and it works":
+  historical runs. With the request-body capture from the foundation
+  item above, two more small additions turn aitelier into "point your
+  eval tool at it and it works":
 
-  1. **Persist request body alongside each run.** Today only
-     `system_prompt_hash` survives. Evaluators can't grade what they
-     can't see; capturing this is also the precondition for the Phase
-     H replay endpoint above. Two new columns: `request_body_json`
-     (the full ChatCompletionRequest as received) and `rendered_messages_json`
-     (post-fold, post-translate — what actually went on the wire).
-     Stored encrypted-at-rest or with PII-stripping is the operator's
-     choice; the schema decision is the one to make.
-  2. **Scoring sink.** New `run_scores` table (`run_id`, `name`,
-     `value`, `evaluator`, `comment`, `created_at`) + `POST
-     /v1/runs/{id}/scores` + filter/aggregate (`/v1/traces/aggregates`
-     gains `group_by=score_name`). Per-evaluator-per-run scoring
-     keeps multiple graders distinct (rubric A vs rubric B; model-
-     graded vs human-graded). Most eval frameworks become a 50-line
-     adapter against this surface.
-  3. **Bulk NDJSON export.** `GET /v1/runs/export?since=Y&trace_tag=X`
-     streams `application/x-ndjson` of full run rows (now including
-     the request body from #1) for backfill grading without paging
-     through 500-row windows. One new endpoint; no new storage.
+  - **Scoring sink.** New `run_scores` table (`run_id`, `name`,
+    `value`, `evaluator`, `comment`, `created_at`) + `POST
+    /v1/runs/{id}/scores` + filter/aggregate (`/v1/traces/aggregates`
+    gains `group_by=score_name`). Per-evaluator-per-run scoring keeps
+    multiple graders distinct (rubric A vs rubric B; model-graded vs
+    human-graded). Most eval frameworks become a 50-line adapter
+    against this surface.
+  - **Bulk NDJSON export.** `GET /v1/runs/export?since=Y&trace_tag=X`
+    streams `application/x-ndjson` of full run rows (including the
+    captured request body) for backfill grading without paging through
+    500-row windows. One new endpoint; no new storage.
 
   Sticking strictly to "substrate that other tools sit on" — no
-  rubric DSL, no grader catalog, no scoring UI. Aitelier owns durable
-  state; the eval framework owns the grading logic. PLAN.md already
-  refuses the framework path under "Memory / threads / prompt registry
-  / scoring DSL"; this is the same refusal applied at a higher
-  granularity — provide the primitives, let consumers compose.
+  rubric DSL, no grader catalog, no scoring UI. Aitelier owns
+  durable state; the eval framework owns the grading logic. Same
+  refusal as "Memory / threads / prompt registry / scoring DSL"
+  applied at a higher granularity — provide the primitives, let
+  consumers compose.
 
 ### Tier 2 — table stakes; ship when pain forces it
 
