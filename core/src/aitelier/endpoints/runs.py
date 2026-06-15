@@ -31,7 +31,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error
+from aitelier.errors import classify_error, scrub_error_text
 from aitelier.openai_compat import AsyncRunRequest, parse_model_route
 from aitelier.runner import make_run_id
 from aitelier.storage import RunFilter, get_store
@@ -94,9 +94,15 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
                     webhook_url=webhook_url,
                 )
             except Exception as exc:
+                # scrub_error_text() before persistence/delivery so upstream
+                # error envelopes that quote Authorization headers or embed
+                # credentials in URLs don't reach the webhook consumer or
+                # persist in runs.error_msg. Matches the seven other
+                # `error_msg: str(exc)` sites in server.py + sandbox_agent.py.
                 result = {
                     "error": {
-                        "type": classify_error(exc), "message": str(exc),
+                        "type": classify_error(exc),
+                        "message": scrub_error_text(str(exc)),
                     },
                     "aitelier_run_id": run_id,
                 }
