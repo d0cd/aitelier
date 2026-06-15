@@ -7,6 +7,138 @@ relevant section.
 
 ## Unreleased
 
+### Added / changed — Phase I (decomposition arc + security hardening)
+
+This phase moved ~700 LOC out of `server.py` (2700+ → 1843) into
+focused modules without changing behavior. All endpoint surfaces
+preserved; tests grew from 325 → 363.
+
+#### Module decomposition
+
+- **`endpoints/` package** — one APIRouter per resource. Handlers
+  lazy-import shared helpers from `server.py` to break the module-load
+  cycle that would otherwise result from a circular import.
+  - `endpoints/inference.py` — `/v1/chat/completions`, `/v1/embeddings`,
+    `/v1/models` (plus `_filter_chat_capable`, `_list_agent_models`,
+    `_ensure_base64_embeddings`).
+  - `endpoints/runs.py` — `/v1/runs`, `/v1/runs/{id}`,
+    `/v1/runs/{id}/events*`, `/v1/runs/active`, `/wait`, `/cancel`.
+  - `endpoints/schedules.py` — `/v1/schedules/*` CRUD.
+  - `endpoints/traces.py` — `/v1/traces/*` projections.
+- **`middleware.py`** — auth → correlation → body_size → rate_limit
+  stack, mounted via `register_middleware(app)`. State (`_rate_limit_buckets`,
+  `_correlation_id_var`, `_AUTH_EXEMPT_PATHS`) lives here; `server.py`
+  re-exports for backward-compat with existing tests.
+- **`idempotency.py`** — `check_idempotency` / `record_idempotency` /
+  `release_idempotency_ctx` + per-key locks + `IdempotencyContext`,
+  extracted from `server.py`. `server.py` re-exports under the prior
+  underscored names so endpoint modules' lazy imports stay terse.
+- **`providers/acp_transport.py`** — ACP-over-HTTP wire layer
+  (`AcpClient`, `AcpError`, `_is_local_url`, `_scrub_sandbox_url`,
+  `_warn_remote_misconfig`, `_persist_sandbox_server_id`,
+  `ACP_PROTOCOL_VERSION`). `sandbox_agent.py` keeps the high-level
+  session orchestration.
+- **`providers/ollama.py`** — direct `/api/chat` bypass for `local` /
+  `ollama/*` extracted from `llm.py` (LiteLLM's Ollama adapter drops
+  `message.thinking`). `get_shared_client` lookup goes via the `llm`
+  module attribute so existing test patches still bind.
+- **`storage/{postgres,inmemory}.py`** — the two Store implementations
+  split out of the 1019-LOC `_store.py` monolith. Protocol + factory
+  stay in `_store.py`; row→dataclass helpers live with PostgresStore.
+  `AGGREGATE_GROUP_KEYS` moved to `storage/models.py` so both impls
+  import it without circular dependency.
+
+#### Backend primitives
+
+- **`aitelier.plan_mode`** — new request field gates the agent's
+  plan-mode default at session/new. Sent as
+  `session/set_config_option planMode`. Codex / cursor default to
+  interactive deliberation (`true`); set `false` for batch /
+  non-interactive callers. Unblocks the most common deepread shape
+  (codex as LiteLLM fallback) where plan mode made the agent refuse
+  to execute. Plumbed through `_open_acp_session` and
+  `aitelier_request.schema.json`.
+- **claude-acp config via `session/new._meta`** — `maxTurns`, `model`,
+  `allowedTools`, `systemPrompt` now flow via
+  `_meta.claudeCode.options` instead of the silently-dropped
+  `session/set_config_option` notify. Verified against bridge 0.36.1
+  (`dist/acp-agent.js:1371-1450`). Previously every option was
+  swallowed and claude ran unbounded turns to natural completion;
+  `max_turns=1` cuts response time from 119s → 2s on a simple ack.
+- **Ollama `reasoning_effort` → `think` mapping.** OpenAI's canonical
+  enum (`minimal | low | medium | high`) maps to Ollama's binary
+  `think` toggle. `minimal` disables thinking; `low|medium|high`
+  enable it; omitted leaves the model default. Fixes deepread's
+  production incident where `qwen3:8b` returned `content=""` with
+  `finish_reason=length` because thinking consumed the full
+  `num_predict` budget.
+- **`POST /v1/runs/{id}/wait`** — block until a run reaches a terminal
+  state. Convenience over manual polling for consumers that don't want
+  to set up a webhook receiver. Returns `408` with retry guidance when
+  the timeout elapses before terminal.
+- **`GET /v1/metrics`** — runtime counters for operators.
+
+#### Security
+
+- **`errors.scrub_error_text()`** — regex-based credential redaction
+  for free-form error text. Applied at every `str(exc) → error_msg`
+  site in `server.py` (5), `endpoints/runs.py` (1, was missed in
+  initial extraction and caught in audit), `providers/sandbox_agent.py`
+  (2), and `runs.py` `_finalize_terminal` (1). Covers:
+  - `Authorization: Bearer <token>` header echoes
+  - bare `Bearer <jwt>` (≥16 chars to skip false-positive matches)
+  - `?api_key=…` / `&token=…` / `&password=…` URL query params
+  - JSON-ish `'token': '…'` field=value pairs
+  - `https://user:password@host` basic-auth URLs (added in audit 4)
+- **Scheduled-run failure persistence.** `_schedule_handler` previously
+  swallowed pre-`record_run` exceptions (validation, route parse) —
+  the webhook fired but `/v1/runs` had no record. Now persists a
+  synthetic failed row via `_finalize_terminal` so the control plane
+  surfaces every fired schedule.
+- **`tools` field capped at 256 entries.** Bounds parse cost when a
+  hostile caller maxes out the body-size limit with trivially-small
+  tool entries. Above any provider's practical limit.
+- **`runs.state` vs `runs.status` invariant documented** at the
+  dataclass field level (`storage/models.py`). State is the lifecycle
+  position; status is the outcome category; they diverge only on
+  user-initiated cancellation.
+
+#### Tests
+
+- **+38 unit tests** across the new modules:
+  - `test_acp_transport.py` (new, 10 tests) — `_is_local_url`,
+    `_scrub_sandbox_url`, `_persist_sandbox_server_id` (local vs
+    remote classification, error swallowing, no-op on empty run_id).
+  - `test_sandbox_proxy.py` (new, 12 tests) — `run_prepare`,
+    `stop_sidecars`, `fetch_artifacts`, `prepare_failed_result`
+    coverage that was previously only exercised via end-to-end tests.
+  - `test_errors.py` (+10 tests) — every scrub pattern + edge cases
+    (false positives on "Bearer of bad news", empty/None inputs,
+    case-insensitive `reasoning_effort`).
+  - `test_llm.py` (+6 tests) — direct unit tests for
+    `chat_completion_via_ollama{,_stream}` (transport error,
+    upstream 5xx, NDJSON happy path, stream error on open).
+
+#### Brig deployment
+
+- **SA-only cell** — aitelier runs on the host, talks to SA in brig
+  via the ingress reverse proxy. Brig isolates what needs isolating
+  (the agent processes) without conflating with aitelier's runtime.
+- **`trust_warden_ca: true`** (brig 0.3.0 default) replaces the
+  pre-0.3.0 manual `warden-ca-cert` secret + entrypoint stitching.
+  Brig stages a combined system+warden CA bundle and auto-exports
+  `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` /
+  `NODE_EXTRA_CA_CERTS`. Three implementation bugs we caught and
+  brig fixed mid-session are documented in `brig-feedback.md`.
+- **`tls_passthrough`** for `chatgpt.com` + `auth.openai.com` — brig
+  shipped exactly the principled fix we sketched, unblocking codex
+  agent runs through brig (Cloudflare-fronted strict TLS that
+  mitmproxy can't relay).
+- **`platform.claude.com` added to allow list** — Anthropic's
+  Agent SDK / extra-usage rollout (April 2026) added a new OAuth
+  quota endpoint that claude-code hits on every session/prompt.
+  Without this the bridge hangs indefinitely on a blocked CONNECT.
+
 ### Added / changed — Phase H (audit-3 fixes)
 
 - **Secret redaction extended to `metadata`, `result`, and
