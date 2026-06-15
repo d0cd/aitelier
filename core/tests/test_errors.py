@@ -204,3 +204,31 @@ def test_scrub_error_text_does_not_match_short_words_after_bearer():
     `of` is too short to look like a token)."""
     msg = "Server is bearer of bad news"
     assert scrub_error_text(msg) == msg
+
+
+def test_scrub_error_text_redacts_basic_auth_url():
+    """Upstream proxy / DSN errors sometimes echo full URLs with
+    embedded basic-auth — `postgres://user:pass@host`, `https://api:key@…`.
+    Keep the scheme + host for context; redact the userinfo block."""
+    msg = "connection failed: https://admin:s3cret@api.example.com/v1/foo timed out"
+    scrubbed = scrub_error_text(msg)
+    assert "https://[redacted]:[redacted]@api.example.com" in scrubbed
+    assert "admin" not in scrubbed
+    assert "s3cret" not in scrubbed
+    # Path + rest of message preserved
+    assert "/v1/foo timed out" in scrubbed
+
+
+def test_scrub_error_text_basic_auth_handles_http_and_https():
+    """Same pattern, both schemes."""
+    for scheme in ("http", "https"):
+        msg = f"{scheme}://u:p@host/path failed"
+        scrubbed = scrub_error_text(msg)
+        assert f"{scheme}://[redacted]:[redacted]@host" in scrubbed
+
+
+def test_scrub_error_text_basic_auth_leaves_non_credential_urls_alone():
+    """URLs without userinfo (most URLs) must not be touched. The pattern
+    only fires when there's a `user:pass@` block before the host."""
+    msg = "GET https://api.example.com/v1/things failed (500)"
+    assert scrub_error_text(msg) == msg

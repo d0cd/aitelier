@@ -180,6 +180,15 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         r"\1[redacted]\2",
     ),
+    # Basic-auth URLs embedded in error prose: `https://user:password@host/...`
+    # — upstream proxies and database driver errors sometimes echo full DSNs.
+    # Keep the scheme + host for context; redact userinfo.
+    (
+        re.compile(
+            r"(?i)(https?://)([^:/?#\s\"']+):([^@/?#\s\"']+)(@)"
+        ),
+        r"\1[redacted]:[redacted]\4",
+    ),
 )
 
 
