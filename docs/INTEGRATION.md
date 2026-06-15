@@ -655,6 +655,40 @@ from a previous process — Sandbox Agent has no session-resume API today, so
 those sessions are unrecoverable. Dashboards should treat `orphaned` as a
 terminal failure mode.
 
+### Captured request body + rendered messages
+
+Every run row (from migration v4 onward) carries the actual request
+under two fields:
+
+- `request_body` — the `ChatCompletionRequest` / `AsyncRunRequest` /
+  `EmbeddingsRequest` body as the caller submitted it, before any
+  aitelier-side translation. What you POST is what you read back.
+- `rendered_messages` — the message list after aitelier's agent-path
+  translations (system-prompt fold, response_format injection,
+  `<aitelier_context>` block). What actually went on the wire to the
+  provider. On the LLM path this mostly mirrors `request_body.messages`;
+  on the agent path it collapses to `[{role: system, content: <fold>},
+  {role: user, content: <last user message>}]`.
+
+Both are `null` for runs created before the v4 migration (historical
+state) and for synthetic schedule-side failures that didn't have a
+parseable task body. Operators can distinguish "no record" (`null`)
+from "empty body sent" (`{}`) — the projection preserves the
+distinction.
+
+Both fields pass through the same secret-redaction projection as
+`environment` / `result` / `metadata`: `Authorization: Bearer …`
+shapes inside `aitelier.mcp_servers[*].headers` (and equivalent
+credential keys named `api_key` / `token` / `secret`) are redacted at
+the HTTP boundary. The stored Postgres row keeps the originals for
+operator debugging.
+
+This unlocks several downstream surfaces (see `docs/PLAN.md` Tier 1):
+the Phase H replay endpoint, a static `/ui` browser, bolt-on eval
+frameworks reading the captured input via `/v1/runs/{id}` or a future
+bulk export, and OpenTelemetry GenAI export (`gen_ai.prompt` /
+`gen_ai.completion` conventions).
+
 ## Available models
 
 LiteLLM resolves both curated aliases (declared in `docker/litellm/config.yaml`)

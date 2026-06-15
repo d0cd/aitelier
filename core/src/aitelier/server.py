@@ -217,6 +217,10 @@ async def _schedule_handler(entry: dict) -> None:
                         "schedule_id": entry.get("id"),
                         "schedule_name": entry.get("name"),
                     },
+                    # Schedule's task IS the request body — capture it so a
+                    # synthetic failed run still surfaces what was meant to
+                    # run, useful for replay / debugging the schedule config.
+                    request_body=task if isinstance(task, dict) else None,
                 ))
             except Exception:
                 pass  # row may already exist if the failure happened post-record_run
@@ -758,6 +762,17 @@ async def _agent_chat_completion(
     run_metadata: dict[str, Any] = {"correlation_id": cid}
     if webhook_url:
         run_metadata["webhook_url"] = webhook_url
+
+    # Rendered messages for the agent path: SA receives system_prompt +
+    # the single initial_message (the message list collapses to "last
+    # user turn"). Capturing this here so consumers reading
+    # `/v1/runs/{id}.rendered_messages` see what the agent actually saw,
+    # which can differ from `request_body.messages` (multi-turn history
+    # is folded into the system prompt before dispatch).
+    rendered_messages = [
+        {"role": "system", "content": system_prompt or ""},
+        {"role": "user", "content": initial_message or ""},
+    ]
     spec = RunSpec(
         run_id=run_id, kind="agent",
         agent_id=agent_backend, model=inner_llm,
@@ -770,6 +785,8 @@ async def _agent_chat_completion(
         },
         system_prompt_hash=hash_system_prompt(system_prompt),
         metadata=run_metadata,
+        request_body=req.model_dump(exclude_none=True),
+        rendered_messages=rendered_messages,
     )
 
     async def _do() -> dict:
@@ -994,6 +1011,10 @@ async def _agent_chat_completion_stream(
     system_prompt = _fold_examples(system_prompt, opts.examples)
     system_prompt = _fold_response_format(system_prompt, req.response_format)
 
+    rendered_messages = [
+        {"role": "system", "content": system_prompt or ""},
+        {"role": "user", "content": initial_message or ""},
+    ]
     await start_run(RunSpec(
         run_id=run_id, kind="agent",
         agent_id=agent_backend, model=inner_llm,
@@ -1006,6 +1027,8 @@ async def _agent_chat_completion_stream(
         },
         system_prompt_hash=hash_system_prompt(system_prompt),
         metadata={"correlation_id": cid},
+        request_body=req.model_dump(exclude_none=True),
+        rendered_messages=rendered_messages,
     ))
 
     def _stamp(chunk: dict) -> dict:
@@ -1175,11 +1198,17 @@ async def _llm_chat_completion(
     )
 
     body = _llm_body_from_request(req)
+    # On the LLM path, `body` IS the rendered message set (we don't fold
+    # messages into a system prompt the way the agent path does — the
+    # LLM provider sees `request_body.messages` verbatim modulo
+    # response_format gates). Capture both for symmetry.
     spec = RunSpec(
         run_id=run_id, kind="complete", model=req.model,
         trace_tag=None, correlation_id=cid,
         system_prompt_hash=sp_hash,
         metadata={"correlation_id": cid},
+        request_body=req.model_dump(exclude_none=True),
+        rendered_messages=body.get("messages") if isinstance(body, dict) else None,
     )
 
     async def _do() -> dict:
@@ -1258,13 +1287,14 @@ async def _llm_chat_completion_stream(
         "\n\n".join(str(m.get("content") or "") for m in sys_msgs) or None,
     )
 
+    body = _llm_body_from_request(req)
     await start_run(RunSpec(
         run_id=run_id, kind="complete", model=req.model,
         correlation_id=cid, system_prompt_hash=sp_hash,
         metadata={"correlation_id": cid},
+        request_body=req.model_dump(exclude_none=True),
+        rendered_messages=body.get("messages") if isinstance(body, dict) else None,
     ))
-
-    body = _llm_body_from_request(req)
 
     async def event_generator():
         final: dict | None = None
@@ -1424,6 +1454,21 @@ def _run_to_dict(run) -> dict:
         "error_msg": run.error_msg,
         "result": _redact_secrets(run.result),
         "metadata": _redact_secrets(run.metadata),
+        # Same projection-boundary redaction as `environment` / `result` /
+        # `metadata` — stored row keeps the originals; HTTP projection scrubs
+        # `tools[*].function.parameters.api_key`-shaped fields and any
+        # caller-supplied Authorization headers folded into the request.
+        # `None` (no body captured — older run or schedule-side synthetic
+        # failure) passes through unchanged so consumers can distinguish
+        # "no record" from "empty body."
+        "request_body": (
+            _redact_secrets(run.request_body)
+            if run.request_body is not None else None
+        ),
+        "rendered_messages": (
+            _redact_secrets(run.rendered_messages)
+            if run.rendered_messages is not None else None
+        ),
     }
 
 

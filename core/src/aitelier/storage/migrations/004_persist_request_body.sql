@@ -1,0 +1,39 @@
+-- aitelier storage schema v4: persist request body alongside each run.
+--
+-- Today only `system_prompt_hash` survives the request — enough to
+-- detect prompt drift but not to replay, grade, or inspect what the
+-- model actually saw. Adding the two JSONB columns below unblocks:
+--
+--   - Phase H trace replay (re-dispatch a finalized run with one
+--     field changed)
+--   - Static /ui browser (render the conversation as the model saw it)
+--   - Bolt-on eval frameworks (graders can't grade what they can't see)
+--   - OpenTelemetry GenAI export (`gen_ai.prompt` / `gen_ai.completion`
+--     conventions require the actual content)
+--
+-- Two columns by design:
+--   - `request_body_json`        — the ChatCompletionRequest /
+--                                  AsyncRunRequest body as received
+--                                  (pre-fold, pre-translate). This is
+--                                  what the caller submitted.
+--   - `rendered_messages_json`   — the message list after aitelier's
+--                                  agent-path translations (system-
+--                                  prompt fold, response_format text
+--                                  rendering, `<aitelier_context>`
+--                                  block injection). This is what
+--                                  actually went on the wire to the
+--                                  provider.
+--
+-- Both are NULLABLE for backward compatibility — historical runs and
+-- runs from older aitelier processes will surface NULL. New runs
+-- captured by aitelier ≥ this migration will populate both.
+--
+-- Storage policy: the columns hold the values verbatim. The HTTP
+-- projection in `_run_to_dict` applies `_redact_secrets` at the
+-- boundary so MCP-server `Authorization: Bearer …` headers and
+-- equivalent secrets don't echo back to API consumers. Stored row
+-- keeps the originals for operator debugging — same pattern as the
+-- `environment_json` and `result_json` columns.
+
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS request_body_json      JSONB;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS rendered_messages_json  JSONB;

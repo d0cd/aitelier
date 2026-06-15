@@ -87,6 +87,18 @@ class RunSpec:
     environment: dict[str, Any] = field(default_factory=dict)
     system_prompt_hash: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_body: dict[str, Any] | None = None
+    """The ChatCompletionRequest / AsyncRunRequest / EmbeddingsRequest body
+    as received from the consumer, BEFORE any aitelier-side translation.
+    Captured by the endpoint layer; None when omitted (synthetic runs,
+    backward-compat with older code paths)."""
+    rendered_messages: list[dict[str, Any]] | None = None
+    """The message list after aitelier's agent-path translations
+    (system-prompt fold, response_format injection, `<aitelier_context>`
+    block). What actually went on the wire to the provider. None when
+    the run path doesn't apply translations (LLM path mostly preserves
+    `request_body['messages']` verbatim; embed runs have no messages).
+    """
 
     def __post_init__(self) -> None:
         # Defense against persisting unboundedly large metadata blobs.
@@ -156,6 +168,14 @@ class Run:
     error_type: str | None = None
     error_msg: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_body: dict[str, Any] | None = None
+    """Caller's request body as received, before aitelier-side translation.
+    NULL for historical runs from before the v4 migration."""
+    rendered_messages: list[dict[str, Any]] | None = None
+    """Message list after aitelier's agent-path translations (system-prompt
+    fold, response_format injection, `<aitelier_context>` block) — what
+    actually went on the wire. NULL when no translations apply (LLM path)
+    or for runs from before the v4 migration."""
 
 
 @dataclass

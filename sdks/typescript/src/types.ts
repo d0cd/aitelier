@@ -113,6 +113,13 @@ export interface Run {
   errorMsg?: string | null;
   result?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
+  /** Caller's request body as received (pre-fold, pre-translate). `null`
+   * for historical runs from before the v4 storage migration. */
+  requestBody?: Record<string, unknown> | null;
+  /** Message list after aitelier's agent-path translations — what
+   * actually went on the wire. `null` for runs before v4 or where no
+   * translation applies. */
+  renderedMessages?: Array<Record<string, unknown>> | null;
 }
 
 export interface RunEvent {

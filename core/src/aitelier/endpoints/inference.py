@@ -123,6 +123,11 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
     spec = RunSpec(
         run_id=run_id, kind="embed", model=req.model,
         correlation_id=cid, metadata={"correlation_id": cid},
+        # Embeddings have no message rendering — the body IS what goes to
+        # the provider. Capture the EmbeddingsRequest so consumers can see
+        # the input list, encoding_format, etc. when reviewing the run.
+        # rendered_messages stays None (no messages on the embed path).
+        request_body=req.model_dump(exclude_none=True),
     )
 
     async def _do() -> dict:

@@ -7,6 +7,63 @@ relevant section.
 
 ## Unreleased
 
+### Added — Phase J (request body persistence — eval/replay/OTel foundation)
+
+Storage migration v4 + plumbing to capture the actual request body
+alongside each run. Foundation for the Phase H replay endpoint, the
+static `/ui` browser, bolt-on eval frameworks, and OpenTelemetry GenAI
+export — all of which need the captured input to function.
+
+- **`runs` table gains two JSONB columns** (`004_persist_request_body.sql`):
+  - `request_body_json` — caller's body as received (`ChatCompletionRequest`
+    / `AsyncRunRequest` / `EmbeddingsRequest`), pre-fold, pre-translate.
+  - `rendered_messages_json` — message list after aitelier's agent-path
+    translations (system-prompt fold, response_format injection,
+    `<aitelier_context>` block). What actually went on the wire.
+- **`RunSpec` + `Run` dataclasses** carry `request_body: dict | None`
+  and `rendered_messages: list[dict] | None`. Both NULL for backward
+  compatibility — historical runs and synthetic schedule-side failures
+  surface `null` rather than `{}`, so consumers can distinguish "no
+  record" from "empty body sent."
+- **Captured at all 5 RunSpec construction sites**:
+  - `_agent_chat_completion` (sync agent) and `_agent_chat_completion_stream`
+    (streaming agent) — rendered messages collapse to system + last user.
+  - `_llm_chat_completion` (sync LLM) and `_llm_chat_completion_stream`
+    (streaming LLM) — `rendered_messages = body["messages"]` post
+    `_llm_body_from_request`.
+  - `endpoints/inference.py:embeddings_endpoint` — `rendered_messages`
+    stays `None` (no messages on the embed path); `request_body`
+    captures input list + encoding_format.
+  - `_schedule_handler` synthetic failure path — `request_body = task`
+    so a debug-able record of the failed schedule survives.
+- **HTTP projection redacts at the boundary** via `_redact_secrets` —
+  same pattern as `environment` / `result` / `metadata`. Stored row
+  keeps originals; `Authorization: Bearer …` headers inside
+  `aitelier.mcp_servers[*].headers` and credential-named fields scrub
+  to `[redacted]` before reaching API consumers. `None` passes through
+  unchanged.
+- **SDK Run types updated** — Python (`request_body: dict | None`,
+  `rendered_messages: list[dict] | None`) and TypeScript (`requestBody`,
+  `renderedMessages` with `null` preserved). TS adds `request_body` and
+  `rendered_messages` to `PRESERVE_VALUE_KEYS` so the OpenAI-shape
+  snake_case keys inside the captured body don't get mangled to
+  camelCase on read.
+- **`run.schema.json` declares the two new fields** — JSON Schema
+  source of truth stays in sync.
+- **5 new unit tests**:
+  - `test_storage.py` — round-trip for both fields (NULL + populated).
+  - `test_server.py` — `_run_to_dict` redaction of MCP-header shapes
+    inside `request_body`; NULL preservation for pre-v4 runs.
+- **`docs/INTEGRATION.md`** gains a "Captured request body + rendered
+  messages" subsection under "Run state machine" documenting the
+  semantics, the redaction guarantee, and the four downstream surfaces
+  this unblocks.
+
+Net: 399 unit tests pass (was 366 at the end of Phase I). No backward
+compat breaks — pre-v4 rows surface `null` for both fields. New
+queries against `/v1/runs/{id}` see populated values for runs created
+after the migration.
+
 ### Added / changed — Phase I (decomposition arc + security hardening)
 
 This phase moved ~700 LOC out of `server.py` (2700+ → 1843) into

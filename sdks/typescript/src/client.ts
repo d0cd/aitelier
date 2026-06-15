@@ -392,6 +392,15 @@ const PRESERVE_VALUE_KEYS = new Set([
   "environment",
   "payload",
   "task",
+  // The captured request_body contains the OpenAI ChatCompletionRequest
+  // verbatim (e.g., `response_format`, `tool_choice`, `max_tokens`).
+  // Camel-casing those keys would mutate consumer data; OpenAI's wire
+  // format is snake_case and consumers may pass it back to OpenAI SDKs.
+  "request_body",
+  // Similarly for the rendered messages — message objects carry
+  // `tool_calls`, `tool_call_id`, `function_call`, etc. as snake_case
+  // in OpenAI's API.
+  "rendered_messages",
 ]);
 
 function snakeToCamelDeep(value: unknown): unknown {

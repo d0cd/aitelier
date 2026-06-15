@@ -281,6 +281,114 @@ def test_schedules_redacts_headers_and_env_on_get(client):
         client.delete(f"/v1/schedules/{sid}")
 
 
+def test_run_to_dict_redacts_request_body_and_rendered_messages():
+    """`request_body` and `rendered_messages` capture what the caller sent
+    + what went on the wire. Both can carry MCP `Authorization: Bearer …`
+    headers (via `aitelier.mcp_servers[*].headers`) or other credential
+    shapes folded into the request. Stored row keeps the originals; HTTP
+    projection scrubs at the boundary."""
+    from aitelier.server import _run_to_dict
+
+    class _R:
+        run_id = "r-1"
+        state = "completed"
+        kind = "agent"
+        agent_id = None
+        model = None
+        started_at = None
+        ended_at = None
+        trace_tag = None
+        correlation_id = None
+        parent_run_id = None
+        sandbox_backend = None
+        sandbox_url = None
+        sandbox_server_id = None
+        workspace = None
+        environment = {}
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        cost_usd = None
+        finish_reason = None
+        tool_call_count = 0
+        system_prompt_hash = None
+        status = "ok"
+        error_type = None
+        error_msg = None
+        result = {}
+        metadata = {}
+        request_body = {
+            "model": "agent:claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "aitelier": {
+                "mcp_servers": [{
+                    "name": "private-mcp",
+                    "headers": [{"name": "Authorization",
+                                  "value": "Bearer secret"}],
+                }],
+            },
+        }
+        rendered_messages = [
+            {"role": "system", "content": "you are a helper"},
+            {"role": "user", "content": "hi"},
+        ]
+
+    out = _run_to_dict(_R())
+    # MCP headers redacted; rest of structure intact.
+    redacted_headers = out["request_body"]["aitelier"]["mcp_servers"][0]["headers"]
+    assert redacted_headers == ["[redacted]"]
+    assert out["request_body"]["model"] == "agent:claude"
+    assert out["request_body"]["messages"] == [{"role": "user", "content": "hi"}]
+    # Rendered messages pass through when no credential shape is present.
+    assert out["rendered_messages"] == [
+        {"role": "system", "content": "you are a helper"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_run_to_dict_passes_through_none_request_body():
+    """Historical runs (pre-v4 migration) and synthetic schedule-side
+    failures may have `request_body=None`. That must round-trip as `null`
+    in JSON, NOT collapse to `{}` (which would mean "empty body sent").
+    Same NULL-preserving semantics for `rendered_messages`."""
+    from aitelier.server import _run_to_dict
+
+    class _R:
+        run_id = "r-pre-v4"
+        state = "completed"
+        kind = "complete"
+        agent_id = None
+        model = "claude-haiku"
+        started_at = None
+        ended_at = None
+        trace_tag = None
+        correlation_id = None
+        parent_run_id = None
+        sandbox_backend = None
+        sandbox_url = None
+        sandbox_server_id = None
+        workspace = None
+        environment = {}
+        input_tokens = 0
+        output_tokens = 0
+        total_tokens = 0
+        cost_usd = None
+        finish_reason = None
+        tool_call_count = 0
+        system_prompt_hash = None
+        status = "ok"
+        error_type = None
+        error_msg = None
+        result = {}
+        metadata = {}
+        request_body = None
+        rendered_messages = None
+
+    out = _run_to_dict(_R())
+    assert out["request_body"] is None
+    assert out["rendered_messages"] is None
+
+
 def test_redact_secrets_strips_metadata_and_result_on_run_to_dict():
     """`metadata` and `result` carry consumer-written values that may
     include secrets (a webhook_url with credentials, a captured stderr
@@ -318,6 +426,8 @@ def test_redact_secrets_strips_metadata_and_result_on_run_to_dict():
             "headers": [{"name": "X-Forwarded", "value": "token"}],
             "webhook_url": "https://hooks.example.com/X",
         }
+        request_body = None
+        rendered_messages = None
 
     out = _run_to_dict(_R())
     assert out["result"]["authorization"] == "[redacted]"

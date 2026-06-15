@@ -38,6 +38,8 @@
     "error_msg":         { "type": ["string", "null"] },
     "system_prompt_hash":{ "type": ["string", "null"], "description": "SHA-256 of the system prompt actually sent to the provider; lets dashboards group runs by prompt variant." },
     "result":            { "type": "object", "description": "Final result payload from the run. For LLM/embed kinds: the OpenAI-shape response body. For agent kinds: the aggregated done event (content, finish_reason, usage, tool_calls). Empty object if the run hasn't reached a terminal state." },
-    "metadata":          { "type": "object" }
+    "metadata":          { "type": "object" },
+    "request_body":      { "type": ["object", "null"], "description": "Caller's request body as received (pre-fold, pre-translate). For ChatCompletionRequest / AsyncRunRequest / EmbeddingsRequest. Null for historical runs from before the v4 storage migration. Projection-redacted at the HTTP boundary." },
+    "rendered_messages": { "type": ["array", "null"], "items": {"type": "object"}, "description": "Message list after aitelier's agent-path translations (system-prompt fold, response_format injection) — what actually went on the wire. Null when no translation applies (embed runs, pre-v4 runs)." }
   }
 }

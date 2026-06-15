@@ -120,6 +120,13 @@ class Run(BaseModel):
     error_msg: str | None = None
     result: dict[str, Any] = {}
     metadata: dict[str, Any] = {}
+    request_body: dict[str, Any] | None = None
+    """Caller's request body as received (pre-fold, pre-translate). `None`
+    for historical runs from before the v4 storage migration."""
+    rendered_messages: list[dict[str, Any]] | None = None
+    """Message list after aitelier's agent-path translations — what
+    actually went on the wire. `None` for runs before v4 or where no
+    translation applies."""
 
 
 class RunEvent(BaseModel):

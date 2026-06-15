@@ -25,6 +25,11 @@ phase-by-phase history, read the code or `git log`.
 - Append-only `run_events` timeline.
 - `mark_orphaned_running_runs()` startup sweep — prevents ghost rows after a crash.
 - `sandbox_url` / `sandbox_server_id` / `sandbox_backend` stamped on every agent run.
+- **`request_body` + `rendered_messages` captured on every run** (migration v4).
+  Pre-fold body as received + post-fold message list as it went on the
+  wire. Foundation for Phase H replay, the `/ui` browser, bolt-on eval
+  frameworks, and OpenTelemetry GenAI export. Projection-redacted at
+  the HTTP boundary (same pattern as `environment` / `result`).
 
 ### Observability
 
@@ -114,30 +119,18 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
 
 ### Tier 1 — leans into aitelier's unique position
 
-- **Persist the request body alongside each run** (foundation for
-  several items below). Today only `system_prompt_hash` survives —
-  rich enough to detect prompt drift but not to replay, grade, or
-  inspect. Two new `runs` columns: `request_body_json` (the full
-  ChatCompletionRequest as received) and `rendered_messages_json`
-  (post-fold, post-translate — what actually went on the wire to
-  the provider). Encrypted-at-rest is the operator's choice; the
-  schema decision is the one to make. Precondition for:
-  - The Phase H replay endpoint (re-dispatch a finalized run with
-    one field changed).
-  - The static `/ui` browser (need to render what the model actually
-    saw).
-  - Bolt-on eval frameworks (graders can't grade what they can't see).
-  - OpenTelemetry GenAI export (the conventions include `gen_ai.prompt`).
-
-- **Agent trace observability + replay** (the "Phase H" idea).
+- **Agent trace observability + replay** (the "Phase H" idea, now
+  unblocked by the request-body capture under "Built" above).
   Existing observability platforms (LangSmith, Langfuse, Phoenix)
   instrument from the application; aitelier intercepts at the HTTP
-  edge and already stores rich per-run data. Two small additions on
-  top of the request-body capture above:
+  edge and already stores rich per-run data including the captured
+  request body. Two small additions left:
   - `POST /v1/runs/{id}/replay?model=X` — re-dispatch a finalized run
-    with one field changed; new run linked via `parent_run_id`.
+    with one field changed; new run linked via `parent_run_id`. The
+    captured `request_body` IS the replay input.
   - Static web UI at `/ui` — read-only browser over `/v1/runs`,
     `/v1/runs/{id}/events`, `/v1/traces/aggregates`. No build step.
+    Renders `rendered_messages` as the conversation the model saw.
   Pays off as both an observability tool *and* the foundation for
   evals (`trace_tag` + replay + aggregates cover the eval workflow
   pattern; no DSL needed).
@@ -191,12 +184,12 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
 
 - **Substrate-grade for bolt-on eval frameworks.** Aitelier already
   records per-call rows with model/tokens/cost/timing/error class,
-  append-only event timelines, `trace_tag` grouping, and `parent_run_id`
-  hierarchies — exactly the substrate any eval framework (Langfuse,
-  Phoenix, PromptFoo, OpenEval, internal tools) needs to grade
-  historical runs. With the request-body capture from the foundation
-  item above, two more small additions turn aitelier into "point your
-  eval tool at it and it works":
+  append-only event timelines, `trace_tag` grouping, `parent_run_id`
+  hierarchies, AND (as of migration v4) the captured `request_body` +
+  `rendered_messages` — exactly the substrate any eval framework
+  (Langfuse, Phoenix, PromptFoo, OpenEval, internal tools) needs to
+  grade historical runs. Two small additions turn aitelier into
+  "point your eval tool at it and it works":
 
   - **Scoring sink.** New `run_scores` table (`run_id`, `name`,
     `value`, `evaluator`, `comment`, `created_at`) + `POST

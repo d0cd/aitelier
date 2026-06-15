@@ -62,6 +62,8 @@ class InMemoryStore:
             environment=spec.environment,
             system_prompt_hash=spec.system_prompt_hash,
             metadata=spec.metadata,
+            request_body=spec.request_body,
+            rendered_messages=spec.rendered_messages,
         )
         self._runs[spec.run_id] = run
         self._events[spec.run_id] = []

@@ -91,10 +91,11 @@ class PostgresStore:
                     run_id, state, kind, agent_id, model,
                     trace_tag, correlation_id, parent_run_id,
                     sandbox_backend, sandbox_url, sandbox_server_id, workspace,
-                    environment_json, system_prompt_hash, metadata_json
+                    environment_json, system_prompt_hash, metadata_json,
+                    request_body_json, rendered_messages_json
                 )
                 VALUES ($1, 'pending', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                        $12::jsonb, $13, $14::jsonb)
+                        $12::jsonb, $13, $14::jsonb, $15::jsonb, $16::jsonb)
                 RETURNING *
                 """,
                 spec.run_id, spec.kind, spec.agent_id, spec.model,
@@ -102,6 +103,8 @@ class PostgresStore:
                 spec.sandbox_backend, spec.sandbox_url, spec.sandbox_server_id, spec.workspace,
                 json.dumps(spec.environment), spec.system_prompt_hash,
                 json.dumps(spec.metadata),
+                json.dumps(spec.request_body) if spec.request_body is not None else None,
+                json.dumps(spec.rendered_messages) if spec.rendered_messages is not None else None,
             )
         return _row_to_run(row)
 
@@ -546,11 +549,20 @@ def _row_to_run(row: Any) -> Run:
     # `parent_run_id` is read defensively: old Postgres rows from before
     # migration 003 don't have the column. asyncpg raises KeyError on
     # missing columns; we treat that as None so the runtime stays
-    # backward-compatible across rolling upgrades.
+    # backward-compatible across rolling upgrades. Same pattern for
+    # the v4 columns (`request_body_json`, `rendered_messages_json`).
     try:
         parent_run_id = row["parent_run_id"]
     except (KeyError, IndexError):
         parent_run_id = None
+    try:
+        request_body = _as_dict_or_none(row["request_body_json"])
+    except (KeyError, IndexError):
+        request_body = None
+    try:
+        rendered_messages = _as_list_or_none(row["rendered_messages_json"])
+    except (KeyError, IndexError):
+        rendered_messages = None
     return Run(
         run_id=row["run_id"], state=row["state"], kind=row["kind"],
         started_at=row["started_at"], ended_at=row["ended_at"],
@@ -574,7 +586,42 @@ def _row_to_run(row: Any) -> Run:
         error_type=row["error_type"],
         error_msg=row["error_msg"],
         metadata=_as_dict(row["metadata_json"]),
+        request_body=request_body,
+        rendered_messages=rendered_messages,
     )
+
+
+def _as_dict_or_none(value: Any) -> dict[str, Any] | None:
+    """JSONB read that preserves the distinction between NULL (column
+    unset — historical run from before migration v4) and `{}` (caller
+    explicitly sent an empty body). `_as_dict` collapses both to `{}`."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    if isinstance(value, dict):
+        return value
+    return None
+
+
+def _as_list_or_none(value: Any) -> list[dict[str, Any]] | None:
+    """JSONB read for the rendered_messages column. Same NULL-preserving
+    semantics as `_as_dict_or_none`."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, list) else None
+    if isinstance(value, list):
+        return value
+    return None
 
 
 def _row_to_event(row: Any) -> RunEvent:

@@ -86,6 +86,35 @@ async def test_create_and_get_run(store):
 
 
 @pytest.mark.asyncio
+async def test_request_body_and_rendered_messages_round_trip(store):
+    """v4 migration columns survive a write → read cycle. Both NULL when
+    unset (backward-compat with older code paths) and verbatim when set."""
+    # Default: both fields absent → None at the row level.
+    await store.create_run(RunSpec(run_id="r-no-body", kind="agent"))
+    no_body = await store.get_run("r-no-body")
+    assert no_body.request_body is None
+    assert no_body.rendered_messages is None
+
+    # Explicit: both fields populated → verbatim round-trip.
+    rb = {
+        "model": "agent:claude",
+        "messages": [{"role": "user", "content": "hi"}],
+        "aitelier": {"max_turns": 1},
+    }
+    rm = [
+        {"role": "system", "content": "be brief"},
+        {"role": "user", "content": "hi"},
+    ]
+    await store.create_run(RunSpec(
+        run_id="r-with-body", kind="agent",
+        request_body=rb, rendered_messages=rm,
+    ))
+    with_body = await store.get_run("r-with-body")
+    assert with_body.request_body == rb
+    assert with_body.rendered_messages == rm
+
+
+@pytest.mark.asyncio
 async def test_run_state_transitions(store):
     await store.create_run(RunSpec(run_id="r", kind="agent"))
     await store.update_run_state("r", "running")
