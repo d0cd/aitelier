@@ -102,15 +102,26 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
 ## Project structure
 
 - `core/src/aitelier/` — Python core
-  - `server.py` — FastAPI app + endpoint handlers + middleware
-  - `openai_compat.py` — request/response models + OpenAI ↔ aitelier translation
-  - `providers/` — `llm.py` (LiteLLM passthrough), `sandbox_agent.py` (ACP client)
-  - `storage/` — `Store` protocol + `PostgresStore` + `InMemoryStore`, migrations, dataclasses
-  - `sandbox_proxy.py` — SA workflow choreography (install / commands / files / sidecars / artifacts)
-  - `purge_worker.py` — background trim of idempotency keys, terminal webhooks, old events
-  - `webhook_worker.py` — durable webhook delivery worker
-  - `schedules.py` — recurring / one-shot job tick loop
-  - `runner.py`, `runs.py` — run id helper + state-machine recording (record_run, start_run)
+  - `server.py` — FastAPI app bootstrap + lifespan + agent-execution orchestration + the helpers each endpoint module imports lazily (idempotency wrappers, render, probes, webhooks, SSE framing). Routers are included from `endpoints/`; middleware from `middleware.py`.
+  - `endpoints/` — one router per resource. Handlers lazy-import shared helpers from `server.py` to avoid module-load cycles.
+    - `inference.py` — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
+    - `runs.py` — `/v1/runs`, `/v1/runs/{id}*`, `/v1/runs/active`, `/wait`, `/cancel`, `/events*`
+    - `schedules.py` — `/v1/schedules*`
+    - `traces.py` — `/v1/traces*`
+  - `middleware.py` — HTTP middleware stack (auth → correlation → body_size → rate_limit), registered on the app via `register_middleware(app)`.
+  - `idempotency.py` — `Idempotency-Key` check/record/release + per-key locks (process-local; DB `ON CONFLICT` is the cross-process safety net).
+  - `openai_compat.py` — request/response models (`ChatCompletionRequest`, `AsyncRunRequest`, `ScheduleRequest`, …) + OpenAI ↔ aitelier translation.
+  - `providers/`
+    - `llm.py` — LiteLLM passthrough for non-Ollama models; shared `LLMError` + `get_shared_client`.
+    - `ollama.py` — direct `/api/chat` bypass for `local` / `ollama/*` (LiteLLM's Ollama adapter drops `message.thinking`).
+    - `sandbox_agent.py` — high-level ACP session orchestration (`call_via_sandbox`, `call_via_sandbox_stream`, `_build_session_new_meta`, event translation).
+    - `acp_transport.py` — ACP-over-HTTP wire layer (`AcpClient`, URL scrubbing, preflight warnings, run-row stamping).
+  - `storage/` — `Store` protocol + factory in `_store.py`; `postgres.py` (asyncpg-backed) and `inmemory.py` (process-local, tests + DSN-less dev) implement it; `models.py` carries the dataclasses + `AGGREGATE_GROUP_KEYS`; `migrations/` holds the SQL.
+  - `sandbox_proxy.py` — SA workflow choreography (install / commands / files / sidecars / artifacts).
+  - `purge_worker.py` — background trim of idempotency keys, terminal webhooks, old events.
+  - `webhook_worker.py` — durable webhook delivery worker.
+  - `schedules.py` — recurring / one-shot job tick loop.
+  - `runner.py`, `runs.py` — run id helper + state-machine recording (`record_run`, `start_run`, `_finalize_terminal`).
   - `config.py`, `errors.py`, `security.py`, `cli.py`
 - `schemas/v1/` — JSON Schema source of truth for *control plane* wire format
 - `sdks/python/` — Python SDK (`aitelier_client`); inference via `Aitelier.openai()`
