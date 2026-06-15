@@ -84,3 +84,25 @@ interval_seconds = 3600
 webhook_retention_days = 7
 event_retention_days = 30
 run_retention_days = 30
+
+# [otel]
+# OpenTelemetry GenAI export. OFF by default — vanilla install pays no
+# import cost. Install the extras to opt in:
+#
+#   uv pip install 'aitelier[otel]'
+#
+# Then enable and point at an OTLP collector. Any OTLP backend (Jaeger,
+# Tempo, Honeycomb, Datadog, Phoenix, Langfuse-via-OTel) ingests aitelier
+# inference spans without adapter code — they're tagged with the GenAI
+# semantic conventions (gen_ai.system, gen_ai.request.*, gen_ai.usage.*).
+#
+# enabled         = true
+# endpoint        = "http://localhost:4317"   # OTLP collector
+# protocol        = "grpc"                    # "grpc" (4317) or "http" (4318)
+# insecure        = true                      # grpc only; http infers from URL
+# service_name    = "aitelier"                # surfaces as service.name resource
+# capture_content = false
+#   When true, emits each chat message as a span event (gen_ai.user.message,
+#   gen_ai.assistant.message, …) so trace backends render the conversation.
+#   Default off — message bodies routinely carry PII / secrets, and the
+#   destination collector's retention isn't aitelier's to assume.

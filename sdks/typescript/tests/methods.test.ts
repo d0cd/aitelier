@@ -257,6 +257,88 @@ describe("control plane", () => {
   });
 });
 
+describe("run scores (eval framework write-back)", () => {
+  it("addRunScore POSTs JSON and returns camelCased RunScore", async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: true, status: 201,
+        json: async () => ({
+          id: 7, run_id: "r-1", name: "helpfulness", value: 0.8,
+          evaluator: "gpt-4o-judge", comment: null, metadata: null,
+          created_at: "2026-05-28T12:00:00Z",
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://aitelier.test" });
+    const score = await c.addRunScore("r-1", {
+      name: "helpfulness", value: 0.8, evaluator: "gpt-4o-judge",
+    });
+    expect(score.id).toBe(7);
+    expect(score.runId).toBe("r-1");
+    expect(score.value).toBe(0.8);
+    expect(score.createdAt).toBe("2026-05-28T12:00:00Z");
+    expect(calls[0].url).toBe("http://aitelier.test/v1/runs/r-1/scores");
+    expect(calls[0].init?.method).toBe("POST");
+    const body = JSON.parse(calls[0].init?.body as string);
+    expect(body).toEqual({
+      name: "helpfulness", value: 0.8, evaluator: "gpt-4o-judge",
+    });
+  });
+
+  it("listRunScores hits GET /v1/runs/{id}/scores and unwraps `data`", async () => {
+    globalThis.fetch = mockFetch({
+      ok: true, status: 200,
+      json: {
+        object: "list",
+        data: [
+          { id: 1, run_id: "r-1", name: "h", value: 0.5,
+            evaluator: "j", comment: null, metadata: null,
+            created_at: "2026-05-28T12:00:00Z" },
+          { id: 2, run_id: "r-1", name: "h", value: 0.7,
+            evaluator: "j", comment: null, metadata: null,
+            created_at: "2026-05-28T12:01:00Z" },
+        ],
+      },
+    });
+    const c = new Aitelier({ baseUrl: "http://aitelier.test" });
+    const scores = await c.listRunScores("r-1");
+    expect(scores.map((s) => s.value)).toEqual([0.5, 0.7]);
+  });
+
+  it("exportRuns streams NDJSON and yields one Run per line", async () => {
+    const body =
+      '{"run_id": "r-1", "state": "completed", "kind": "complete"}\n' +
+      "\n" +  // blank line: skipped
+      '{"run_id": "r-2", "state": "failed", "kind": "complete"}\n';
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(enc.encode(body));
+        controller.close();
+      },
+    });
+    globalThis.fetch = vi.fn(async (url: string | URL) => {
+      calls.push({ url: String(url), init: undefined });
+      return {
+        ok: true, status: 200, body: stream,
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://aitelier.test" });
+    const out = [];
+    for await (const r of c.exportRuns({ traceTag: "audit", limit: 50 })) {
+      out.push(r);
+    }
+    expect(out.map((r) => r.runId)).toEqual(["r-1", "r-2"]);
+    expect(calls[0].url).toContain("/v1/runs/export?");
+    expect(calls[0].url).toContain("trace_tag=audit");
+    expect(calls[0].url).toContain("limit=50");
+  });
+});
+
 describe(".openai()", () => {
   it("throws a helpful error if openai is not installed", async () => {
     // The package IS installed (we declare it in dev deps), so this test

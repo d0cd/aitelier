@@ -203,3 +203,132 @@ async def test_get_schema():
     assert result["type"] == "object"
     args, _ = fake.get.call_args
     assert args[0] == "/v1/schemas/run"
+
+
+# --- Run scores (eval framework write-back) --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_run_score_posts_body_and_returns_typed_row():
+    """add_run_score sends only the optional fields the caller provided —
+    no `comment: None` noise on the wire — and returns a parsed RunScore."""
+    sdk = Aitelier()
+    server_row = {
+        "id": 7, "run_id": "r-1", "name": "helpfulness", "value": 0.8,
+        "evaluator": "gpt-4o-judge", "comment": None, "metadata": None,
+        "created_at": "2026-05-28T12:00:00Z",
+    }
+    fake = _stub_http(sdk, server_row, status_code=201)
+    score = await sdk.add_run_score(
+        "r-1", name="helpfulness", value=0.8, evaluator="gpt-4o-judge",
+    )
+    assert score.id == 7 and score.value == 0.8
+    args, kwargs = fake.post.call_args
+    assert args[0] == "/v1/runs/r-1/scores"
+    assert kwargs["json"] == {
+        "name": "helpfulness", "value": 0.8, "evaluator": "gpt-4o-judge",
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_run_score_includes_comment_and_metadata_when_given():
+    sdk = Aitelier()
+    server_row = {
+        "id": 8, "run_id": "r-2", "name": "factuality", "value": 1.0,
+        "evaluator": "human:r3", "comment": "verified",
+        "metadata": {"rubric_version": 2}, "created_at": None,
+    }
+    fake = _stub_http(sdk, server_row, status_code=201)
+    await sdk.add_run_score(
+        "r-2", name="factuality", value=1.0, evaluator="human:r3",
+        comment="verified", metadata={"rubric_version": 2},
+    )
+    _, kwargs = fake.post.call_args
+    assert kwargs["json"]["comment"] == "verified"
+    assert kwargs["json"]["metadata"] == {"rubric_version": 2}
+
+
+@pytest.mark.asyncio
+async def test_list_run_scores_returns_typed_history():
+    sdk = Aitelier()
+    rows = {
+        "object": "list",
+        "data": [
+            {"id": 1, "run_id": "r-1", "name": "h", "value": 0.5,
+             "evaluator": "j", "comment": None, "metadata": None,
+             "created_at": "2026-05-28T12:00:00Z"},
+            {"id": 2, "run_id": "r-1", "name": "h", "value": 0.7,
+             "evaluator": "j", "comment": None, "metadata": None,
+             "created_at": "2026-05-28T12:01:00Z"},
+        ],
+    }
+    fake = _stub_http(sdk, rows)
+    scores = await sdk.list_run_scores("r-1")
+    assert [s.value for s in scores] == [0.5, 0.7]
+    args, _ = fake.get.call_args
+    assert args[0] == "/v1/runs/r-1/scores"
+
+
+@pytest.mark.asyncio
+async def test_export_runs_streams_ndjson_and_parses_per_line():
+    """export_runs is an async iterator over Run rows. The underlying
+    HTTP call uses `client.stream(...)`; iterating `aiter_lines()` yields
+    one Run per non-empty line."""
+    import contextlib
+
+    sdk = Aitelier()
+    fake_client = MagicMock()
+    fake_client.is_closed = False
+
+    class _StreamResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        async def aiter_lines(self):
+            yield '{"run_id": "r-1", "state": "completed", "kind": "complete"}'
+            yield ""  # blank line: must be skipped
+            yield '{"run_id": "r-2", "state": "failed", "kind": "complete"}'
+
+    @contextlib.asynccontextmanager
+    async def fake_stream(method, url, params=None):
+        fake_stream.last_call = (method, url, params)
+        yield _StreamResp()
+    fake_client.stream = fake_stream
+    sdk._client = fake_client
+
+    runs = [r async for r in sdk.export_runs(trace_tag="audit", limit=50)]
+    assert [r.run_id for r in runs] == ["r-1", "r-2"]
+    method, url, params = fake_stream.last_call
+    assert method == "GET"
+    assert url == "/v1/runs/export"
+    assert params["trace_tag"] == "audit"
+    assert params["limit"] == 50
+
+
+@pytest.mark.asyncio
+async def test_export_runs_omits_unset_filters():
+    """No filters → only `limit` in params. Avoids sending `since=None`
+    string which the server would 400 on."""
+    import contextlib
+
+    sdk = Aitelier()
+    fake_client = MagicMock()
+    fake_client.is_closed = False
+
+    class _StreamResp:
+        status_code = 200
+        def raise_for_status(self): pass
+        async def aiter_lines(self):
+            if False:
+                yield ""
+
+    captured = {}
+    @contextlib.asynccontextmanager
+    async def fake_stream(method, url, params=None):
+        captured["params"] = params
+        yield _StreamResp()
+    fake_client.stream = fake_stream
+    sdk._client = fake_client
+
+    async for _ in sdk.export_runs():
+        pass
+    assert set(captured["params"].keys()) == {"limit"}

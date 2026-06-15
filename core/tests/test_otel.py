@@ -5,10 +5,11 @@ builders (`gen_ai_request_attrs`, `gen_ai_response_attrs`,
 `gen_ai_system_for_model`) are pure functions that DON'T import the OTel
 SDK, so they work on a default install without the `[otel]` extra. Span
 emission goes through `record_inference_span` which is a no-op when
-`get_tracer()` returns None.
+`_tracer` is None (i.e., `init_tracer_provider` hasn't been called).
 
-The tests here cover the pure-function surface — span emission against a
-real tracer provider would require the extras installed.
+Pure-function tests at the top of this file run without the SDK
+installed; integration tests below use `pytest.importorskip` and an
+`InMemorySpanExporter` to exercise the SDK-bound surface.
 """
 
 from __future__ import annotations

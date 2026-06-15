@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/run_score.schema.json",
+  "title": "RunScore",
+  "description": "One score written against a run by an external grader. Returned by POST /v1/runs/{run_id}/scores (201) and listed by GET /v1/runs/{run_id}/scores. No uniqueness on (run_id, name, evaluator) — re-grading is a write, not an update; the historical sequence is preserved by `created_at`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["run_id", "name", "value", "evaluator"],
+  "properties": {
+    "id": {
+      "type": ["integer", "null"],
+      "description": "Server-assigned row id. Populated on response; absent on request."
+    },
+    "run_id": {
+      "type": "string",
+      "description": "The run this score is against. Must reference an existing row in `runs`."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_\\-\\.]+$",
+      "description": "Score name (e.g. 'helpfulness', 'factuality'). Charset-restricted because it flows into log lines and aggregate group-by queries."
+    },
+    "value": {
+      "type": "number",
+      "description": "Score value. Unconstrained range because rubrics differ (0..1 normalized, 1..5 Likert, raw token counts, latency budgets, etc.). Consumers normalize as they need."
+    },
+    "evaluator": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_\\-\\.:/]+$",
+      "description": "Who or what produced the score (e.g. 'gpt-4o-judge', 'human:reviewer-3', 'rubric/v2'). Charset-restricted for the same reasons as `name`, but allows ':' and '/' for namespacing."
+    },
+    "comment": {
+      "type": ["string", "null"],
+      "maxLength": 4096,
+      "description": "Free-form grader rationale. Defaults to null."
+    },
+    "metadata": {
+      "type": ["object", "null"],
+      "description": "Opaque grader-supplied metadata (rubric version, model temperature, dataset slice, etc.)."
+    },
+    "created_at": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "description": "Server-assigned creation timestamp. Populated on response."
+    }
+  }
+}

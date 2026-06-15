@@ -51,6 +51,8 @@ The agent path **hard-rejects** OpenAI fields it can't honestly map:
 - `GET  /v1/runs[/{id}[/events[/stream]]]` — durable runs + append-only event timeline
 - `GET  /v1/runs/active`, `POST /v1/runs/{id}/cancel` — in-flight registry + cancel
 - `POST /v1/runs/{id}/wait` — block until a run reaches a terminal state
+- `POST /v1/runs/{id}/scores`, `GET /v1/runs/{id}/scores` — eval-framework scoring sink
+- `GET  /v1/runs/export` — NDJSON stream of full runs (with captured request_body) for backfill grading
 - `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
 - `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
 - `GET  /v1/health`, `GET /v1/discovery`, `GET /v1/metrics` — liveness + endpoint inventory + dependency probes + runtime counters
@@ -105,9 +107,10 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
   - `server.py` — FastAPI app bootstrap + lifespan + agent-execution orchestration + the helpers each endpoint module imports lazily (idempotency wrappers, render, probes, webhooks, SSE framing). Routers are included from `endpoints/`; middleware from `middleware.py`.
   - `endpoints/` — one router per resource. Handlers lazy-import shared helpers from `server.py` to avoid module-load cycles.
     - `inference.py` — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
-    - `runs.py` — `/v1/runs`, `/v1/runs/{id}*`, `/v1/runs/active`, `/wait`, `/cancel`, `/events*`
+    - `runs.py` — `/v1/runs`, `/v1/runs/{id}*` (events, wait, cancel, scores), `/v1/runs/active`, `/v1/runs/export`
     - `schedules.py` — `/v1/schedules*`
     - `traces.py` — `/v1/traces*`
+  - `otel.py` — opt-in OTLP GenAI export (off by default; SDK lazy-imported only when `[otel] enabled = true`).
   - `middleware.py` — HTTP middleware stack (auth → correlation → body_size → rate_limit), registered on the app via `register_middleware(app)`.
   - `idempotency.py` — `Idempotency-Key` check/record/release + per-key locks (process-local; DB `ON CONFLICT` is the cross-process safety net).
   - `openai_compat.py` — request/response models (`ChatCompletionRequest`, `AsyncRunRequest`, `ScheduleRequest`, …) + OpenAI ↔ aitelier translation.
@@ -252,8 +255,8 @@ guidance: [`docs/INTEGRATION.md`](docs/INTEGRATION.md) → "Error handling".
 
 - Generated types in `_generated/` dirs — never hand-edit
 - Run directories on disk: `runs/{ISO-timestamp}_{task}/` (prompt, manifest)
-- Durable state in Postgres tables: `runs`, `run_events`, `schedules`,
-  `webhook_deliveries`, `schema_version`
+- Durable state in Postgres tables: `runs`, `run_events`, `run_scores`,
+  `schedules`, `webhook_deliveries`, `idempotency_keys`, `schema_version`
 - API versioning: `/v1/` prefix
 - Lockstep versioning across all packages
 - Kind values: `complete`, `embed`, `agent` (internal — runs.kind)
