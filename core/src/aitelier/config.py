@@ -181,6 +181,52 @@ class OllamaConfig:
 
 
 @dataclass
+class OtelConfig:
+    """OpenTelemetry GenAI export.
+
+    `enabled = false` by default — aitelier doesn't pay any OTel import
+    cost or emit any spans until an operator flips this on. When
+    enabled, install the OTel extras:
+
+        uv pip install aitelier[otel]
+
+    Spans use the GenAI semantic conventions
+    (https://opentelemetry.io/docs/specs/semconv/gen-ai/) so any
+    OTLP-compatible backend (Langfuse, Phoenix, Honeycomb, Datadog,
+    Grafana Tempo) ingests them without custom adapters.
+
+    `capture_content = false` by default — the conventions optionally
+    include `gen_ai.{user,system,assistant}.message` events carrying
+    the actual message content. Operators turn this on when they want
+    full prompt visibility in the trace backend; off keeps the spans
+    light (model/tokens/cost only) and avoids forwarding the same data
+    twice when aitelier's own `request_body` capture is the primary
+    audit record.
+    """
+    enabled: bool = False
+    endpoint: str | None = None
+    """OTLP collector endpoint. e.g. `http://localhost:4317` for grpc
+    (default port), `http://localhost:4318` for http/protobuf. When
+    unset, the OTel SDK falls back to env vars
+    (`OTEL_EXPORTER_OTLP_ENDPOINT`) — aitelier itself never reads env."""
+    protocol: str = "grpc"
+    """`grpc` (default, port 4317) or `http` (port 4318, protobuf over HTTP)."""
+    insecure: bool = True
+    """Disable TLS verification for the OTLP endpoint. Default true for
+    local-collector setups; flip to false when shipping to a remote
+    collector over the internet."""
+    service_name: str = "aitelier"
+    """Resource attribute `service.name`. Set to the operator's own
+    name (e.g., `aitelier-prod`, `aitelier-dev`) so multiple deployments
+    are distinguishable in the trace backend."""
+    capture_content: bool = False
+    """Emit `gen_ai.{user,system,assistant}.message` events carrying
+    the actual content. Off by default — spans stay light and we avoid
+    duplicating the data aitelier already records in `request_body` /
+    `rendered_messages`."""
+
+
+@dataclass
 class Config:
     litellm: LiteLLMConfig = field(default_factory=LiteLLMConfig)
     sandbox_agent: SandboxAgentConfig = field(default_factory=SandboxAgentConfig)
@@ -189,6 +235,7 @@ class Config:
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     purge: PurgeConfig = field(default_factory=PurgeConfig)
+    otel: OtelConfig = field(default_factory=OtelConfig)
     runs_dir: str = "runs"
 
 
@@ -304,6 +351,18 @@ def load_config(path: Path | None = None) -> Config:
             ),
             run_retention_days=_section("purge").get(
                 "run_retention_days", PurgeConfig.run_retention_days,
+            ),
+        ),
+        otel=OtelConfig(
+            enabled=_section("otel").get("enabled", OtelConfig.enabled),
+            endpoint=_section("otel").get("endpoint", OtelConfig.endpoint),
+            protocol=_section("otel").get("protocol", OtelConfig.protocol),
+            insecure=_section("otel").get("insecure", OtelConfig.insecure),
+            service_name=_section("otel").get(
+                "service_name", OtelConfig.service_name,
+            ),
+            capture_content=_section("otel").get(
+                "capture_content", OtelConfig.capture_content,
             ),
         ),
         runs_dir=raw.get("runs_dir", "runs"),

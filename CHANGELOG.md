@@ -7,6 +7,113 @@ relevant section.
 
 ## Unreleased
 
+### Added — Phase K (OpenTelemetry GenAI semantic conventions export)
+
+Opt-in OTLP span export per inference call, tagged with the [GenAI
+semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+so any OTLP-speaking backend (Jaeger, Tempo, Honeycomb, Datadog,
+Phoenix, Langfuse-via-OTel) can ingest aitelier traffic without
+adapter code.
+
+- **`[otel]` config section** in `aitelier.toml` — `enabled`,
+  `endpoint`, `protocol` (`grpc` / `http`), `insecure`, `service_name`,
+  `capture_content`. Off by default; zero request-path cost when
+  disabled.
+- **Optional install** via `pip install 'aitelier[otel]'`. The OTel
+  SDK + OTLP exporters are *not* default dependencies — a vanilla
+  install pays no import cost. If `[otel] enabled = true` but the
+  SDK isn't installed, aitelier logs one WARN at startup and inference
+  keeps working (instrumentation call sites are no-ops when the tracer
+  was never set).
+- **`aitelier.otel`** — pure attribute builders (`gen_ai_system_for_model`,
+  `gen_ai_request_attrs`, `gen_ai_response_attrs`) plus
+  `record_inference_span(operation, request_body, result, …)`. The
+  builders are SDK-free and testable on a default install.
+- **System mapping**: `claude-*` / `anthropic/*` → `anthropic`,
+  `gpt-*` / `o1-*` / `o3-*` / `openai/*` → `openai`, `gemini-*` →
+  `gemini`, `ollama/*` / `local` → `ollama`, agent backends →
+  `aitelier.agent.<backend>` (custom namespace — OTel's registry has
+  no canonical name for sandboxed agent runtimes), unknown → `_OTHER`.
+- **Instrumented at all 4 inference call sites**:
+  - `_llm_chat_completion` (sync LLM)
+  - `_llm_chat_completion_stream` (streaming LLM — span fires after
+    the stream terminates, with accumulated usage)
+  - `_agent_chat_completion` (sync + streaming agent — both paths
+    funnel through one call after the agent run completes)
+  - `endpoints/inference.py:embeddings_endpoint` (operation =
+    `embeddings`)
+- **Error spans** carry `error.type` + `error.message` and a non-OK
+  span status. Trace backends can filter for failed inference without
+  parsing logs.
+- **Content opt-in**. `[otel] capture_content = true` emits each
+  message as a span event (`gen_ai.system.message`,
+  `gen_ai.user.message`, `gen_ai.assistant.message`,
+  `gen_ai.tool.message`) following the convention's content-as-events
+  model. Defaults to off — message bodies routinely carry PII /
+  secrets, and the destination collector's retention isn't aitelier's
+  to assume.
+- **One span per request, not per agent turn.** Agent-path runs
+  collapse the entire run (turns + tool calls) into a single span.
+  Per-turn detail still lives in `run_events` — OTel sees the outer
+  shape.
+- **38 new unit tests** in `test_otel.py` covering:
+  - Pure builders: system mapping (Anthropic / OpenAI / Gemini / Ollama
+    / `aitelier.agent.*` / `_OTHER`), request attribute extraction
+    (model, max_tokens precedence, temperature / top_p / frequency /
+    presence penalties, stop sequences, partial bodies), response
+    attribute extraction (OpenAI shape, aitelier agent shape,
+    finish-reason deduplication, empty-input tolerance).
+  - Span emission against an in-memory exporter: full attribute set
+    lands, span name format (`"chat <model>"` vs. operation-only),
+    error path (`error.type` + non-OK status + error description),
+    content-event opt-in (off by default, on emits per-role events,
+    skipped for embeddings regardless).
+  - Lifecycle: `init_tracer_provider` is a no-op when disabled and
+    idempotent when already initialized; `shutdown_tracer_provider`
+    is safe to call uninitialized.
+  - `OtelConfig` TOML loading: explicit `[otel]` section hydrates all
+    six fields; absent section keeps defaults (enabled = false).
+  - Exporter selection: `protocol = "grpc"` returns the gRPC
+    OTLPSpanExporter; `protocol = "http"` returns the HTTP exporter.
+  - **End-to-end HTTP integration**: TestClient against the real
+    FastAPI app proves the LLM (sync + streaming), agent (sync +
+    streaming), and embeddings (`POST /v1/embeddings`) endpoints all
+    invoke `record_inference_span` with the correct operation, model,
+    system attribute, and token usage. Streaming-path spans verify the
+    `finally`-block emission (LLM) and the detached `_finalize_stream_run`
+    emission (agent) — both fire after the SSE stream terminates and
+    carry the accumulated usage. The detached task is tracked in
+    `_pending_finalize_tasks` so the agent-stream test joins
+    deterministically (no polling, no flakes).
+  - **Lifespan integration**: `with TestClient(app) as c:` triggers
+    real startup/shutdown — verifies `init_tracer_provider` runs (sets
+    `_tracer`) and `shutdown_tracer_provider` runs (clears it).
+  - **SDK-missing graceful degradation**: stubs `opentelemetry.*`
+    out of `sys.modules` and asserts `init_tracer_provider` logs the
+    install-hint WARNING and returns without setting `_tracer`.
+  - **Best-effort guard**: `record_inference_span` swallows SDK-side
+    failures (bad attr, exporter bug) — a `start_as_current_span` that
+    raises surfaces as a WARNING, never as a propagated exception.
+  - **`BatchSpanProcessor` flushes on shutdown**: install a real batch
+    processor + in-memory exporter, emit a span, call
+    `shutdown_tracer_provider`, assert the buffered span landed.
+
+  Robustness changes alongside the new tests:
+  - `record_inference_span` now wraps its body in a best-effort
+    try/except — a regression in the OTel SDK can't turn into a 500
+    on the inference path.
+  - `_finalize_stream_run` reorders durability before observability:
+    storage finalize + idempotency cache write happen *before* the
+    OTel span emission, so an observability failure can't leave the
+    idem lock released without a cache row (which would cause a retry
+    under the same key to re-execute the agent).
+- **`docs/INTEGRATION.md`** gains an "Observability — OpenTelemetry
+  export" section documenting the config, install, attribute mapping,
+  content-event opt-in, and the one-span-per-request scope decision.
+
+Net: 412 unit tests pass (was 374 at the end of Phase J). No request-
+path cost when disabled. Default-install behavior unchanged.
+
 ### Added — Phase J (request body persistence — eval/replay/OTel foundation)
 
 Storage migration v4 + plumbing to capture the actual request body
@@ -59,7 +166,7 @@ export — all of which need the captured input to function.
   semantics, the redaction guarantee, and the four downstream surfaces
   this unblocks.
 
-Net: 399 unit tests pass (was 366 at the end of Phase I). No backward
+Net: 374 unit tests pass (was 363 at the end of Phase I). No backward
 compat breaks — pre-v4 rows surface `null` for both fields. New
 queries against `/v1/runs/{id}` see populated values for runs created
 after the migration.

@@ -146,6 +146,15 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
         return resp
 
     result = await record_run(spec, _do())
+    # OTel: emit a gen_ai.embeddings span. No-op when disabled.
+    from aitelier.otel import record_inference_span
+    record_inference_span(
+        operation="embeddings",
+        request_body=spec.request_body,
+        result=result if result.get("status") != "error" else None,
+        error_type=result.get("error_type"),
+        error_msg=result.get("error_msg"),
+    )
     if result.get("status") == "error":
         return _render_chat_completion(chat_completion_error_envelope(
             result, run_id=run_id, correlation_id=cid,

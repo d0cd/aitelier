@@ -36,6 +36,14 @@ phase-by-phase history, read the code or `git log`.
 - `GET /v1/traces`, `GET /v1/traces/{id}`, `GET /v1/traces/aggregates`.
 - Correlation-ID middleware: echo header, body field, every SSE chunk, run.metadata.
 - Structured logging (`[service] log_format = "json"`) — aggregator-friendly.
+- **OpenTelemetry GenAI export** (opt-in, `[otel] enabled = true`).
+  One OTLP span per inference call tagged with the GenAI semantic
+  conventions (`gen_ai.system`, `gen_ai.request.*`, `gen_ai.response.*`,
+  `gen_ai.usage.*`). Optional install via `aitelier[otel]`; default
+  install pays no import cost. Any OTLP backend (Jaeger, Tempo,
+  Honeycomb, Datadog, Phoenix, Langfuse-via-OTel) ingests without
+  adapter code. Content opt-in (`capture_content = true`) emits message
+  bodies as span events; off by default.
 
 ### Schedules + webhooks
 
@@ -212,16 +220,6 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
 
 ### Tier 2 — table stakes; ship when pain forces it
 
-- **OpenTelemetry GenAI semantic conventions.** Emit run/event/trace
-  data via OTLP using the GenAI semantic conventions (`gen_ai.*`
-  attributes) so the existing observability ecosystem (Grafana,
-  Datadog, Jaeger, Honeycomb, Langfuse, Phoenix) consumes it without
-  custom adapters. Highest-leverage interop move: converts the
-  N×M (every eval/observability tool × every gateway) into N+M.
-  Complement to the eval-substrate Tier-1 item above — that one
-  exposes raw data on aitelier's API; this one exposes the same
-  data through the standard wire format every eval/observability
-  tool already speaks.
 - **Response caching (exact + semantic).** Builds on `/v1/embeddings`
   for semantic match, Postgres for storage. Opt-in via
   `aitelier.cache: {mode, ttl}`. Real cost savings; commoditized

@@ -1199,6 +1199,73 @@ happen inside the Sandbox Agent process and go directly to Anthropic /
 OpenAI, bypassing LiteLLM. Token usage *is* captured when the backend
 surfaces it (`runs.input_tokens` / `output_tokens` / `total_tokens`).
 
+## Observability — OpenTelemetry export
+
+aitelier can emit one OTLP span per inference request, tagged with the
+[GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
+(`gen_ai.system`, `gen_ai.request.*`, `gen_ai.response.*`,
+`gen_ai.usage.*`). Point any OTLP-speaking backend at the configured
+endpoint and you'll see request/response shape, model, token counts,
+finish reason, and error type per call.
+
+The export is **off by default** and the OTel SDK is an optional
+dependency — a default install pays no import cost.
+
+**Install:**
+
+```bash
+uv pip install 'aitelier[otel]'
+```
+
+**Enable** in `aitelier.toml`:
+
+```toml
+[otel]
+enabled         = true
+endpoint        = "http://localhost:4317"   # OTLP collector
+protocol        = "grpc"                    # "grpc" (4317) or "http" (4318)
+insecure        = true                      # grpc only; http infers from URL scheme
+service_name    = "aitelier"
+capture_content = false                     # true → emit message bodies as span events
+```
+
+**What gets exported** (one span per request):
+
+| Attribute | Source |
+|---|---|
+| `gen_ai.operation.name` | `chat` or `embeddings` |
+| `gen_ai.system` | `anthropic`, `openai`, `gemini`, `ollama`, or `aitelier.agent.<backend>` |
+| `gen_ai.request.model` | request `model` field |
+| `gen_ai.request.max_tokens` | request `max_completion_tokens` ?? `max_tokens` |
+| `gen_ai.request.temperature` | request `temperature` |
+| `gen_ai.request.top_p` | request `top_p` |
+| `gen_ai.request.stop_sequences` | request `stop` (string or array) |
+| `gen_ai.response.id` | response `id` |
+| `gen_ai.response.model` | response `model` |
+| `gen_ai.response.finish_reasons` | deduplicated tuple across choices |
+| `gen_ai.usage.input_tokens` | `usage.prompt_tokens` or `usage.input_tokens` |
+| `gen_ai.usage.output_tokens` | `usage.completion_tokens` or `usage.output_tokens` |
+
+**Error spans** carry `error.type` + `error.message` and a non-OK status
+so trace backends can filter for failed inference without parsing logs.
+
+**Content opt-in.** Messages are *not* exported unless `capture_content
+= true`. With it on, each `system` / `user` / `assistant` / `tool`
+message is emitted as a span event (`gen_ai.{role}.message`) following
+the GenAI convention's content-as-events model. Enable only when you've
+audited the destination collector for retention and access — message
+bodies routinely contain customer data, secrets, and PII.
+
+**One span per request, not per agent turn.** Agent-path runs collapse
+the entire run (all internal turns + tool calls) into a single span.
+Per-turn detail still lives in `run_events` (and `/v1/runs/{id}/events`)
+— OTel sees the outer shape only.
+
+**Graceful degradation.** If `[otel] enabled = true` but the SDK isn't
+installed, you get one WARN log at startup and inference keeps working
+— the instrumentation call sites are no-ops when the tracer wasn't
+initialized. No request-path cost when disabled.
+
 ## SDK reference
 
 Both SDKs share the same shape: a thin `Aitelier` client for the control

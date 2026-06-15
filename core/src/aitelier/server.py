@@ -324,6 +324,12 @@ async def lifespan(app: FastAPI):
     from aitelier.purge_worker import start_purge_worker, stop_purge_worker
     start_purge_worker()
 
+    # Initialize OpenTelemetry GenAI export if [otel] enabled. No-op
+    # when disabled (the default) — modules that aren't using OTel
+    # never see the import cost.
+    from aitelier.otel import init_tracer_provider, shutdown_tracer_provider
+    init_tracer_provider()
+
     # Health check LiteLLM proxy. /health/liveness — no auth, no upstream
     # provider probing. /health would 5xx on transient backend issues (e.g.
     # OpenAI 429) and falsely log the proxy as unreachable on startup.
@@ -359,6 +365,11 @@ async def lifespan(app: FastAPI):
     stop_webhook_worker()
     stop_purge_worker()
 
+    # Flush + shut down the OpenTelemetry tracer provider so the last
+    # batch of spans reaches the collector. No-op when OTel wasn't
+    # initialized.
+    shutdown_tracer_provider()
+
     # Release the shared HTTP client pool.
     from aitelier.providers.llm import close_shared_client
     await close_shared_client()
@@ -393,6 +404,14 @@ _register_middleware(app)
 # Single-process assumption; if aitelier ever scales horizontally this
 # moves to a shared store.
 _active_runs: dict[str, asyncio.Task] = {}
+
+# Detached finalize tasks spawned by streaming agent responses. The
+# `event_generator`'s finally clause can be interrupted by client
+# disconnect, so storage finalize + idempotency cache run in a
+# background task. We track them here so tests can await pending
+# finalizes deterministically; production drops entries on completion
+# via add_done_callback.
+_pending_finalize_tasks: set[asyncio.Task] = set()
 
 
 def _reject_if_saturated() -> None:
@@ -825,6 +844,19 @@ async def _agent_chat_completion(
         _active_runs.pop(run_id, None)
         await _stop_sidecars(prep_result.get("sidecars") or [])
 
+    # OTel: emit the gen_ai.chat span for this agent run. We pass the
+    # caller's request_body (captured into spec earlier) and the result
+    # envelope so input/output tokens, finish_reason, and the rendered
+    # model land on the span. No-op when `[otel] enabled = false`.
+    from aitelier.otel import record_inference_span
+    record_inference_span(
+        operation="chat",
+        request_body=spec.request_body,
+        result=result if result.get("status") != "error" else None,
+        error_type=result.get("error_type"),
+        error_msg=result.get("error_msg"),
+    )
+
     if result.get("status") == "error":
         status, body = agent_error_to_chat_completion_error(result)
         body["aitelier_status_code"] = status
@@ -1121,11 +1153,15 @@ async def _agent_chat_completion_stream(
             # releases the per-key lock regardless of caching. The
             # `should_cache` decision controls whether we *record* the
             # response, not whether we release the lock.
-            asyncio.create_task(_finalize_stream_run(
+            _task = asyncio.create_task(_finalize_stream_run(
                 run_id=run_id, final=final, state=state,
                 idem=idem,
                 recorded_chunks=recorded_chunks if should_cache else None,
+                otel_request_body=req.model_dump(exclude_none=True),
+                otel_model=req.model,
             ))
+            _pending_finalize_tasks.add(_task)
+            _task.add_done_callback(_pending_finalize_tasks.discard)
 
     return _sse_response(event_generator())
 
@@ -1133,6 +1169,7 @@ async def _agent_chat_completion_stream(
 async def _finalize_stream_run(
     *, run_id: str, final: dict, state: str,
     idem: _IdempotencyContext | None, recorded_chunks: list[dict] | None,
+    otel_request_body: dict | None = None, otel_model: str | None = None,
 ) -> None:
     """Run the storage write + optional idempotency cache for a streaming
     agent run in its own task. The caller (event_generator's finally) may
@@ -1147,6 +1184,12 @@ async def _finalize_stream_run(
         except (KeyError, ValueError):
             # Race: cancel endpoint or another path already finalized.
             pass
+        # Durability writes (finalize + idem cache) MUST land before any
+        # observability emission. record_inference_span has its own
+        # best-effort guard, but ordering still matters: if anything in
+        # the finalize path raises into the outer except, the lock is
+        # released without a cache row — and a retry would re-execute
+        # the agent. Cache first, observe second.
         if idem is not None and recorded_chunks is not None:
             await _record_idempotency(idem, {
                 "_aitelier_stream": True,
@@ -1159,6 +1202,28 @@ async def _finalize_stream_run(
             # retry under the same key isn't blocked. We don't write a
             # cache row in this case, so the retry will re-run.
             _release_idempotency_ctx(idem)
+        # OTel: emit gen_ai.chat span for this streaming agent run.
+        # Synthesize an OpenAI-shape result so `gen_ai_response_attrs`
+        # finds usage in the OpenAI slots. No-op when OTel is disabled;
+        # internally guarded against SDK-side failure.
+        if otel_request_body is not None:
+            from aitelier.otel import record_inference_span
+            ok = final.get("status") != "error"
+            synth = {
+                "model": otel_model,
+                "choices": [{"finish_reason": final.get("finish_reason")}],
+                "usage": {
+                    "prompt_tokens": (final.get("usage") or {}).get("input_tokens", 0),
+                    "completion_tokens": (final.get("usage") or {}).get("output_tokens", 0),
+                },
+            } if ok else None
+            record_inference_span(
+                operation="chat",
+                request_body=otel_request_body,
+                result=synth,
+                error_type=final.get("error_type"),
+                error_msg=final.get("error_msg"),
+            )
     except Exception as exc:
         logger.warning(
             "background finalize for stream run %s failed: %s",
@@ -1234,6 +1299,17 @@ async def _llm_chat_completion(
         return resp
 
     result = await record_run(spec, _do())
+    # OTel: emit a gen_ai.chat span describing this LLM call. No-op when
+    # `[otel] enabled = false` (the default). Off the hot path, after
+    # the run is durably recorded.
+    from aitelier.otel import record_inference_span
+    record_inference_span(
+        operation="chat",
+        request_body=spec.request_body,
+        result=result if result.get("status") != "error" else None,
+        error_type=result.get("error_type"),
+        error_msg=result.get("error_msg"),
+    )
     if result.get("status") == "error":
         return chat_completion_error_envelope(
             result, run_id=run_id, correlation_id=cid,
@@ -1374,6 +1450,28 @@ async def _llm_chat_completion_stream(
                 state = "failed" if final.get("status") == "error" else "completed"
                 store = await get_store()
                 await store.finalize_run(run_id, final, state=state)
+                # OTel: emit gen_ai.chat span after the stream terminates,
+                # carrying accumulated usage + finish_reason. No-op when
+                # OTel is disabled. Synthesize a chat-completions-shape
+                # result so `gen_ai_response_attrs` finds usage in the
+                # OpenAI slots (`prompt_tokens` / `completion_tokens`).
+                from aitelier.otel import record_inference_span
+                ok = final.get("status") != "error"
+                synth = {
+                    "model": req.model,
+                    "choices": [{"finish_reason": final.get("finish_reason")}],
+                    "usage": {
+                        "prompt_tokens": (final.get("usage") or {}).get("input_tokens", 0),
+                        "completion_tokens": (final.get("usage") or {}).get("output_tokens", 0),
+                    },
+                } if ok else None
+                record_inference_span(
+                    operation="chat",
+                    request_body=req.model_dump(exclude_none=True),
+                    result=synth,
+                    error_type=final.get("error_type"),
+                    error_msg=final.get("error_msg"),
+                )
 
     return _sse_response(event_generator())
 
