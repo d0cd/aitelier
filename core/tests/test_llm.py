@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -20,6 +21,8 @@ from aitelier.providers.ollama import (
     _resolve_ollama_model,
     chat_completion_via_ollama,
     chat_completion_via_ollama_stream,
+)
+from aitelier.providers.ollama import (
     routes_to_ollama as _routes_to_ollama,
 )
 
@@ -533,6 +536,59 @@ def test_resolve_ollama_model_strips_prefix_and_resolves_local():
     assert _resolve_ollama_model("local") == "qwen3:8b"
 
 
+def test_ollama_finish_reason_tool_calls_non_stream():
+    """Ollama reports done_reason='stop' even when the turn ended to call a
+    tool; we must surface finish_reason='tool_calls' so OpenAI consumers
+    drive the tool loop instead of treating the turn as final."""
+    resp = {
+        "message": {
+            "role": "assistant", "content": "",
+            "tool_calls": [{"function": {"name": "get_weather", "arguments": {}}}],
+        },
+        "done_reason": "stop",
+        "prompt_eval_count": 3, "eval_count": 1,
+    }
+    out = _ollama_to_chat_completion(resp, request_model="local")
+    assert out["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_ollama_finish_reason_stop_without_tool_calls():
+    """No tool_calls → the mapped done_reason still wins."""
+    resp = {"message": {"role": "assistant", "content": "hi"}, "done_reason": "stop"}
+    out = _ollama_to_chat_completion(resp, request_model="local")
+    assert out["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.asyncio
+async def test_ollama_stream_finish_reason_tool_calls(monkeypatch):
+    """A tool_calls delta anywhere in the stream → terminal chunk reports
+    finish_reason='tool_calls', not 'stop'."""
+    lines = [
+        json.dumps({"message": {"role": "assistant",
+                                 "tool_calls": [{"function": {"name": "f"}}]},
+                    "done": False}),
+        json.dumps({"message": {}, "done": True, "done_reason": "stop",
+                    "prompt_eval_count": 2, "eval_count": 1}),
+    ]
+    fake_client = MagicMock()
+    fake_client.stream = MagicMock(return_value=_fake_stream_response(lines))
+
+    async def fake_get_shared():
+        return fake_client
+    monkeypatch.setattr("aitelier.providers.llm.get_shared_client", fake_get_shared)
+
+    chunks = [c async for c in chat_completion_via_ollama_stream(
+        {"model": "local", "messages": [{"role": "user", "content": "hi"}]},
+        timeout=10,
+    )]
+    finish_reasons = [
+        ch["choices"][0]["finish_reason"]
+        for ch in chunks
+        if ch.get("choices") and ch["choices"][0].get("finish_reason")
+    ]
+    assert finish_reasons == ["tool_calls"]
+
+
 def test_build_ollama_request_translates_max_tokens_and_temperature():
     out = _build_ollama_request({
         "model": "ollama/qwen3:8b",
@@ -858,16 +914,23 @@ async def test_chat_completion_via_ollama_stream_yields_openai_chunks(monkeypatc
     # Some chunk in the middle should carry content "!"
     contents = [
         c["choices"][0]["delta"].get("content")
-        for c in chunks if c["choices"][0].get("delta", {}).get("content")
+        for c in chunks
+        if c["choices"] and c["choices"][0].get("delta", {}).get("content")
     ]
     assert "Hi" in contents and "!" in contents
 
-    # Final chunk must carry usage + finish_reason
-    final = chunks[-1]
-    assert final["usage"]["prompt_tokens"] == 3
-    assert final["usage"]["completion_tokens"] == 2
-    finish_reasons = [c.get("finish_reason") for c in final["choices"]]
+    # finish_reason rides on its own (one-choice) frame.
+    finish_reasons = [
+        c["choices"][0].get("finish_reason")
+        for c in chunks if c["choices"]
+    ]
     assert "stop" in finish_reasons
+
+    # Usage rides on a dedicated empty-choices frame (include_usage convention).
+    usage_frame = chunks[-1]
+    assert usage_frame["choices"] == []
+    assert usage_frame["usage"]["prompt_tokens"] == 3
+    assert usage_frame["usage"]["completion_tokens"] == 2
 
 
 @pytest.mark.asyncio
@@ -914,3 +977,23 @@ async def test_chat_completion_via_ollama_stream_raises_on_5xx(monkeypatch):
         ):
             pass
     assert exc_info.value.status_code == 502
+
+
+def test_build_ollama_request_forwards_sampling_and_tools():
+    """seed/stop/penalties map to options; tools to top-level — previously
+    silently dropped on the Ollama bypass."""
+    from aitelier.providers.ollama import _build_ollama_request
+    out = _build_ollama_request({
+        "model": "local",
+        "messages": [{"role": "user", "content": "hi"}],
+        "seed": 7,
+        "stop": "END",
+        "frequency_penalty": 0.2,
+        "presence_penalty": 0.3,
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+    }, stream=False)
+    assert out["options"]["seed"] == 7
+    assert out["options"]["stop"] == ["END"]
+    assert out["options"]["frequency_penalty"] == 0.2
+    assert out["options"]["presence_penalty"] == 0.3
+    assert out["tools"] == [{"type": "function", "function": {"name": "f"}}]

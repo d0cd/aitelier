@@ -12,8 +12,6 @@ Endpoints surfaced here:
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from fastapi import APIRouter, HTTPException, Query
 
 from aitelier.storage import RunFilter, get_store
@@ -27,24 +25,27 @@ async def traces_endpoint(
     trace_tag: str | None = None,
     parent_run_id: str | None = None,
     status: str | None = None,
+    state: str | None = None,
     limit: int = Query(50, ge=1, le=500),
 ) -> list[dict]:
     """Query recent runs as TraceRecord summaries (counts, tokens, cost).
 
-    `parent_run_id` narrows to children of a specific parent — useful
-    for rendering a multi-agent workflow's subtree as a flat trace list.
+    Both filter axes are supported: `status` ∈ {ok, error, cancelled} is
+    the terminal outcome (None while in flight, so `?status=running`
+    returns nothing — use `state` for that); `state` ∈ {pending, running,
+    completed, …} is the lifecycle position. `parent_run_id` narrows to
+    children of a specific parent — useful for rendering a multi-agent
+    workflow's subtree as a flat trace list.
     """
-    from aitelier.server import _run_to_trace_dict
+    from aitelier.server import _parse_iso_param, _run_to_trace_dict
 
     store = await get_store()
-    since_dt = datetime.fromisoformat(since) if since else None
+    since_dt = _parse_iso_param("since", since)
     flt = RunFilter(
         trace_tag=trace_tag, parent_run_id=parent_run_id,
-        since=since_dt, limit=limit,
+        status=status, state=state, since=since_dt, limit=limit,
     )
     runs = await store.list_runs(flt)
-    if status:
-        runs = [r for r in runs if r.status == status]
     return [_run_to_trace_dict(r) for r in runs]
 
 
@@ -59,9 +60,11 @@ async def traces_aggregates_endpoint(
 
     `group_by` ∈ {trace_tag, kind, model, agent_id, status, error_type, day}.
     """
+    from aitelier.server import _parse_iso_param
+
     store = await get_store()
-    since_dt = datetime.fromisoformat(since) if since else None
-    until_dt = datetime.fromisoformat(until) if until else None
+    since_dt = _parse_iso_param("since", since)
+    until_dt = _parse_iso_param("until", until)
     try:
         return await store.aggregate_runs(
             group_by=group_by, since=since_dt, until=until_dt, trace_tag=trace_tag,

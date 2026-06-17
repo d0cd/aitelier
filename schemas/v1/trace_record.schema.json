@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/trace_record.schema.json",
+  "title": "TraceRecord",
+  "description": "Trace summary from the trace store. Returned by GET /v1/traces.",
+  "type": "object",
+  "required": ["trace_id", "started_at"],
+  "properties": {
+    "trace_id":           { "type": "string" },
+    "started_at":         { "type": "string" },
+    "ended_at":           { "type": ["string", "null"] },
+    "model":              { "type": ["string", "null"] },
+    "kind":               { "type": ["string", "null"] },
+    "finish_reason":      { "type": ["string", "null"] },
+    "tool_call_count":    { "type": "integer", "default": 0 },
+    "input_tokens":       { "type": "integer", "default": 0 },
+    "output_tokens":      { "type": "integer", "default": 0 },
+    "total_tokens":       { "type": "integer", "default": 0 },
+    "cost_usd":           { "type": ["number", "null"] },
+    "system_prompt_hash": { "type": ["string", "null"] },
+    "trace_tag":          { "type": ["string", "null"] },
+    "parent_run_id":      { "type": ["string", "null"] },
+    "status":             { "type": ["string", "null"] },
+    "error_type":         { "type": ["string", "null"] },
+    "error_msg":          { "type": ["string", "null"] },
+    "metadata":           { "type": "object", "default": {} }
+  }
+}

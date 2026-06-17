@@ -10,8 +10,8 @@ Tests can inject this directly via `_set_store_for_tests` in
 
 from __future__ import annotations
 
-import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -73,11 +73,16 @@ class InMemoryStore:
         return run
 
     async def get_run(self, run_id: str) -> Run | None:
-        return self._runs.get(run_id)
+        run = self._runs.get(run_id)
+        # Return a copy so callers can't mutate the canonical row — matches
+        # PostgresStore, which rebuilds a fresh dataclass per read.
+        return replace(run) if run is not None else None
 
     async def list_runs(self, flt: RunFilter) -> list[Run]:
         def _match(r: Run) -> bool:
             if flt.state and r.state != flt.state:
+                return False
+            if flt.status and r.status != flt.status:
                 return False
             if flt.kind and r.kind != flt.kind:
                 return False
@@ -98,7 +103,7 @@ class InMemoryStore:
             filter(_match, self._runs.values()),
             key=lambda r: r.started_at, reverse=True,
         )
-        return rows[: flt.limit]
+        return [replace(r) for r in rows[: flt.limit]]
 
     async def update_run_state(self, run_id: str, new_state: RunState,
                                  *, ended_at: datetime | None = None) -> None:
@@ -125,15 +130,30 @@ class InMemoryStore:
         if sandbox_backend is not None:
             run.sandbox_backend = sandbox_backend
 
-    async def mark_orphaned_running_runs(self) -> int:
-        n = 0
+    async def mark_orphaned_running_runs(self) -> list[str]:
+        flipped: list[str] = []
         now = datetime.now(UTC)
         for run in self._runs.values():
             if run.state in ("pending", "running"):
                 run.state = "orphaned"
                 run.ended_at = run.ended_at or now
-                n += 1
-        return n
+                flipped.append(run.run_id)
+        return flipped
+
+    async def runs_awaiting_webhook(self, since: datetime | None = None) -> list[Run]:
+        with_delivery = {w.run_id for w in self._webhooks.values() if w.run_id}
+        out: list[Run] = []
+        for run in self._runs.values():
+            # `orphaned` included so a crash mid orphan-webhook-loop (which
+            # leaves some orphaned runs without a delivery row) is recovered.
+            if run.state not in ("completed", "failed", "cancelled", "orphaned"):
+                continue
+            if since is not None and not (run.ended_at and run.ended_at >= since):
+                continue
+            meta = run.metadata if isinstance(run.metadata, dict) else {}
+            if meta.get("webhook_url") and run.run_id not in with_delivery:
+                out.append(run)
+        return out
 
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None:
@@ -285,7 +305,10 @@ class InMemoryStore:
             if w.state == "pending" and (w.next_attempt_at is None or w.next_attempt_at <= now)
         ][:limit]
         for w in due:
-            w.attempts += 1
+            # Visibility timeout so a concurrent worker doesn't re-grab it.
+            # Attempts are counted in record_webhook_attempt (after the delivery
+            # actually runs) so a crash between claim and record doesn't burn an
+            # attempt — the row is reclaimed after the timeout.
             w.last_attempt_at = now
             w.next_attempt_at = now + timedelta(minutes=5)
         return due
@@ -297,6 +320,7 @@ class InMemoryStore:
         w = self._webhooks.get(delivery_id)
         if w is None:
             return
+        w.attempts += 1
         w.last_status_code = status_code
         w.last_error = error
         w.next_attempt_at = next_attempt_at
@@ -325,7 +349,11 @@ class InMemoryStore:
         if rec is None:
             return None
         if rec.expires_at <= datetime.now(UTC):
-            self._idempotency.pop(key, None)
+            # Expired: treat as absent but DON'T pop — PostgresStore filters
+            # expired rows in the WHERE clause and leaves them for the purge
+            # worker to delete. Popping here would let a re-record succeed in
+            # memory while Postgres (ON CONFLICT DO NOTHING on the lingering
+            # row) blocks it until purge — a store-divergence bug.
             return None
         return rec
 
@@ -356,7 +384,13 @@ class InMemoryStore:
         return stored
 
     async def list_run_scores(self, run_id: str) -> list[RunScore]:
-        return [s for s in self._scores if s.run_id == run_id]
+        # Order by (created_at, id) to match PostgresStore — `id` breaks ties
+        # when two scores share a created_at so latest-wins (`[-1]`) is
+        # deterministic across both stores.
+        return sorted(
+            (s for s in self._scores if s.run_id == run_id),
+            key=lambda s: (s.created_at, s.id),
+        )
 
 
 # ---------------------------------------------------------------------------

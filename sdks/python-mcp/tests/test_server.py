@@ -94,6 +94,32 @@ async def test_submit_run_forwards_to_sdk_with_aitelier_opts(server, fake_client
 
 
 @pytest.mark.asyncio
+async def test_submit_run_forwards_prepare_artifacts_and_top_level(server, fake_client):
+    """prepare/artifacts/reasoning_effort/examples ride in the aitelier block;
+    timeout + correlation_id are forwarded as top-level submit_run args."""
+    await _call_tool(
+        server, "submit_run",
+        model="agent:claude",
+        messages=[{"role": "user", "content": "hi"}],
+        reasoning_effort="high",
+        prepare={"commands": [{"run": "pip install -e ."}]},
+        artifacts={"fetch": ["/workspace/out.json"]},
+        examples=[{"user": "q", "assistant": "a"}],
+        timeout=900,
+        correlation_id="cid-xyz",
+    )
+    kwargs = fake_client.submit_run.await_args.kwargs
+    assert kwargs["timeout"] == 900
+    assert kwargs["correlation_id"] == "cid-xyz"
+    assert kwargs["aitelier_opts"] == {
+        "reasoning_effort": "high",
+        "prepare": {"commands": [{"run": "pip install -e ."}]},
+        "artifacts": {"fetch": ["/workspace/out.json"]},
+        "examples": [{"user": "q", "assistant": "a"}],
+    }
+
+
+@pytest.mark.asyncio
 async def test_submit_run_omits_aitelier_block_when_no_options(server, fake_client):
     """Bare submission without parent / trace / workspace shouldn't
     send an empty `aitelier: {}` block — let aitelier defaults apply."""
@@ -144,8 +170,10 @@ async def test_tool_catalog_complete(server):
     tools = await server.list_tools()
     names = {t.name for t in tools}
     assert names == {
-        "submit_run", "get_run", "list_runs",
-        "list_run_events", "cancel_run", "get_my_run_id",
+        "submit_run", "get_run", "list_runs", "list_run_events",
+        "cancel_run", "wait_for_run", "get_my_run_id",
+        "add_run_score", "list_run_scores",
+        "recent_traces", "aggregate_traces", "list_active_runs", "discovery",
     }
 
 

@@ -25,7 +25,6 @@ import asyncio
 import json
 import os
 import time
-from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -62,7 +61,10 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
         _validate_aitelier_opts,
     )
 
-    route, agent_backend, inner_llm = parse_model_route(req.model)
+    try:
+        route, agent_backend, inner_llm = parse_model_route(req.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     if route != "agent":
         raise HTTPException(
             status_code=400,
@@ -135,6 +137,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
 @router.get("/v1/runs")
 async def list_runs_endpoint(
     state: str | None = None,
+    status: str | None = None,
     kind: str | None = None,
     agent_id: str | None = None,
     trace_tag: str | None = None,
@@ -145,16 +148,19 @@ async def list_runs_endpoint(
 ) -> list[dict]:
     """List runs from the durable store with optional filters.
 
-    `state` ∈ {pending, running, completed, failed, cancelled, orphaned}.
-    `parent_run_id` filters to children of a specific parent — the
-    primary way to reconstruct a multi-agent workflow's tree.
+    Two filter axes, both supported (see the Run dataclass docstring):
+    `state` ∈ {pending, running, completed, failed, cancelled, orphaned}
+    is the lifecycle position; `status` ∈ {ok, error, cancelled} is the
+    terminal outcome (None while pending/running). `parent_run_id` filters
+    to children of a specific parent — the primary way to reconstruct a
+    multi-agent workflow's tree.
     """
-    from aitelier.server import _run_to_dict
+    from aitelier.server import _parse_iso_param, _run_to_dict
 
     store = await get_store()
-    since_dt = datetime.fromisoformat(since) if since else None
+    since_dt = _parse_iso_param("since", since)
     runs = await store.list_runs(RunFilter(
-        state=state, kind=kind, agent_id=agent_id,
+        state=state, status=status, kind=kind, agent_id=agent_id,
         trace_tag=trace_tag, correlation_id=correlation_id,
         parent_run_id=parent_run_id,
         since=since_dt, limit=limit,
@@ -254,7 +260,7 @@ async def export_runs_endpoint(
     """
     from fastapi.responses import StreamingResponse
 
-    from aitelier.server import _run_to_dict
+    from aitelier.server import _parse_iso_param, _run_to_dict
 
     flt_kwargs: dict = {"limit": limit}
     if trace_tag is not None:
@@ -264,14 +270,9 @@ async def export_runs_endpoint(
     if state is not None:
         flt_kwargs["state"] = state
     for key, val in (("since", since), ("until", until)):
-        if val is not None:
-            try:
-                flt_kwargs[key] = datetime.fromisoformat(val)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"{key} must be ISO-8601: {exc}",
-                ) from None
+        parsed = _parse_iso_param(key, val)
+        if parsed is not None:
+            flt_kwargs[key] = parsed
 
     store = await get_store()
     runs = await store.list_runs(RunFilter(**flt_kwargs))
@@ -384,7 +385,11 @@ async def get_run(run_id: str) -> dict:
         manifest_path = run_dir / "manifest.json"
         if manifest_path.exists():
             try:
-                body["manifest"] = json.loads(manifest_path.read_text())
+                # Scrub like every other field of this response — the on-disk
+                # manifest can carry mcp_servers headers / prepare env secrets.
+                from aitelier.server import _redact_secrets
+                body["manifest"] = _redact_secrets(
+                    json.loads(manifest_path.read_text()))
             except json.JSONDecodeError:
                 pass
         prompt_path = run_dir / "prompt.txt"

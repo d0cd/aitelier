@@ -46,9 +46,14 @@ async def sa_proxy(
             headers=headers, timeout=timeout,
         )
     except Exception as exc:
+        # Scrub the sandbox URL from the transport error — httpx connect
+        # errors embed the host:port, which is internal topology we don't
+        # surface in hosted mode (the 4xx path below scrubs the same way).
+        from aitelier.providers.sandbox_agent import _scrub_sandbox_url
+        reason = _scrub_sandbox_url(str(exc), cfg.base_url)
         raise HTTPException(
             status_code=502,
-            detail=f"Sandbox Agent unreachable: {type(exc).__name__}: {exc}",
+            detail=f"Sandbox Agent unreachable: {type(exc).__name__}: {reason}",
         ) from None
     if resp.status_code >= 400:
         # Truncate upstream body — it may carry container paths, env hints,

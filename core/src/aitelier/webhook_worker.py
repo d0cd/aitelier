@@ -2,10 +2,11 @@
 
 Consumers register webhooks via store.enqueue_webhook(); this worker claims
 pending deliveries every few seconds and POSTs them. On non-2xx or network
-error, schedules a retry with exponential backoff. After 5 attempts gives
-up and marks the delivery `failed`.
+error, schedules a retry with exponential backoff. After the backoff
+schedule is exhausted it gives up and marks the delivery `failed`.
 
-Retry delays: 1s, 5s, 30s, 5min, 1hr. Then `state='failed'`.
+Retry delays after attempts 1-5: 1s, 5s, 30s, 5min, 1hr. The 6th attempt
+failing → `state='failed'`.
 """
 
 from __future__ import annotations
@@ -19,15 +20,25 @@ logger = logging.getLogger("aitelier.webhooks")
 
 _worker_task: asyncio.Task | None = None
 _TICK_SECONDS = 5.0
-_MAX_ATTEMPTS = 5
 _BACKOFF_SECONDS = [1, 5, 30, 5 * 60, 60 * 60]
+# One delivery attempt per backoff entry, plus the final attempt that
+# exhausts the schedule and fails. Derived so the cap can't drift out of
+# sync with the schedule (which would strand the last backoff entry dead).
+_MAX_ATTEMPTS = len(_BACKOFF_SECONDS) + 1
 
 
 def _next_attempt_at(attempts: int) -> datetime | None:
-    """Return when the next attempt should run, or None to mark `failed`."""
+    """Return when the next attempt should run, or None to mark `failed`.
+
+    `attempts` is the count *including* the attempt just made (the claim no
+    longer pre-increments — record_webhook_attempt does). So the first failed
+    delivery passes attempts=1 here and waits `_BACKOFF_SECONDS[0]` (1s) — hence
+    the `attempts - 1` index.
+    """
     if attempts >= _MAX_ATTEMPTS:
         return None
-    delay = _BACKOFF_SECONDS[min(attempts, len(_BACKOFF_SECONDS) - 1)]
+    idx = min(max(attempts - 1, 0), len(_BACKOFF_SECONDS) - 1)
+    delay = _BACKOFF_SECONDS[idx]
     return datetime.now(UTC) + timedelta(seconds=delay)
 
 
@@ -100,10 +111,13 @@ async def _deliver_once(delivery) -> None:
     # Decide next state. 2xx → delivered. Non-2xx with retries left → pending.
     # Otherwise → failed.
     success = status_code is not None and 200 <= status_code < 300
+    # The attempt just made is delivery.attempts + 1 (the claim no longer
+    # increments — record_webhook_attempt does). Compute the backoff from it.
+    this_attempt = delivery.attempts + 1
     if success:
         next_at = None  # not reused — record_webhook_attempt sees 2xx and marks delivered
     else:
-        next_at = _next_attempt_at(delivery.attempts)
+        next_at = _next_attempt_at(this_attempt)
 
     store = await get_store()
     await store.record_webhook_attempt(
@@ -118,12 +132,12 @@ async def _deliver_once(delivery) -> None:
     elif next_at is None:
         logger.warning(
             "Webhook %s failed after %d attempts: %s",
-            delivery.id, delivery.attempts, error,
+            delivery.id, this_attempt, error,
         )
     else:
         logger.info(
             "Webhook %s retry %d/%d at %s: %s",
-            delivery.id, delivery.attempts, _MAX_ATTEMPTS,
+            delivery.id, this_attempt, _MAX_ATTEMPTS,
             next_at.isoformat(), error,
         )
 

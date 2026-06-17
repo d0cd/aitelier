@@ -2,7 +2,7 @@
 
 These are documentation-shaped (not auto-loaded by anything in the run-time
 path), but consumers copy them as starting points. A regression in
-`docs/deploy/aitelier.cell.yaml` or `docker/sandbox-agent.Dockerfile` is
+`docs/deploy/sandbox-agent.cell.yaml` or `docker/sandbox-agent.Dockerfile` is
 silent until someone tries to use them — these tests catch the shape
 breaks at unit-test speed.
 

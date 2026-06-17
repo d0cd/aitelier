@@ -213,17 +213,20 @@ Highlights:
 - **Async agent runs** — `POST /v1/runs` for long-running submissions with
   durable webhook delivery.
 - **Durable runs** — `GET /v1/runs*`, `GET /v1/runs/{id}/events*`,
-  `GET /v1/runs/active`, `POST /v1/runs/{id}/cancel`.
+  `GET /v1/runs/active`, `POST /v1/runs/{id}/cancel`,
+  `POST /v1/runs/{id}/wait`, `GET/POST /v1/runs/{id}/scores`,
+  `GET /v1/runs/export` (NDJSON backfill).
 - **Traces** — `GET /v1/traces*`, `GET /v1/traces/aggregates`.
 - **Schedules + webhooks** — `GET/POST/DELETE /v1/schedules*`.
-- **Discovery** — `GET /v1/discovery`, `GET /v1/health`.
+- **Discovery** — `GET /v1/discovery`, `GET /v1/health`, `GET /v1/metrics`.
 
 The `/v1/` prefix exists from day one. Future incompatible changes go to
 `/v2/`; old endpoints can be retired when no caller uses them.
 
-The server is bound to `localhost` by default. Authentication is not
-implemented — this is not a public service. If you ever need remote
-invocation, add a token check then; not before.
+The server is bound to `localhost` by default and trusts local callers.
+Setting `[service] api_key` enables Bearer auth on every `/v1/*` route
+except `/v1/health` (see `middleware.py` auth_middleware) — flip it on for
+any remote/hosted deployment.
 
 ### CLI
 
@@ -347,6 +350,9 @@ working" and "what changed" without archaeology.
 
 ## Repo layout
 
+Illustrative, not exhaustive — see `CLAUDE.md` "Project structure" for the
+authoritative module map.
+
 ```
 aitelier/
 ├── README.md
@@ -356,15 +362,19 @@ aitelier/
 ├── pnpm-workspace.yaml                # if using pnpm workspaces
 ├── .gitignore
 ├── docs/
-│   ├── design.md                      # this doc
-│   ├── hypotheses.md                  # experiment log
-│   └── api.md                         # OpenAPI dump from FastAPI
+│   ├── DESIGN.md                      # this doc
+│   ├── INTEGRATION.md                 # consumer-facing API + error guide
+│   ├── PLAN.md                        # roadmap
+│   └── deploy/                        # brig cell + Dockerfile samples
 ├── schemas/                           # control-plane wire format (inference is OpenAI)
 │   └── v1/
+│       ├── aitelier_request.schema.json
 │       ├── run.schema.json
 │       ├── run_event.schema.json
+│       ├── run_score.schema.json
 │       ├── schedule.schema.json
 │       ├── discovery.schema.json
+│       ├── health.schema.json
 │       ├── active_runs.schema.json
 │       ├── cancel.schema.json
 │       └── traces_aggregate.schema.json
@@ -373,17 +383,25 @@ aitelier/
 │   ├── src/aitelier/
 │   │   ├── __init__.py
 │   │   ├── cli.py
-│   │   ├── server.py                  # FastAPI app + endpoint handlers
+│   │   ├── server.py                  # FastAPI app bootstrap + shared helpers
+│   │   ├── endpoints/                 # one router per resource
+│   │   ├── middleware.py              # auth → correlation → body_size → rate_limit
+│   │   ├── idempotency.py             # Idempotency-Key check/record/release
 │   │   ├── openai_compat.py           # request/response models + translation
+│   │   ├── otel.py                    # opt-in OTLP GenAI export
 │   │   ├── runner.py                  # run-id helper (lean)
 │   │   ├── runs.py                    # record_run + finalize state machine
 │   │   ├── schedules.py
 │   │   ├── webhook_worker.py          # durable delivery queue
-│   │   ├── storage/                   # Store protocol + Postgres + InMemory
-│   │   ├── security.py                # public-URL gate for webhooks
+│   │   ├── purge_worker.py            # background trim of old rows
+│   │   ├── sandbox_proxy.py           # prepare/artifacts workflow choreography
+│   │   ├── storage/                   # Store protocol + Postgres + InMemory + migrations
+│   │   ├── security.py                # SSRF public-URL gate (webhooks + MCP URLs) + workspace/path validation
 │   │   └── providers/
 │   │       ├── llm.py                 # LiteLLM passthrough (chat / embed)
-│   │       └── sandbox_agent.py       # ACP client + call_via_sandbox
+│   │       ├── ollama.py              # direct /api/chat bypass for local/ollama
+│   │       ├── sandbox_agent.py       # ACP session orchestration
+│   │       └── acp_transport.py       # ACP-over-HTTP wire layer
 │   └── tests/
 ├── sdks/
 │   ├── python/

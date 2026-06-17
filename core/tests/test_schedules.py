@@ -38,9 +38,40 @@ async def test_create_oneshot_schedule_at_iso():
 
 
 @pytest.mark.asyncio
+async def test_create_oneshot_naive_at_iso_normalized_to_utc():
+    """A tz-less at_iso must not produce a naive next_run_at — comparing it to
+    the tz-aware tick `now` would raise TypeError and poison the tick loop."""
+    naive = "2099-01-01T00:00:00"  # no offset
+    entry = await sch.create_schedule({
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "x"}]},
+        "at_iso": naive,
+    })
+    next_run = datetime.fromisoformat(entry["next_run_at"])
+    assert next_run.tzinfo is not None
+    # Tick comparison against tz-aware now must not raise.
+    assert next_run > datetime.now(UTC)
+
+
+@pytest.mark.asyncio
 async def test_create_rejects_missing_task():
     with pytest.raises(ValueError):
         await sch.create_schedule({"interval_seconds": 60})
+
+
+@pytest.mark.asyncio
+async def test_create_rejects_malformed_task():
+    """A `task` that isn't a valid chat-completions body is rejected at
+    create time, not silently accepted to fail on every fire."""
+    with pytest.raises(ValueError, match="task"):
+        await sch.create_schedule({
+            "task": {"messages": [{"role": "user", "content": "hi"}]},  # no model
+            "interval_seconds": 60,
+        })
+    with pytest.raises(ValueError, match="task"):
+        await sch.create_schedule({
+            "task": "not-an-object",
+            "interval_seconds": 60,
+        })
 
 
 @pytest.mark.asyncio
@@ -220,3 +251,49 @@ async def test_schedule_handler_routes_llm_task(monkeypatch):
         },
     })
     # No webhook URL → enqueue should not have been called; handler still ran.
+
+
+@pytest.mark.asyncio
+async def test_tick_isolates_per_schedule_failure():
+    """One schedule's run-time-update failure must not abort the other due
+    schedules in the same tick."""
+    import asyncio
+
+    from aitelier.storage import get_store
+
+    await sch.create_schedule({
+        "name": "a",
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "1"}]},
+        "interval_seconds": 60,
+    })
+    await sch.create_schedule({
+        "name": "b",
+        "task": {"model": "claude-sonnet", "messages": [{"role": "user", "content": "2"}]},
+        "interval_seconds": 60,
+    })
+    later = datetime.now(UTC) + timedelta(hours=1)
+    fired: list[str] = []
+
+    async def handler(entry: dict) -> None:
+        fired.append(entry["name"])
+
+    # Make the FIRST update_schedule_run_times call blow up; later calls work.
+    store = await get_store()
+    orig = store.update_schedule_run_times
+    calls = {"n": 0}
+
+    async def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("transient DB error")
+        return await orig(*args, **kwargs)
+
+    store.update_schedule_run_times = flaky
+    try:
+        await sch._run_tick(later, handler)
+        await asyncio.sleep(0)
+    finally:
+        store.update_schedule_run_times = orig
+
+    # Both schedules dispatched their handler despite the first's update failing.
+    assert sorted(fired) == ["a", "b"]

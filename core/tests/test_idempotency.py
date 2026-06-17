@@ -67,6 +67,29 @@ def test_repeat_with_same_key_returns_cached_response(client, monkeypatch):
     )
 
 
+def test_error_response_is_not_cached_under_key(client, monkeypatch):
+    """A transient agent error must NOT be cached — a retry under the same
+    Idempotency-Key has to re-run the agent, not replay the stale error."""
+    error_envelope = {
+        "kind": "agent", "provider": "claude", "status": "error",
+        "duration_s": 0.0, "run_id": "r",
+        "content": "", "usage": None, "finish_reason": "error",
+        "tool_calls": [], "cost_usd": None,
+        "error_type": "ProviderUnavailable", "error_msg": "503 service unavailable",
+    }
+    calls = _stub_agent(monkeypatch, returns=error_envelope)
+    headers = {"Idempotency-Key": "key-err"}
+    body = _chat_body()
+
+    r1 = client.post("/v1/chat/completions", headers=headers, json=body)
+    r2 = client.post("/v1/chat/completions", headers=headers, json=body)
+
+    assert r1.status_code >= 400
+    assert r2.status_code >= 400
+    # The error was not cached: the agent ran again on retry.
+    assert calls["count"] == 2
+
+
 def test_same_key_different_body_returns_422(client, monkeypatch):
     _stub_agent(monkeypatch)
     headers = {"Idempotency-Key": "key-collision"}

@@ -20,6 +20,13 @@ _ERROR_MAP: dict[str, str] = {
     # policies can re-attempt.
     "RemoteProtocolError": "ProviderUnavailable",
     "LocalProtocolError": "ProviderUnavailable",
+    # NetworkError leaves (httpx) — peer socket drop mid-read/write. Siblings of
+    # ConnectError under TransportError; matched by their own class name since
+    # _ERROR_MAP keys on the concrete type, not the base.
+    "ReadError": "ProviderUnavailable",
+    "WriteError": "ProviderUnavailable",
+    "NetworkError": "ProviderUnavailable",
+    "CloseError": "ProviderUnavailable",
     # Read / write timeout once the connection was established.
     "TimeoutException": "Timeout",
     "TimeoutError": "Timeout",
@@ -108,12 +115,15 @@ _RPC_ERROR_CLASS_NAMES = {"AcpError"}
 def classify_error(exc: Exception) -> str:
     """Classify an exception into a documented error type.
 
-    Known types: ProviderUnavailable, Timeout, SchemaViolation,
+    Types resolved here: ProviderUnavailable, Timeout, SchemaViolation,
     RateLimited, AuthError, ProviderError, Cancelled.
 
-    Falls through to the exception class name only as a last resort —
-    the documented vocabulary should cover every observed failure mode
-    on both the LLM and the agent (ACP) paths.
+    Other documented types are set directly at their call sites, not by
+    this function: PrepareFailed (prepare phase), UnsupportedResponseFormat
+    (response_format gate), Orphaned (startup orphan sweep). The full
+    consumer-facing table lives in docs/INTEGRATION.md → "Error handling".
+
+    Falls through to the exception class name only as a last resort.
     """
     # HTTP status errors get special handling by status code
     if isinstance(exc, httpx.HTTPStatusError):
@@ -180,12 +190,13 @@ _SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         r"\1[redacted]\2",
     ),
-    # Basic-auth URLs embedded in error prose: `https://user:password@host/...`
-    # — upstream proxies and database driver errors sometimes echo full DSNs.
-    # Keep the scheme + host for context; redact userinfo.
+    # Basic-auth URLs embedded in error prose: `scheme://user:password@host/...`
+    # — upstream proxies and database driver errors echo full DSNs
+    # (`postgresql://`, `redis://`, `https://`). Keep scheme + host for
+    # context; redact userinfo.
     (
         re.compile(
-            r"(?i)(https?://)([^:/?#\s\"']+):([^@/?#\s\"']+)(@)"
+            r"(?i)([a-z][a-z0-9+.\-]*://)([^:/?#\s\"']+):([^@/?#\s\"']+)(@)"
         ),
         r"\1[redacted]:[redacted]\4",
     ),

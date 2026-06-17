@@ -15,7 +15,9 @@ Endpoints surfaced here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -61,7 +63,10 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
         _validate_aitelier_opts,
     )
 
-    route, agent_backend, inner_llm = parse_model_route(req.model)
+    try:
+        route, agent_backend, inner_llm = parse_model_route(req.model)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
     await _validate_aitelier_opts(req, agent_path=(route == "agent"))
     _reject_if_saturated()
 
@@ -107,8 +112,14 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
 @router.post("/v1/embeddings")
 async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
     """OpenAI-shape embeddings (LiteLLM passthrough)."""
-    from aitelier.server import _http_status_for_llm_error, _render_chat_completion
+    from aitelier.server import (
+        _http_status_for_llm_error,
+        _reject_if_saturated,
+        _render_chat_completion,
+        _track_inflight_run,
+    )
 
+    _reject_if_saturated()
     cid = request.state.correlation_id
     run_id = make_run_id("embed")
 
@@ -145,7 +156,8 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
         resp["correlation_id"] = cid
         return resp
 
-    result = await record_run(spec, _do())
+    with _track_inflight_run(run_id):
+        result = await record_run(spec, _do())
     # OTel: emit a gen_ai.embeddings span. No-op when disabled.
     from aitelier.otel import record_inference_span
     record_inference_span(
@@ -196,11 +208,11 @@ async def list_models_endpoint() -> dict:
             status_code=exc.status_code or 502, detail=str(exc),
         ) from None
     cfg = get_config()
-    agents = await _list_agent_models(cfg, llm_ids=[m["id"] for m in data])
+    agents = await _list_agent_models(cfg)
     return {"object": "list", "data": data + agents}
 
 
-async def _list_agent_models(cfg, *, llm_ids: list[str]) -> list[dict]:
+async def _list_agent_models(cfg) -> list[dict]:
     """Build agent-model entries by probing Sandbox Agent's /v1/agents.
 
     Returns an empty list when SA is unreachable — `/v1/models` shouldn't
@@ -210,16 +222,9 @@ async def _list_agent_models(cfg, *, llm_ids: list[str]) -> list[dict]:
     `/v1/discovery` — which already carries the structured reason via
     `_probe_sandbox_agent`.
     """
+    from aitelier.server import _normalize_agents_payload, _sandbox_agents_request
     try:
-        from aitelier.providers.llm import get_shared_client
-        client = await get_shared_client()
-        headers = {}
-        if cfg.sandbox_agent.token:
-            headers["Authorization"] = f"Bearer {cfg.sandbox_agent.token}"
-        resp = await client.get(
-            f"{cfg.sandbox_agent.base_url}/v1/agents",
-            headers=headers, timeout=3,
-        )
+        resp = await _sandbox_agents_request(cfg)
         if resp.status_code != 200:
             logger.warning(
                 "agent model enumeration: SA /v1/agents returned HTTP %s "
@@ -238,56 +243,86 @@ async def _list_agent_models(cfg, *, llm_ids: list[str]) -> list[dict]:
         )
         return []
 
-    agents_raw = raw if isinstance(raw, list) else raw.get("agents") or []
+    agents_raw = _normalize_agents_payload(raw)
+    installed = [a for a in agents_raw
+                 if isinstance(a, dict) and a.get("id") and a.get("installed", True)]
+
+    # Probe each backend (cached) for the models / reasoning levels / approval
+    # modes it actually advertises — the LiteLLM catalog is not the backend's
+    # own list. Parallel + best-effort: a backend whose probe fails just omits
+    # those fields (its entry still appears).
+    probes = await asyncio.gather(*[
+        _cached_backend_config_options(cfg.sandbox_agent, a["id"]) for a in installed
+    ])
+
     out: list[dict] = []
-    for a in agents_raw:
-        if not isinstance(a, dict) or not a.get("id"):
-            continue
-        if not a.get("installed", True):
-            # Don't advertise uninstalled backends; agent runs against them
-            # would fail with NotInstalled. Consumers calling `/v1/discovery`
-            # see the full advertised set.
-            continue
-        out.append({
+    for a, opts in zip(installed, probes):
+        entry = {
             "id": f"agent:{a['id']}",
             "object": "model",
             "owned_by": "sandbox-agent",
             "aitelier_agent": True,
-            # The backend can drive any chat-capable LLM LiteLLM advertises;
-            # consumers can pair as `agent:<backend>/<llm_id>`. The raw
-            # LiteLLM catalog includes TTS / image / embedding / moderation
-            # routes that can't drive a code agent, so we filter those out
-            # before exposing the inner-LLM picklist.
-            "aitelier_inner_llms": _filter_chat_capable(llm_ids),
             "aitelier_capabilities": a.get("capabilities") or {},
             # Declarative request-field caps mirroring the agent-path gates
             # enforced by `_reject_agent_incompatible_fields`. Generic
             # consumers (model pickers, doctor probes) can pre-strip
             # request fields from the catalog instead of waiting for a 400.
+            # `False` here = rejected on the agent path; list the full sampling/
+            # decoding set the inner agent owns so a caps-based pre-strip
+            # matches the actual 400s.
             "aitelier_request_caps": {
                 "tools": False,
                 "tool_choice": False,
                 "n_gt_1": False,
+                "temperature": False,
                 "top_p": False,
+                "max_tokens": False,
+                "max_completion_tokens": False,
+                "seed": False,
+                "stop": False,
+                "frequency_penalty": False,
+                "presence_penalty": False,
+                "logprobs": False,
+                "top_logprobs": False,
                 "streaming": True,
-                "response_format": ["json_schema"],
+                # Both fold into a prompt directive (best-effort) on the agent path.
+                "response_format": ["json_object", "json_schema"],
             },
-        })
+        }
+        if opts is not None:
+            # Real, backend-native ids: pair as `agent:<backend>/<model>`,
+            # set reasoning via `aitelier.reasoning_effort`, approval via
+            # `aitelier.approval_mode`.
+            entry["aitelier_inner_llms"] = opts["models"]
+            entry["aitelier_reasoning_levels"] = opts["reasoning_levels"]
+            entry["aitelier_approval_modes"] = opts["approval_modes"]
+        out.append(entry)
     return sorted(out, key=lambda m: m["id"])
 
 
-# Model-id substrings that mark a route as not a valid inner LLM for a
-# code agent. Covers non-chat modalities (TTS, image, embeddings, audio
-# transcription, moderation, video) plus chat models with constrained
-# variants the agent harness can't drive (realtime voice / web-search
-# preview endpoints that change the response shape).
-_NON_CHAT_MODEL_MARKERS = (
-    "tts", "whisper", "dall-e", "image", "embed", "moderation",
-    "audio", "transcribe", "speech", "sora",
-    "realtime", "-search-preview",
-)
+# Per-backend advertised config options change only on a Sandbox Agent upgrade,
+# so cache successful probes aggressively. Failures are cached briefly too —
+# otherwise a backend whose probe hangs (no creds, slow CLI) would re-probe (and
+# eat the timeout) on every /v1/models call. Probing spawns a short-lived agent
+# process each time.
+_CONFIG_OPTS_CACHE: dict[tuple[str, str], dict] = {}
+_CONFIG_OPTS_TTL = 600.0
+_CONFIG_OPTS_NEG_TTL = 60.0
 
 
-def _filter_chat_capable(model_ids: list[str]) -> list[str]:
-    return [m for m in model_ids
-            if not any(marker in m.lower() for marker in _NON_CHAT_MODEL_MARKERS)]
+async def _cached_backend_config_options(sa_cfg, backend: str) -> dict | None:
+    """Cached wrapper over `probe_backend_config_options`. Keyed by
+    (base_url, backend). Successes cache for `_CONFIG_OPTS_TTL`, failures for the
+    shorter `_CONFIG_OPTS_NEG_TTL` (so a flaky backend retries soon but doesn't
+    slow every request)."""
+    from aitelier.providers.sandbox_agent import probe_backend_config_options
+
+    key = (sa_cfg.base_url, backend)
+    hit = _CONFIG_OPTS_CACHE.get(key)
+    if hit:
+        ttl = _CONFIG_OPTS_TTL if hit["value"] is not None else _CONFIG_OPTS_NEG_TTL
+        if (time.monotonic() - hit["at"]) < ttl:
+            return hit["value"]
+    value = await probe_backend_config_options(sa_cfg, backend)
+    _CONFIG_OPTS_CACHE[key] = {"value": value, "at": time.monotonic()}
+    return value

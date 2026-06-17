@@ -81,6 +81,14 @@ class PostgresStore:
                 logger.info("Applying migration %s", f.name)
                 async with conn.transaction():
                     await conn.execute(f.read_text())
+                    # Single source of truth for version recording: migration
+                    # files never self-insert. ON CONFLICT guards against a
+                    # row left by an older build that did self-insert.
+                    await conn.execute(
+                        "INSERT INTO schema_version (version) VALUES ($1) "
+                        "ON CONFLICT DO NOTHING",
+                        version,
+                    )
 
     # --- Runs ---
 
@@ -102,10 +110,12 @@ class PostgresStore:
                 spec.run_id, spec.kind, spec.agent_id, spec.model,
                 spec.trace_tag, spec.correlation_id, spec.parent_run_id,
                 spec.sandbox_backend, spec.sandbox_url, spec.sandbox_server_id, spec.workspace,
-                json.dumps(spec.environment), spec.system_prompt_hash,
-                json.dumps(spec.metadata),
-                json.dumps(spec.request_body) if spec.request_body is not None else None,
-                json.dumps(spec.rendered_messages) if spec.rendered_messages is not None else None,
+                json.dumps(spec.environment, default=str), spec.system_prompt_hash,
+                json.dumps(spec.metadata, default=str),
+                json.dumps(spec.request_body, default=str)
+                if spec.request_body is not None else None,
+                json.dumps(spec.rendered_messages, default=str)
+                if spec.rendered_messages is not None else None,
             )
         return _row_to_run(row)
 
@@ -124,6 +134,8 @@ class PostgresStore:
 
         if flt.state:
             add(flt.state, "state = ${idx}")
+        if flt.status:
+            add(flt.status, "status = ${idx}")
         if flt.kind:
             add(flt.kind, "kind = ${idx}")
         if flt.agent_id:
@@ -189,19 +201,42 @@ class PostgresStore:
                 sandbox_url, sandbox_server_id, sandbox_backend, run_id,
             )
 
-    async def mark_orphaned_running_runs(self) -> int:
+    async def mark_orphaned_running_runs(self) -> list[str]:
         """Sweep on startup: any run still in `running` from a previous
         aitelier process is unrecoverable (SA has no session-resume API yet).
-        Flip to `orphaned` so dashboards stop treating it as live."""
+        Flip to `orphaned` so dashboards stop treating it as live.
+
+        Returns the run_ids it just flipped — not a count — so the caller
+        delivers terminal webhooks to exactly this generation's orphans.
+        Prior-generation orphans are already `orphaned` (not pending/running),
+        so a restart can't re-match and re-fire them."""
         async with self._pool.acquire() as conn:
-            result = await conn.execute(
+            rows = await conn.fetch(
                 "UPDATE runs SET state = 'orphaned', ended_at = COALESCE(ended_at, now()) "
-                "WHERE state IN ('pending', 'running')"
+                "WHERE state IN ('pending', 'running') RETURNING run_id"
             )
-        try:
-            return int(result.rsplit(" ", 1)[-1])
-        except ValueError:
-            return 0
+        return [r["run_id"] for r in rows]
+
+    async def runs_awaiting_webhook(self, since: datetime | None = None) -> list[Run]:
+        """Terminal runs with a webhook_url in metadata but no delivery row —
+        the process crashed between finalizing the run and enqueuing its
+        completion webhook. The startup sweep delivers them. `since` bounds it
+        to recently-ended runs so a long-delivered run whose delivery row has
+        purged isn't re-fired."""
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT r.* FROM runs r
+                WHERE r.state IN ('completed', 'failed', 'cancelled', 'orphaned')
+                  AND r.metadata_json->>'webhook_url' IS NOT NULL
+                  AND ($1::timestamptz IS NULL OR r.ended_at >= $1)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM webhook_deliveries w WHERE w.run_id = r.run_id
+                  )
+                """,
+                since,
+            )
+        return [_row_to_run(r) for r in rows]
 
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None:
@@ -246,7 +281,7 @@ class PostgresStore:
         "agent_id":   "COALESCE(agent_id, '<none>')",
         "status":     "COALESCE(status, '<none>')",
         "error_type": "COALESCE(error_type, '<none>')",
-        "day":        "to_char(started_at, 'YYYY-MM-DD')",
+        "day":        "to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD')",
     }
 
     async def aggregate_runs(self, *, group_by: str = "trace_tag",
@@ -405,15 +440,16 @@ class PostgresStore:
 
     async def claim_pending_webhooks(self, limit: int = 10) -> list[WebhookDelivery]:
         """Atomically claim due deliveries by bumping their next_attempt_at far out
-        so concurrent workers don't grab them. Caller must record_webhook_attempt
-        after each attempt."""
+        (visibility timeout) so concurrent workers don't grab them. The attempt is
+        counted in record_webhook_attempt after the delivery actually runs, so a
+        crash between claim and record doesn't burn an attempt — the row is
+        reclaimed once the timeout lapses. Caller must record_webhook_attempt."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
                 UPDATE webhook_deliveries
                 SET next_attempt_at = now() + interval '5 minutes',
-                    last_attempt_at = now(),
-                    attempts = attempts + 1
+                    last_attempt_at = now()
                 WHERE id IN (
                     SELECT id FROM webhook_deliveries
                     WHERE state = 'pending' AND next_attempt_at <= now()
@@ -439,7 +475,8 @@ class PostgresStore:
                 """
                 UPDATE webhook_deliveries
                 SET last_status_code = $1, last_error = $2,
-                    next_attempt_at = $3, state = $4
+                    next_attempt_at = $3, state = $4,
+                    attempts = attempts + 1
                 WHERE id = $5
                 """,
                 status_code, error, next_attempt_at, new_state, delivery_id,
@@ -547,7 +584,8 @@ class PostgresStore:
             rows = await conn.fetch(
                 "SELECT id, run_id, name, value, evaluator, comment, "
                 "       metadata, created_at "
-                "FROM run_scores WHERE run_id = $1 ORDER BY created_at ASC",
+                "FROM run_scores WHERE run_id = $1 "
+                "ORDER BY created_at ASC, id ASC",
                 run_id,
             )
         return [
@@ -688,8 +726,8 @@ def _row_to_schedule(row: Any) -> Schedule:
 
 def _row_to_webhook(row: Any) -> WebhookDelivery:
     return WebhookDelivery(
-        id=row["id"], run_id=row.get("run_id") if isinstance(row, dict) else row["run_id"],
-        schedule_id=row.get("schedule_id") if isinstance(row, dict) else row["schedule_id"],
+        id=row["id"], run_id=row["run_id"],
+        schedule_id=row["schedule_id"],
         url=row["url"], payload=_as_dict(row["payload_json"]),
         state=row["state"], attempts=row["attempts"],
         last_status_code=row["last_status_code"],

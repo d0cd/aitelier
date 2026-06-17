@@ -89,4 +89,5 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 CREATE INDEX IF NOT EXISTS idx_webhook_pending    ON webhook_deliveries(state, next_attempt_at)
     WHERE state = 'pending';
 
-INSERT INTO schema_version (version) VALUES (1) ON CONFLICT DO NOTHING;
+-- schema_version is recorded by migrate() after each file runs (single
+-- source of truth). Migration files do NOT self-insert their version.

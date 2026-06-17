@@ -12,14 +12,12 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from aitelier.sandbox_proxy import (
     fetch_artifacts,
     prepare_failed_result,
     run_prepare,
     stop_sidecars,
 )
-
 
 # --- run_prepare ------------------------------------------------------------
 

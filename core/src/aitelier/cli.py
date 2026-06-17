@@ -100,7 +100,13 @@ def _cmd_runs(args: argparse.Namespace) -> None:
     for rd in run_dirs[: args.last]:
         manifest_path = rd / "manifest.json"
         if manifest_path.exists():
-            manifest = json.loads(manifest_path.read_text())
+            try:
+                manifest = json.loads(manifest_path.read_text())
+            except json.JSONDecodeError:
+                # One corrupt manifest shouldn't abort the whole listing —
+                # matches the JSONDecodeError guard in endpoints/runs.py.
+                print(f"  {rd.name}  [corrupt manifest]")
+                continue
             results_summary = ", ".join(
                 f"{r['provider']}={r['status']}" for r in manifest.get("results", [])
             )

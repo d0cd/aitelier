@@ -26,6 +26,8 @@ from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
 from aitelier.providers.acp_transport import (
     ACP_PROTOCOL_VERSION as _ACP_PROTOCOL_VERSION,
+)
+from aitelier.providers.acp_transport import (
     AcpClient,
     AcpError,
     _is_local_url,
@@ -78,15 +80,13 @@ def _build_session_new_meta(
     agent_model: str | None,
     tool_allowlist: list[str] | None,
     max_turns: int | None,
-    plan_mode: bool | None,
 ) -> dict | None:
     """Build the backend-specific `_meta` block for ACP `session/new`.
 
-    Each ACP bridge reads config from a different place. The
-    standardized `session/setConfigOption` path is for client-facing
-    config the bridge advertises (e.g. claude's "effort"), not for
-    pushing SDK options downstream — which is why we silently dropped
-    every option before we started using `_meta`.
+    Each ACP bridge reads config from a different place. This builds the
+    claude-only `_meta` block; non-claude backends return None here and get
+    their config via the advertised verbs (`session/set_model`,
+    `session/set_config_option`, `session/set_mode`) in `_open_acp_session`.
 
     claude-agent-acp ≥0.36 (dist/acp-agent.js:1371-1450) reads:
       - `_meta.systemPrompt`         → system prompt override
@@ -112,11 +112,47 @@ def _build_session_new_meta(
         meta["systemPrompt"] = system_prompt
     if options:
         meta["claudeCode"] = {"options": options}
-    if plan_mode is not None:
-        # claude-agent-acp doesn't expose plan mode through SDK options;
-        # it surfaces a runtime `session/set_mode` instead. Skip here.
-        pass
     return meta or None
+
+
+def _advertised_config_options(session_resp: Any) -> dict[str, dict]:
+    """Map an ACP `session/new` response to its advertised config options,
+    keyed by ACP `category` ("model", "thought_level", "mode", …).
+
+    Each entry is `{"id": <option-id>, "values": [<advertised value>, …]}`.
+    Option *ids* differ across backends (codex `reasoning_effort` vs claude
+    `effort`) but the `category` is shared, so we normalize on category and
+    use the per-backend `id` when calling `session/set_config_option`."""
+    out: dict[str, dict] = {}
+    if not isinstance(session_resp, dict):
+        return out
+    for opt in session_resp.get("configOptions") or []:
+        if not isinstance(opt, dict):
+            continue
+        oid = opt.get("id")
+        if not oid:
+            continue
+        category = opt.get("category") or oid
+        values = [o["value"] for o in opt.get("options") or []
+                  if isinstance(o, dict) and o.get("value") is not None]
+        out[category] = {"id": oid, "values": values}
+    return out
+
+
+def _run_context_block(run_id: str) -> str:
+    return f"<aitelier_context>\nrun_id={run_id}\n</aitelier_context>"
+
+
+def _compose_system_text(system_prompt: str | None, run_id: str) -> str | None:
+    """Combine the run-context block (so the inner agent can pass
+    `parent_run_id` when dispatching subagents) with the caller's system
+    prompt. Returns None when neither is present."""
+    parts = []
+    if run_id:
+        parts.append(_run_context_block(run_id))
+    if system_prompt:
+        parts.append(system_prompt)
+    return "\n\n".join(parts) or None
 
 
 async def _open_acp_session(
@@ -129,21 +165,22 @@ async def _open_acp_session(
     agent_model: str | None,
     tool_allowlist: list[str] | None,
     max_turns: int | None,
-    plan_mode: bool | None = None,
+    reasoning_effort: str | None = None,
+    approval_mode: str | None = None,
     run_id: str = "",
 ) -> str:
     """Drive the ACP handshake up to a usable session_id.
 
-    initialize → session/new (with backend-specific `_meta`) → start_stream.
+    initialize → session/new → start_stream → apply session config.
 
     Capabilities are advertised honestly: aitelier doesn't service fs/*
     or terminal/* (the SSE consumer rejects them in `_respond_to_agent_request`),
     so we say `false`. The agent then never asks, instead of asking and
     hanging on the rejection.
 
-    When `run_id` is non-empty, an `<aitelier_context>` block carrying
-    the run_id is prepended to the system prompt so the inner agent
-    can pass `parent_run_id` when dispatching subagents through aitelier.
+    `system_prompt` is consumed only by claude's session/new `_meta`; other
+    backends have no system channel and receive their system instructions
+    folded into the prompt by the caller (so it's harmlessly unused here).
     """
     await client.call("initialize", {
         "protocolVersion": _ACP_PROTOCOL_VERSION,
@@ -154,15 +191,9 @@ async def _open_acp_session(
         "clientInfo": {"name": "aitelier", "version": "0.1.0"},
     }, first=True)
 
-    if run_id:
-        ctx_block = (
-            f"<aitelier_context>\n"
-            f"run_id={run_id}\n"
-            f"</aitelier_context>"
-        )
-        system_prompt = (
-            f"{ctx_block}\n\n{system_prompt}" if system_prompt else ctx_block
-        )
+    # Run-context + system prompt for claude's `_meta`. Non-claude backends
+    # get this folded into the prompt by the caller; their `_meta` is None.
+    system_prompt = _compose_system_text(system_prompt, run_id)
 
     session_new_params: dict = {
         "cwd": workspace or ".",
@@ -174,7 +205,6 @@ async def _open_acp_session(
         agent_model=agent_model,
         tool_allowlist=tool_allowlist,
         max_turns=max_turns,
-        plan_mode=plan_mode,
     )
     if meta is not None:
         session_new_params["_meta"] = meta
@@ -199,33 +229,102 @@ async def _open_acp_session(
 
     client.start_stream()
 
-    # Backends that don't read `_meta` (today: everyone except claude)
-    # get a best-effort fallback through `session/set_config_option`.
-    # That method returns "Method not found" on claude-agent-acp, but
-    # claude already received its config via `_meta` above.
-    if agent_name != "claude":
-        for option, value in (
-            ("systemPrompt", system_prompt),
-            ("model", agent_model),
-            ("allowedTools", tool_allowlist),
-            ("maxTurns", max_turns),
-            ("planMode", plan_mode),
-        ):
-            if value is None or value == "" or value == []:
-                continue
-            try:
-                await client.notify("session/set_config_option", {
-                    "sessionId": session_id,
-                    "option": option,
-                    "value": value,
-                })
-            except Exception as exc:
-                logger.debug(
-                    "session/set_config_option %s ignored: %s: %s",
-                    option, type(exc).__name__, exc,
-                )
+    # Apply session config from what the backend actually advertised, in the
+    # order model → reasoning → approval (claude rebuilds its effort options
+    # from the current model, so model must land first). claude takes its model
+    # via `_meta` above; non-claude takes it via `session/set_model`.
+    #
+    # The session is live now — if a validation/apply step raises (bad model,
+    # unadvertised reasoning_effort/approval_mode), close it before propagating
+    # so we don't orphan the backend's child process. (Regression guard for the
+    # leaked-subprocess class; see test_*_closes_session_when_*.)
+    try:
+        advertised = _advertised_config_options(session_resp)
+        if agent_name != "claude" and agent_model:
+            await _apply_model(client, session_id, agent_name, agent_model, advertised)
+        if reasoning_effort is not None:
+            await _apply_categorical(
+                client, session_id, agent_name, advertised,
+                category="thought_level", concept="reasoning_effort",
+                value=reasoning_effort,
+            )
+        if approval_mode is not None:
+            await _apply_categorical(
+                client, session_id, agent_name, advertised,
+                category="mode", concept="approval_mode", value=approval_mode,
+            )
+    except BaseException:
+        await _close_acp_session(client, session_id)
+        raise
 
     return session_id
+
+
+def _validate_advertised(
+    agent_name: str, advertised: dict, *, category: str, concept: str, value: str,
+) -> dict:
+    """Return the advertised option for `category`, raising a precise AcpError
+    if the backend doesn't offer it or `value` isn't one of its values."""
+    opt = advertised.get(category)
+    if opt is None:
+        raise AcpError(
+            -32601,
+            f"backend '{agent_name}' does not support {concept} "
+            f"(no '{category}' option advertised).",
+        )
+    values = opt.get("values") or []
+    if values and value not in values:
+        raise AcpError(
+            -32602,
+            f"backend '{agent_name}' {concept} '{value}' not offered. "
+            f"Available: {', '.join(values)}.",
+        )
+    return opt
+
+
+async def _apply_model(
+    client: AcpClient, session_id: str, agent_name: str,
+    agent_model: str, advertised: dict,
+) -> None:
+    """Set the inner model via `session/set_model`. Validates against the
+    advertised model values first — `set_model` is permissive (accepts any id
+    and only fails later at prompt time), so an eager check turns a wasted turn
+    into a precise error. `modelId` must be backend-native (codex: 'gpt-5.4');
+    `openai/*` and curated aliases are LLM-path ids the backend rejects."""
+    opt = advertised.get("model")
+    values = (opt or {}).get("values") or []
+    if values and agent_model not in values:
+        raise AcpError(
+            -32602,
+            f"backend '{agent_name}' does not offer inner model "
+            f"'{agent_model}'. Available: {', '.join(values)}. Use a "
+            f"backend-native id (e.g. 'agent:{agent_name}/{values[0]}'); "
+            f"'openai/…' and curated aliases are LLM-path ids, not agent "
+            f"inner-model ids.",
+        )
+    await client.call("session/set_model", {
+        "sessionId": session_id, "modelId": agent_model,
+    })
+
+
+async def _apply_categorical(
+    client: AcpClient, session_id: str, agent_name: str, advertised: dict,
+    *, category: str, concept: str, value: str,
+) -> None:
+    """Validate `value` against the advertised option for `category`, then set
+    it via the category's ACP method: `mode` → `session/set_mode`, everything
+    else (e.g. `thought_level`) → `session/set_config_option {configId}`."""
+    opt = _validate_advertised(
+        agent_name, advertised, category=category, concept=concept, value=value,
+    )
+    if category == "mode":
+        await client.call("session/set_mode", {
+            "sessionId": session_id, "modeId": value,
+        })
+    else:
+        await client.call("session/set_config_option", {
+            "sessionId": session_id, "configId": opt["id"], "value": value,
+        })
 
 
 async def _close_acp_session(client: AcpClient, session_id: str) -> None:
@@ -254,6 +353,50 @@ async def _close_acp_session(client: AcpClient, session_id: str) -> None:
         )
 
 
+async def probe_backend_config_options(
+    cfg, backend: str, *, timeout: float = 10.0,
+) -> dict | None:
+    """Open a throwaway ACP session to read what `backend` actually advertises:
+    `{"models": [...], "reasoning_levels": [...], "approval_modes": [...]}`.
+
+    Used by `GET /v1/models` to surface a backend's real, selectable inner
+    models / reasoning levels / approval modes (the LiteLLM catalog isn't the
+    backend's list). Best-effort: returns None on any failure so `/v1/models`
+    never fails because one backend probe timed out. Spawns and tears down a
+    short-lived agent process (`session/new` → `session/close`)."""
+    try:
+        async with AcpClient(cfg.base_url, backend, token=cfg.token,
+                             timeout=timeout) as client:
+            await client.call("initialize", {
+                "protocolVersion": _ACP_PROTOCOL_VERSION,
+                "clientCapabilities": {
+                    "fs": {"readTextFile": False, "writeTextFile": False},
+                    "terminal": False,
+                },
+                "clientInfo": {"name": "aitelier", "version": "0.1.0"},
+            }, first=True)
+            resp = await asyncio.wait_for(
+                client.call("session/new", {"cwd": "/tmp", "mcpServers": []}),
+                timeout=timeout,
+            )
+            advertised = _advertised_config_options(resp)
+            sid = resp.get("sessionId") if isinstance(resp, dict) else None
+            if sid:
+                await _close_acp_session(client, sid)
+            return {
+                "models": (advertised.get("model") or {}).get("values") or [],
+                "reasoning_levels": (advertised.get("thought_level") or {}).get("values") or [],
+                "approval_modes": (advertised.get("mode") or {}).get("values") or [],
+            }
+    except Exception as exc:
+        logger.warning(
+            "config-option probe for backend %s failed (%s: %s) — /v1/models "
+            "will omit its advertised options this cycle.",
+            backend, type(exc).__name__, exc,
+        )
+        return None
+
+
 def _prompt_params(
     session_id: str, prompt: str, response_format: dict | None,
 ) -> dict:
@@ -277,8 +420,9 @@ async def call_via_sandbox(
     tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
     max_turns: int | None = None,
-    plan_mode: bool | None = None,
     agent_model: str | None = None,
+    reasoning_effort: str | None = None,
+    approval_mode: str | None = None,
     timeout: int = 600,
     run_id: str = "",
 ) -> dict:
@@ -287,8 +431,17 @@ async def call_via_sandbox(
     Thin wrapper over call_via_sandbox_stream: consumes the event stream and
     returns the final aggregated `done` (or surfaces error/timeout) as a dict.
 
-    Parameter routing:
-      system_prompt, agent_model, tool_allowlist, max_turns → session/set_config_option
+    Parameter routing (see _open_acp_session / _build_session_new_meta):
+      system_prompt    → session/new `_meta` for claude; folded into the prompt
+                         text for other backends
+      agent_model      → session/new `_meta` for claude; validated
+                         `session/set_model` for other backends
+      tool_allowlist,
+      max_turns        → session/new `_meta` for claude only (rejected upstream
+                         with a 400 for other backends)
+      reasoning_effort → validated `session/set_config_option` (advertised
+                         `thought_level`)
+      approval_mode    → validated `session/set_mode` (advertised `mode`)
       mcp_servers      → session/new mcpServers
       response_format  → session/prompt (json_schema only)
       workspace        → session/new cwd
@@ -304,7 +457,8 @@ async def call_via_sandbox(
                 workspace=workspace, system_prompt=system_prompt,
                 mcp_servers=mcp_servers, tool_allowlist=tool_allowlist,
                 response_format=response_format, max_turns=max_turns,
-                plan_mode=plan_mode, agent_model=agent_model,
+                agent_model=agent_model,
+                reasoning_effort=reasoning_effort, approval_mode=approval_mode,
                 timeout=timeout, run_id=run_id,
             ):
                 etype = event.get("type")
@@ -349,7 +503,7 @@ async def call_via_sandbox(
 async def _translate_note(
     note: dict, *,
     text_chunks: list[str], tool_calls: list[dict],
-    emitter: _RunEventEmitter, live: bool,
+    emitter: _RunEventEmitter,
 ) -> dict | None:
     """Map one ACP notification → an aitelier event, with side effects.
 
@@ -358,18 +512,18 @@ async def _translate_note(
     `emitter`. Returns the event dict (for the caller to yield) or
     None when the notification doesn't map to a surfaced event.
 
-    `live=False` is used by the post-prompt drain pass: tool_call /
-    tool_result notifications during drain are not added to
-    `tool_calls` (they would already have been counted live) — only
-    `delta` content is accumulated so a trailing message-chunk
-    completes the visible output.
+    Each notification is consumed exactly once (from the client queue),
+    so both the live phase and the post-prompt drain accumulate into the
+    same `text_chunks` / `tool_calls` — a tool event that lands during
+    drain still counts toward `done.tool_call_count`, keeping the terminal
+    payload consistent with the events the consumer saw on the stream.
     """
     ev = _notification_to_event(note)
     if ev is None:
         return None
     if ev["type"] == "delta":
         text_chunks.append(ev["content"])
-    elif live and ev["type"] in ("tool_call", "tool_result"):
+    elif ev["type"] in ("tool_call", "tool_result"):
         tool_calls.append({k: v for k, v in ev.items() if k != "type"})
     await emitter.emit(
         ev["type"], {k: v for k, v in ev.items() if k != "type"},
@@ -387,8 +541,9 @@ async def call_via_sandbox_stream(
     tool_allowlist: list[str] | None = None,
     response_format: dict | None = None,
     max_turns: int | None = None,
-    plan_mode: bool | None = None,
     agent_model: str | None = None,
+    reasoning_effort: str | None = None,
+    approval_mode: str | None = None,
     timeout: int = 600,
     run_id: str = "",
 ):
@@ -421,6 +576,17 @@ async def call_via_sandbox_stream(
         "workspace": workspace,
     })
 
+    # claude takes its system prompt natively via session/new `_meta`; every
+    # other backend has no system channel, so fold the run-context + system
+    # prompt into the prompt text and don't pass it to the session opener.
+    if name == "claude":
+        session_system_prompt = system_prompt
+        effective_prompt = prompt
+    else:
+        session_system_prompt = None
+        sys_text = _compose_system_text(system_prompt, run_id)
+        effective_prompt = f"{sys_text}\n\n{prompt}" if sys_text else prompt
+
     try:
         async with AcpClient(cfg.base_url, name, token=cfg.token,
                              timeout=timeout) as client:
@@ -431,13 +597,14 @@ async def call_via_sandbox_stream(
                     client,
                     agent_name=name,
                     workspace=workspace, mcp_servers=mcp_servers,
-                    system_prompt=system_prompt, agent_model=agent_model,
+                    system_prompt=session_system_prompt, agent_model=agent_model,
                     tool_allowlist=tool_allowlist, max_turns=max_turns,
-                    plan_mode=plan_mode, run_id=run_id,
+                    reasoning_effort=reasoning_effort,
+                    approval_mode=approval_mode, run_id=run_id,
                 )
                 prompt_task = asyncio.create_task(client.call(
                     "session/prompt",
-                    _prompt_params(session_id, prompt, response_format),
+                    _prompt_params(session_id, effective_prompt, response_format),
                 ))
 
                 turn_result: dict | None = None
@@ -451,7 +618,7 @@ async def call_via_sandbox_stream(
                             continue
                         ev = await _translate_note(
                             note, text_chunks=text_chunks,
-                            tool_calls=tool_calls, emitter=emitter, live=True,
+                            tool_calls=tool_calls, emitter=emitter,
                         )
                         if ev is not None:
                             yield ev
@@ -471,15 +638,31 @@ async def call_via_sandbox_stream(
 
                     # Drain phase: surface trailing notifications even on
                     # prompt error, so the event stream is consistent.
-                    # Tool events were already counted live; only delta
-                    # content accumulates here.
-                    for note in await client.drain_notifications():
+                    # Final agent_message_chunks can land on the SSE stream
+                    # slightly after session/prompt returns, so poll with a
+                    # short timeout until the stream goes quiet rather than
+                    # only sweeping what's already buffered. Bounded by the
+                    # overall run timeout: unlike the non-streaming
+                    # call_via_sandbox wrapper, this streaming entry point has
+                    # no enclosing wait_for, so a backend that never goes quiet
+                    # would drain forever without this deadline.
+                    drain_deadline = start + timeout
+                    while time.monotonic() < drain_deadline:
+                        note = await client.next_notification(timeout=0.25)
+                        if note is None:
+                            break
                         ev = await _translate_note(
                             note, text_chunks=text_chunks,
-                            tool_calls=tool_calls, emitter=emitter, live=False,
+                            tool_calls=tool_calls, emitter=emitter,
                         )
                         if ev is not None:
                             yield ev
+                    else:
+                        logger.warning(
+                            "Sandbox %s run %s: drain exceeded run timeout "
+                            "(%ss) without going quiet; ending stream.",
+                            name, run_id, timeout,
+                        )
                 finally:
                     # Close session on every exit path — cancellation, prompt
                     # error, successful completion. Without this the inner
@@ -573,7 +756,7 @@ def _notification_to_event(note: dict) -> dict | None:
     )
 
     if kind in (
-        "agent_message_chunk", "user_message_chunk",
+        "agent_message_chunk",
         "agentMessageChunk", "messageChunk", "text",
     ):
         content = update.get("content") or update.get("text")
@@ -600,11 +783,21 @@ def _notification_to_event(note: dict) -> dict | None:
         }
 
     if kind in ("tool_call_update", "toolCallUpdate", "toolResult", "tool_result"):
+        output = (update.get("result") or update.get("output")
+                  or update.get("rawOutput") or update.get("content"))
+        if kind in ("tool_call_update", "toolCallUpdate"):
+            # Multi-fire status pings. Surface a tool_result only on a
+            # terminal update carrying output; intermediate pings would
+            # otherwise append duplicate, output=None entries and inflate
+            # tool_call_count.
+            status = update.get("status")
+            terminal = status in ("completed", "failed", "error", "cancelled")
+            if not terminal and output is None:
+                return None
         return {
             "type":       "tool_result",
             "tool":       update.get("name") or update.get("toolName"),
-            "output":     (update.get("result") or update.get("output")
-                            or update.get("rawOutput") or update.get("content")),
+            "output":     output,
             "elapsed_ms": update.get("elapsed_ms") or update.get("elapsedMs"),
         }
 

@@ -34,5 +34,7 @@ _other_container_on_port() {
 }
 
 _pick_free_port() {
-    python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
+    # `uv run python`, not bare `python3` — works on a uv-managed machine
+    # with no system python3 (matches credential extraction in start.sh).
+    uv run python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
 }

@@ -2,9 +2,12 @@
 
 Loaded by an inner agent (via `aitelier.mcp_servers[]` on the parent
 request) so the agent can dispatch subagents through aitelier without
-hand-rolling HTTP calls. Tools mirror the aitelier-client surface
-one-to-one — submit a run, fetch it, list events, cancel, filter
-runs by `parent_run_id` / `trace_tag`.
+hand-rolling HTTP calls. The tools cover the orchestration-relevant
+slice of the aitelier-client surface: submit / fetch / wait / cancel
+runs, list runs + events, score runs, query traces + aggregates, list
+active runs, and discovery. Inference itself stays on the OpenAI-shape
+HTTP path (not exposed here); schedules/webhooks are operator surfaces
+an inner agent doesn't drive, so they're intentionally omitted.
 
 No business logic lives here. Each tool is a thin wrapper that the
 inner agent's tool-call machinery invokes; the wrapper makes one
@@ -51,47 +54,67 @@ def create_server(client: Aitelier | None = None) -> FastMCP:
         trace_tag: str | None = None,
         webhook_url: str | None = None,
         idempotency_key: str | None = None,
+        correlation_id: str | None = None,
+        timeout: int | None = None,
         workspace: str | None = None,
         mcp_servers: list[dict[str, Any]] | None = None,
         tool_allowlist: list[str] | None = None,
         max_turns: int | None = None,
+        reasoning_effort: str | None = None,
+        approval_mode: str | None = None,
+        prepare: dict[str, Any] | None = None,
+        artifacts: dict[str, Any] | None = None,
+        examples: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Submit an async agent run via aitelier's `POST /v1/runs`.
 
         Returns immediately with `{run_id, status: "accepted"}`. The
         final ChatCompletion (or error) lands on `webhook_url` when
         the run finishes; consumers without a webhook can poll
-        `get_run` or `list_run_events`.
+        `get_run` / `wait_for_run` / `list_run_events`.
 
         `model` must start with `agent:<backend>` (e.g. `agent:claude`).
         `parent_run_id` records this submission as a child of the
         provided run id — recover the subtree later via `list_runs`.
+
+        `prepare` / `artifacts` drive the one-call agent workflow
+        (install → commands → file seed → sidecars → run → artifact
+        fetch); `reasoning_effort` / `approval_mode` / `examples` tune the
+        agent itself. `tool_allowlist` / `max_turns` are claude-only.
+        `timeout` (seconds) sets the server-side run limit and
+        `correlation_id` propagates a trace id.
         """
         aitelier_block: dict[str, Any] = {}
-        if parent_run_id is not None:
-            aitelier_block["parent_run_id"] = parent_run_id
-        if trace_tag is not None:
-            aitelier_block["trace_tag"] = trace_tag
-        if workspace is not None:
-            aitelier_block["workspace"] = workspace
-        if mcp_servers is not None:
-            aitelier_block["mcp_servers"] = mcp_servers
-        if tool_allowlist is not None:
-            aitelier_block["tool_allowlist"] = tool_allowlist
-        if max_turns is not None:
-            aitelier_block["max_turns"] = max_turns
+        for key, value in (
+            ("parent_run_id", parent_run_id),
+            ("trace_tag", trace_tag),
+            ("workspace", workspace),
+            ("mcp_servers", mcp_servers),
+            ("tool_allowlist", tool_allowlist),
+            ("max_turns", max_turns),
+            ("reasoning_effort", reasoning_effort),
+            ("approval_mode", approval_mode),
+            ("prepare", prepare),
+            ("artifacts", artifacts),
+            ("examples", examples),
+        ):
+            if value is not None:
+                aitelier_block[key] = value
         return await client.submit_run(
             model=model, messages=messages,
             webhook_url=webhook_url,
             idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            timeout=timeout,
             aitelier_opts=aitelier_block or None,
         )
 
     @server.tool()
     async def get_run(run_id: str) -> dict[str, Any]:
         """Fetch a single run's state. Returns the Run row including
-        `state`, `status`, `usage`, `parent_run_id`, `trace_tag`,
-        `correlation_id`, `error_type`, `error_msg`."""
+        `state`, `status`, `input_tokens`, `output_tokens`, `total_tokens`,
+        `parent_run_id`, `trace_tag`, `correlation_id`, `error_type`,
+        `error_msg`."""
         run = await client.get_run(run_id)
         return _as_dict(run)
 
@@ -130,6 +153,78 @@ def create_server(client: Aitelier | None = None) -> FastMCP:
         be False — safe to call optimistically."""
         ack = await client.cancel_run(run_id)
         return _as_dict(ack)
+
+    @server.tool()
+    async def wait_for_run(
+        run_id: str, timeout: float = 60.0, poll_interval: float = 0.5,
+    ) -> dict[str, Any]:
+        """Block until `run_id` reaches a terminal state, then return the
+        Run. Lets an orchestrator dispatch a child and await its result
+        without a webhook receiver. Raises on 408 (still running at
+        timeout — call again) or 404 (unknown run)."""
+        run = await client.wait_for_run(
+            run_id, timeout=timeout, poll_interval=poll_interval,
+        )
+        return _as_dict(run)
+
+    @server.tool()
+    async def add_run_score(
+        run_id: str, name: str, value: float, evaluator: str,
+        comment: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Write a grader's score against a run. Lets an orchestrator
+        grade its children's outputs and persist the verdict durably."""
+        score = await client.add_run_score(
+            run_id, name=name, value=value, evaluator=evaluator,
+            comment=comment, metadata=metadata,
+        )
+        return _as_dict(score)
+
+    @server.tool()
+    async def list_run_scores(run_id: str) -> list[dict[str, Any]]:
+        """All scores written against `run_id`, oldest first."""
+        scores = await client.list_run_scores(run_id)
+        return [_as_dict(s) for s in scores]
+
+    @server.tool()
+    async def recent_traces(
+        trace_tag: str | None = None,
+        status: str | None = None,
+        since: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Query recent runs as trace summaries (counts, tokens, cost,
+        status). Use to review a workflow's children by `trace_tag`."""
+        traces = await client.recent_traces(
+            trace_tag=trace_tag, status=status, since=since, limit=limit,
+        )
+        return [_as_dict(t) for t in traces]
+
+    @server.tool()
+    async def aggregate_traces(
+        group_by: str = "trace_tag",
+        since: str | None = None,
+        until: str | None = None,
+        trace_tag: str | None = None,
+    ) -> dict[str, Any]:
+        """Roll up run stats by trace_tag / kind / model / agent_id /
+        status / error_type / day — token + cost + error totals."""
+        agg = await client.aggregate_traces(
+            group_by=group_by, since=since, until=until, trace_tag=trace_tag,
+        )
+        return _as_dict(agg)
+
+    @server.tool()
+    async def list_active_runs() -> dict[str, Any]:
+        """List run_ids currently in-flight in the aitelier process."""
+        return _as_dict(await client.list_active_runs())
+
+    @server.tool()
+    async def discovery() -> dict[str, Any]:
+        """aitelier's live capability + endpoint inventory + dependency
+        health. The runtime source of truth for what's reachable."""
+        return _as_dict(await client.discovery())
 
     @server.tool()
     async def get_my_run_id() -> dict[str, str | None]:

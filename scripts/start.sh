@@ -74,6 +74,12 @@ if [ "$SA_MODE" = "docker" ]; then
     export AITELIER_SA_PROFILE=1
 fi
 
+# Sandbox Agent install channel — single source so the install command and
+# its failure-hint can't drift. `0.4.x` tracks the latest 0.4 patch; for
+# reproducible deploys, pin an exact patch (e.g. "0.4.3") here and keep the
+# docker/*.Dockerfile ARGs in sync. Override via env if needed.
+SANDBOX_AGENT_CHANNEL="${SANDBOX_AGENT_CHANNEL:-0.4.x}"
+
 # Sandbox Agent port resolution (in order):
 #   1. --sandbox-agent-port <N> CLI flag
 #   2. SANDBOX_AGENT_PORT env var
@@ -138,7 +144,13 @@ _existing_sa_url() {
         | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
-if [ -n "$SANDBOX_AGENT_PORT_REQUESTED" ]; then
+if [ "$SA_MODE" = "docker" ]; then
+    # docker compose binds the container's 2468 to host 2468 — it can't take
+    # a dynamic host port. Skip the free-port dance entirely; picking a random
+    # port here would write a base_url into the session overlay that nothing
+    # listens on (the container is still on 2468), failing every dispatch.
+    SANDBOX_AGENT_PORT=2468
+elif [ -n "$SANDBOX_AGENT_PORT_REQUESTED" ]; then
     SANDBOX_AGENT_PORT="$SANDBOX_AGENT_PORT_REQUESTED"
 elif [ -n "${SANDBOX_AGENT_PORT:-}" ]; then
     :  # user already set it via env
@@ -184,14 +196,21 @@ if ! grep -q "docker/.env" "$REPO_ROOT/.gitignore" 2>/dev/null; then
     echo "  Added docker/.env to .gitignore"
 fi
 
-# Extract and validate credentials via Python (handles JSON + expiry check)
-python3 - "$ENV_FILE" <<'PYEOF'
-import json, sys, time
+# Extract credentials via Python (handles JSON + expiry check). Credentials are
+# advisory, not required: the control plane and the local/ollama LLM paths need
+# no API key, so a missing or expired Claude/Codex login degrades capability but
+# never blocks startup. Absent keys are written empty so LiteLLM's env refs still
+# resolve and the proxy boots; the affected models just error at call time.
+# Use `uv run python` (not bare `python3`) so this works on a uv-managed
+# machine that has no system python3 — same interpreter the mode detection
+# above uses.
+uv run python - "$ENV_FILE" <<'PYEOF'
+import json, os, sys, time
 from pathlib import Path
 
 env_file = sys.argv[1]
-lines = []
-ok = True
+anthropic_key = ""
+openai_key = ""
 
 # --- Claude Code ---
 claude_creds = Path.home() / ".claude" / ".credentials.json"
@@ -203,21 +222,17 @@ if claude_creds.exists():
         expires = oauth.get("expiresAt", 0)
 
         if not token:
-            print("  ✗ Claude: credentials file exists but no token found")
-            ok = False
+            print("  - Claude: credentials file exists but no token found")
         elif expires and expires < time.time() * 1000:  # expiresAt is in ms
-            print("  ✗ Claude: OAuth token expired — run 'claude login' to refresh")
-            ok = False
+            print("  - Claude: OAuth token expired — run 'claude login' to refresh")
         else:
-            lines.append(f"ANTHROPIC_API_KEY={token}")
+            anthropic_key = token
             remaining_h = (expires - time.time() * 1000) / 3_600_000 if expires else 0
             print(f"  ✓ Claude: token valid ({remaining_h:.0f}h remaining)")
     except Exception as e:
-        print(f"  ✗ Claude: failed to read credentials: {e}")
-        ok = False
+        print(f"  - Claude: failed to read credentials: {e}")
 else:
-    print("  ✗ Claude: not logged in — run 'claude login'")
-    ok = False
+    print("  - Claude: not logged in — run 'claude login'")
 
 # --- Codex ---
 codex_creds = Path.home() / ".codex" / "auth.json"
@@ -228,23 +243,28 @@ if codex_creds.exists():
         tokens = data.get("tokens", {})
         token = tokens.get("access_token") or data.get("access_token") or data.get("api_key", "")
         if token:
-            lines.append(f"OPENAI_API_KEY={token}")
+            openai_key = token
             print("  ✓ Codex: token found")
         else:
-            print("  - Codex: auth.json exists but no token (non-critical)")
+            print("  - Codex: auth.json exists but no token")
     except Exception as e:
-        print(f"  - Codex: failed to read auth.json: {e} (non-critical)")
+        print(f"  - Codex: failed to read auth.json: {e}")
 else:
-    print("  - Codex: not logged in — run 'codex login' if needed (non-critical)")
+    print("  - Codex: not logged in — run 'codex login' if needed")
 
 # --- Write .env ---
-lines.append("LITELLM_MASTER_KEY=sk-litellm-local")
+# Keys are always written (empty when unavailable) so every os.environ/ ref in
+# the LiteLLM config resolves and the proxy boots regardless of which logins exist.
+lines = [
+    f"ANTHROPIC_API_KEY={anthropic_key}",
+    f"OPENAI_API_KEY={openai_key}",
+    "LITELLM_MASTER_KEY=sk-litellm-local",
+]
 
 # Ollama API base. Default to the host install via host.docker.internal;
 # `make start ollama` (or AITELIER_OLLAMA_PROFILE=1) flips this to the
 # in-compose service.
-import os as _os
-if _os.environ.get("AITELIER_OLLAMA_PROFILE") == "1":
+if os.environ.get("AITELIER_OLLAMA_PROFILE") == "1":
     lines.append("OLLAMA_BASE_URL=http://ollama:11434")
 else:
     lines.append("OLLAMA_BASE_URL=http://host.docker.internal:11434")
@@ -253,15 +273,22 @@ Path(env_file).write_text("\n".join(lines) + "\n")
 # Restrict permissions — tokens are sensitive
 Path(env_file).chmod(0o600)
 
-if not ok:
-    sys.exit(1)
+# Capability summary — make degraded model families obvious at a glance.
+print("")
+print("  Available models:")
+print("    • local, nomic-embed-text, ollama/*  (no credential required)")
+# agent:* backends use the Sandbox Agent's own credentials (claude/codex
+# logins), NOT the LiteLLM key extracted here — don't gate them on it.
+if anthropic_key:
+    print("    • claude-sonnet, claude-haiku, anthropic/*  (LLM path)")
+else:
+    print("    ✗ claude-sonnet, claude-haiku, anthropic/*  (no Anthropic LLM credential)")
+if openai_key:
+    print("    • openai/*  (LLM path)")
+else:
+    print("    ✗ openai/*  (no OpenAI LLM credential)")
+print("    • agent:claude / agent:codex / …  (via Sandbox Agent's own logins)")
 PYEOF
-
-if [ $? -ne 0 ]; then
-    echo ""
-    echo "Fix credential issues above, then re-run."
-    exit 1
-fi
 
 echo "  Written to docker/.env (mode 600)"
 
@@ -429,8 +456,8 @@ EOF
     mkdir -p "$REPO_ROOT/runs"
 
     if ! command -v sandbox-agent >/dev/null 2>&1; then
-        echo "  Installing sandbox-agent (Rust binary)..."
-        curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh
+        echo "  Installing sandbox-agent (Rust binary, channel $SANDBOX_AGENT_CHANNEL)..."
+        curl -fsSL "https://releases.rivet.dev/sandbox-agent/${SANDBOX_AGENT_CHANNEL}/install.sh" | sh
         # The installer typically drops the binary into a user-local bin dir
         # (~/.local/bin or similar) and adds it to PATH for new shells.
         if ! command -v sandbox-agent >/dev/null 2>&1; then
@@ -444,7 +471,7 @@ EOF
         fi
         if ! command -v sandbox-agent >/dev/null 2>&1; then
             echo "  ✗ sandbox-agent install failed — not on PATH after install"
-            echo "    Install manually: curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | sh"
+            echo "    Install manually: curl -fsSL https://releases.rivet.dev/sandbox-agent/${SANDBOX_AGENT_CHANNEL}/install.sh | sh"
             exit 1
         fi
         echo "  ✓ Installed: $(command -v sandbox-agent)"

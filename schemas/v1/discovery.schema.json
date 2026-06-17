@@ -44,23 +44,26 @@
     },
     "dependencies": {
       "type": "object",
+      "title": "Dependencies",
       "properties": {
         "litellm": {
           "type": "object",
-          "required": ["reachable", "base_url"],
+          "title": "LitellmDep",
+          "required": ["reachable"],
           "properties": {
             "reachable": { "type": "boolean" },
-            "base_url":  { "type": "string" },
+            "base_url":  { "type": "string", "description": "Omitted in hosted mode (when service.api_key is set)" },
             "models":    { "type": "array", "items": { "type": "string" } },
             "reason":    { "type": "string" }
           }
         },
         "sandbox_agent": {
           "type": "object",
-          "required": ["reachable", "base_url"],
+          "title": "SandboxAgentDep",
+          "required": ["reachable"],
           "properties": {
             "reachable": { "type": "boolean" },
-            "base_url":  { "type": "string" },
+            "base_url":  { "type": "string", "description": "Omitted in hosted mode (when service.api_key is set)" },
             "agents":    { "type": "array", "items": { "type": "string" } },
             "reason":    { "type": "string" }
           }
@@ -69,8 +72,15 @@
     },
     "models": {
       "type": "array",
-      "description": "Convenience list of model identifiers callable on /v1/chat/completions (LiteLLM aliases + curated agent: routes). The authoritative listing is GET /v1/models.",
-      "items": { "type": "string" }
+      "description": "Convenience list of models callable on /v1/chat/completions (LiteLLM aliases + curated agent: routes). The authoritative listing is GET /v1/models.",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "response_format": { "description": "Per-model response_format capabilities, when known" }
+        }
+      }
     },
     "schemas": {
       "type": "object",

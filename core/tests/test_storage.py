@@ -296,6 +296,25 @@ async def test_run_score_empty_when_run_unscored(store):
 
 
 @pytest.mark.asyncio
+async def test_get_idempotent_expired_is_nonmutating(store):
+    """An expired idempotency key reads as absent but is NOT removed on read,
+    matching PostgresStore (which filters expired rows in its WHERE clause and
+    leaves them for the purge worker). A read that mutated would let a
+    re-record succeed in memory while Postgres still blocked it."""
+    from datetime import timedelta
+
+    from aitelier.storage.models import IdempotencyRecord
+
+    past = datetime.now(UTC) - timedelta(hours=1)
+    await store.record_idempotent(IdempotencyRecord(
+        key="expired-k", body_hash="h", endpoint="/v1/runs",
+        status_code=200, response={"ok": True}, expires_at=past,
+    ))
+    assert await store.get_idempotent("expired-k") is None   # expired → absent
+    assert "expired-k" in store._idempotency                 # but not popped
+
+
+@pytest.mark.asyncio
 async def test_events_append_and_list(store):
     await store.create_run(RunSpec(run_id="r", kind="agent"))
     await store.append_event(RunEvent(run_id="r", seq=1, kind="start",
@@ -403,7 +422,7 @@ async def test_mark_orphaned_running_runs_sweeps_pending_and_running(store):
     await store.update_run_state("c", "completed")                          # terminal
 
     swept = await store.mark_orphaned_running_runs()
-    assert swept == 2
+    assert set(swept) == {"a", "b"}                          # returns the flipped run_ids
     assert (await store.get_run("a")).state == "orphaned"
     assert (await store.get_run("b")).state == "orphaned"
     assert (await store.get_run("c")).state == "completed"   # untouched
@@ -417,9 +436,11 @@ async def test_webhook_enqueue_claim_record(store):
     due = await store.claim_pending_webhooks(limit=10)
     assert len(due) == 1
     assert due[0].id == wid
-    assert due[0].attempts == 1
+    # Claim does NOT count an attempt (so a crash before delivery doesn't burn
+    # one); record_webhook_attempt counts it.
+    assert due[0].attempts == 0
 
-    # Mark delivered
+    # Mark delivered → counts the attempt.
     await store.record_webhook_attempt(wid, status_code=200, error=None,
                                           next_attempt_at=None)
     # Same delivery shouldn't be claimed again
@@ -525,7 +546,7 @@ async def test_postgres_update_run_sandbox_and_orphan_sweep():
         await store.create_run(RunSpec(run_id="pg-orphan-1", kind="agent"))
         await store.update_run_state("pg-orphan-1", "running")
         swept = await store.mark_orphaned_running_runs()
-        assert swept >= 1
+        assert "pg-orphan-1" in swept
         run = await store.get_run("pg-orphan-1")
         assert run.state == "orphaned"
         assert run.ended_at is not None
@@ -536,3 +557,58 @@ async def test_postgres_update_run_sandbox_and_orphan_sweep():
                 "pg-sandbox-1", "pg-orphan-1",
             )
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_runs_awaiting_webhook(store):
+    """Terminal runs with a webhook_url but no delivery row are surfaced for
+    startup reconciliation; runs with a delivery, no url, or still running are not."""
+    # owed: terminal + webhook_url + no delivery
+    await store.create_run(RunSpec(run_id="r-owed", kind="agent",
+                                   metadata={"webhook_url": "https://h/1"}))
+    await store.update_run_state("r-owed", "running")
+    await store.finalize_run("r-owed", {"status": "ok", "content": "x"}, state="completed")
+    # already delivered: terminal + webhook_url + a delivery row exists
+    await store.create_run(RunSpec(run_id="r-done", kind="agent",
+                                   metadata={"webhook_url": "https://h/2"}))
+    await store.update_run_state("r-done", "running")
+    await store.finalize_run("r-done", {"status": "ok"}, state="completed")
+    await store.enqueue_webhook("https://h/2", {"x": 1}, run_id="r-done")
+    # no webhook requested
+    await store.create_run(RunSpec(run_id="r-nohook", kind="agent"))
+    await store.update_run_state("r-nohook", "running")
+    await store.finalize_run("r-nohook", {"status": "ok"}, state="completed")
+    # still running (not terminal)
+    await store.create_run(RunSpec(run_id="r-running", kind="agent",
+                                   metadata={"webhook_url": "https://h/3"}))
+
+    owed = await store.runs_awaiting_webhook()
+    assert {r.run_id for r in owed} == {"r-owed"}
+
+
+@pytest.mark.asyncio
+async def test_runs_awaiting_webhook_respects_since_window(store):
+    """A long-completed run whose delivery row has purged must not be re-fired:
+    the `since` window excludes runs that ended before it."""
+    from datetime import UTC, datetime, timedelta
+    await store.create_run(RunSpec(run_id="r-old", kind="agent",
+                                   metadata={"webhook_url": "https://h"}))
+    await store.update_run_state("r-old", "running")
+    await store.finalize_run("r-old", {"status": "ok"}, state="completed")
+    store._runs["r-old"].ended_at = datetime.now(UTC) - timedelta(days=10)
+    since = datetime.now(UTC) - timedelta(days=7)
+    assert await store.runs_awaiting_webhook(since=since) == []
+    # Unbounded still surfaces it (base behavior).
+    assert [r.run_id for r in await store.runs_awaiting_webhook()] == ["r-old"]
+
+
+@pytest.mark.asyncio
+async def test_runs_awaiting_webhook_includes_orphaned(store):
+    """Orphaned runs with a webhook_url but no delivery are reconciled too
+    (crash mid orphan-webhook-loop recovery)."""
+    await store.create_run(RunSpec(run_id="r-orph", kind="agent",
+                                   metadata={"webhook_url": "https://h"}))
+    await store.update_run_state("r-orph", "running")
+    await store.mark_orphaned_running_runs()  # → orphaned, no delivery enqueued
+    owed = await store.runs_awaiting_webhook()
+    assert "r-orph" in {r.run_id for r in owed}

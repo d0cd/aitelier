@@ -181,6 +181,7 @@ class Run:
 @dataclass
 class RunFilter:
     state: RunState | None = None
+    status: str | None = None
     kind: str | None = None
     agent_id: str | None = None
     trace_tag: str | None = None

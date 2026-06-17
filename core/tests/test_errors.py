@@ -227,8 +227,31 @@ def test_scrub_error_text_basic_auth_handles_http_and_https():
         assert f"{scheme}://[redacted]:[redacted]@host" in scrubbed
 
 
+def test_scrub_error_text_redacts_non_http_dsn_schemes():
+    """Database / cache driver errors echo non-http DSNs. The catch-all
+    scrubber must redact userinfo regardless of scheme."""
+    for dsn in (
+        "postgresql://aitelier:hunter2@localhost:5433/aitelier",
+        "postgres://u:p@db/app",
+        "redis://default:s3cret@cache:6379/0",
+    ):
+        scrubbed = scrub_error_text(f"connect failed: {dsn}")
+        assert "[redacted]:[redacted]@" in scrubbed
+        assert "hunter2" not in scrubbed
+        assert "s3cret" not in scrubbed
+
+
 def test_scrub_error_text_basic_auth_leaves_non_credential_urls_alone():
     """URLs without userinfo (most URLs) must not be touched. The pattern
     only fires when there's a `user:pass@` block before the host."""
     msg = "GET https://api.example.com/v1/things failed (500)"
     assert scrub_error_text(msg) == msg
+
+
+def test_classify_network_errors_as_provider_unavailable():
+    """httpx mid-call NetworkError leaves (ReadError/WriteError) classify as
+    ProviderUnavailable, matching the documented mapping."""
+    import httpx
+    from aitelier.errors import classify_error
+    assert classify_error(httpx.ReadError("peer reset")) == "ProviderUnavailable"
+    assert classify_error(httpx.WriteError("broken pipe")) == "ProviderUnavailable"

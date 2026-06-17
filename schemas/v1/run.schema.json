@@ -5,41 +5,204 @@
   "description": "A row from the durable runs table. Returned by GET /v1/runs and GET /v1/runs/{id} (with on-disk manifest details merged in).",
   "type": "object",
   "additionalProperties": false,
-  "required": ["run_id", "state", "kind"],
+  "required": [
+    "run_id",
+    "state",
+    "kind"
+  ],
   "properties": {
-    "run_id":            { "type": "string" },
-    "trace_id":          { "type": "string", "description": "Alias for run_id; preserved for legacy callers." },
+    "run_id": {
+      "type": "string"
+    },
+    "trace_id": {
+      "type": "string",
+      "description": "Alias for run_id; preserved for legacy callers."
+    },
     "state": {
       "type": "string",
-      "enum": ["pending", "running", "completed", "failed", "cancelled", "orphaned"],
+      "enum": [
+        "pending",
+        "running",
+        "completed",
+        "failed",
+        "cancelled",
+        "orphaned"
+      ],
       "description": "Lifecycle state. `orphaned` = the row was running when a prior aitelier process exited; Sandbox Agent has no resume API yet, so it's terminal."
     },
-    "kind":              { "type": "string", "enum": ["complete", "embed", "agent"] },
-    "agent_id":          { "type": ["string", "null"], "description": "Agent backend name (claude, codex, ...) when kind=agent." },
-    "model":             { "type": ["string", "null"] },
-    "started_at":        { "type": ["string", "null"], "format": "date-time" },
-    "ended_at":          { "type": ["string", "null"], "format": "date-time" },
-    "trace_tag":         { "type": ["string", "null"] },
-    "correlation_id":    { "type": ["string", "null"] },
-    "parent_run_id":     { "type": ["string", "null"], "description": "Optional pointer to a parent run for multi-agent workflows. Pure pass-through: aitelier records it and lets consumers query `/v1/runs?parent_run_id=X`, but enforces no semantics (no FK, no cycle check, no cascade). Orchestrators above aitelier own the meaning." },
-    "sandbox_backend":   { "type": ["string", "null"], "description": "`local` if the SA URL is loopback, `remote` otherwise. Stamped at agent-call time." },
-    "sandbox_url":       { "type": ["string", "null"] },
-    "sandbox_server_id": { "type": ["string", "null"], "description": "ACP server_id this run was bound to. Future SA session-resume APIs can adopt it." },
-    "workspace":         { "type": ["string", "null"] },
-    "environment":       { "type": "object", "description": "Snapshot of mcp_servers + tool_allowlist at run time." },
-    "input_tokens":      { "type": "integer" },
-    "output_tokens":     { "type": "integer" },
-    "total_tokens":      { "type": "integer" },
-    "cost_usd":          { "type": ["number", "null"] },
-    "finish_reason":     { "type": ["string", "null"] },
-    "tool_call_count":   { "type": "integer" },
-    "status":            { "type": ["string", "null"], "enum": ["ok", "error", "cancelled", null] },
-    "error_type":        { "type": ["string", "null"] },
-    "error_msg":         { "type": ["string", "null"] },
-    "system_prompt_hash":{ "type": ["string", "null"], "description": "SHA-256 of the system prompt actually sent to the provider; lets dashboards group runs by prompt variant." },
-    "result":            { "type": "object", "description": "Final result payload from the run. For LLM/embed kinds: the OpenAI-shape response body. For agent kinds: the aggregated done event (content, finish_reason, usage, tool_calls). Empty object if the run hasn't reached a terminal state." },
-    "metadata":          { "type": "object" },
-    "request_body":      { "type": ["object", "null"], "description": "Caller's request body as received (pre-fold, pre-translate). For ChatCompletionRequest / AsyncRunRequest / EmbeddingsRequest. Null for historical runs from before the v4 storage migration. Projection-redacted at the HTTP boundary." },
-    "rendered_messages": { "type": ["array", "null"], "items": {"type": "object"}, "description": "Message list after aitelier's agent-path translations (system-prompt fold, response_format injection) — what actually went on the wire. Null when no translation applies (embed runs, pre-v4 runs)." }
+    "kind": {
+      "type": "string",
+      "enum": [
+        "complete",
+        "embed",
+        "agent"
+      ]
+    },
+    "agent_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Agent backend name (claude, codex, ...) when kind=agent."
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "ended_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "trace_tag": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "correlation_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "parent_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional pointer to a parent run for multi-agent workflows. Pure pass-through: aitelier records it and lets consumers query `/v1/runs?parent_run_id=X`, but enforces no semantics (no FK, no cycle check, no cascade). Orchestrators above aitelier own the meaning."
+    },
+    "sandbox_backend": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "`local` if the SA URL is loopback, `remote` otherwise. Stamped at agent-call time."
+    },
+    "sandbox_url": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "sandbox_server_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "ACP server_id this run was bound to. Future SA session-resume APIs can adopt it."
+    },
+    "workspace": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "environment": {
+      "type": "object",
+      "description": "Snapshot of mcp_servers + tool_allowlist at run time.",
+      "default": {}
+    },
+    "input_tokens": {
+      "type": "integer"
+    },
+    "output_tokens": {
+      "type": "integer"
+    },
+    "total_tokens": {
+      "type": "integer"
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "finish_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_call_count": {
+      "type": "integer"
+    },
+    "status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        "error",
+        "cancelled",
+        null
+      ]
+    },
+    "error_type": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "error_msg": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "system_prompt_hash": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "SHA-256 of the system prompt actually sent to the provider; lets dashboards group runs by prompt variant."
+    },
+    "result": {
+      "type": "object",
+      "description": "Final result payload from the run. For LLM/embed kinds: the OpenAI-shape response body. For agent kinds: the aggregated done event (content, finish_reason, usage, tool_calls). Empty object if the run hasn't reached a terminal state.",
+      "default": {}
+    },
+    "metadata": {
+      "type": "object",
+      "default": {}
+    },
+    "request_body": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Caller's request body as received (pre-fold, pre-translate). For ChatCompletionRequest / AsyncRunRequest / EmbeddingsRequest. Null for historical runs from before the v4 storage migration. Projection-redacted at the HTTP boundary."
+    },
+    "rendered_messages": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object"
+      },
+      "description": "Message list after aitelier's agent-path translations (system-prompt fold, response_format injection) \u2014 what actually went on the wire. Null when no translation applies (embed runs, pre-v4 runs)."
+    },
+    "manifest": {
+      "type": "object",
+      "description": "On-disk run manifest (runs/{id}/manifest.json), merged in by GET /v1/runs/{id} when present."
+    },
+    "prompt": {
+      "type": "string",
+      "description": "On-disk rendered prompt (runs/{id}/prompt.txt), merged in by GET /v1/runs/{id} when present."
+    }
   }
 }

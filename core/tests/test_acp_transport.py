@@ -13,13 +13,11 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from aitelier.providers.acp_transport import (
     _is_local_url,
     _persist_sandbox_server_id,
     _scrub_sandbox_url,
 )
-
 
 # --- _is_local_url ----------------------------------------------------------
 

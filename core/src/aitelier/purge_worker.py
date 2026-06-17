@@ -29,19 +29,22 @@ async def _purge_tick() -> None:
     cfg = get_config().purge
     store = await get_store()
 
-    for name, coro in (
-        ("idempotency_keys", store.purge_expired_idempotency_keys()),
+    # Each pass is a zero-arg callable so the coroutine is created only when
+    # we're about to await it — a tuple of pre-built coroutines would leak
+    # "never awaited" warnings if the worker is cancelled mid-tick.
+    for name, call in (
+        ("idempotency_keys", store.purge_expired_idempotency_keys),
         ("webhook_deliveries",
-         store.purge_old_webhook_deliveries(
+         lambda: store.purge_old_webhook_deliveries(
              max_age_days=cfg.webhook_retention_days,
          )),
         ("run_events",
-         store.purge_old_run_events(
+         lambda: store.purge_old_run_events(
              max_age_days=cfg.event_retention_days,
          )),
     ):
         try:
-            removed = await coro
+            removed = await call()
             if removed:
                 logger.info("purge_%s removed %d row(s)", name, removed)
         except Exception as exc:
@@ -50,15 +53,19 @@ async def _purge_tick() -> None:
 
 
 async def _loop() -> None:
+    # Config is read once (get_config caches); the interval is fixed for the
+    # life of the process. The worker is only started when interval > 0
+    # (see start_purge_worker), so enabling/disabling requires a restart.
+    interval = get_config().purge.interval_seconds
+    # Tick once on boot: with a 1h default interval, a frequently-restarting
+    # process would otherwise never purge idempotency_keys / webhooks /
+    # events. The in-loop sleep-first still rate-limits retries on failure.
+    try:
+        await _purge_tick()
+    except Exception as exc:
+        logger.warning("purge worker initial tick errored: %s", exc)
     while True:
         try:
-            # Re-read on every tick so operator config edits take effect
-            # without a restart. A zero/negative value pauses the worker
-            # without killing it.
-            interval = get_config().purge.interval_seconds
-            if interval <= 0:
-                await asyncio.sleep(60)
-                continue
             await asyncio.sleep(interval)
             await _purge_tick()
         except asyncio.CancelledError:

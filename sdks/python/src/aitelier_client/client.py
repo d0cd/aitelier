@@ -319,14 +319,19 @@ class Aitelier:
 
     async def aggregate_traces(
         self, *,
-        group_by: str = "model",
+        group_by: str = "trace_tag",
         since: str | None = None,
+        until: str | None = None,
         trace_tag: str | None = None,
         limit: int = 50,
     ) -> TracesAggregate:
+        # `group_by` defaults to "trace_tag" to match the server default, so
+        # the SDK doesn't silently override it.
         params: dict[str, Any] = {"group_by": group_by}
         if since is not None:
             params["since"] = since
+        if until is not None:
+            params["until"] = until
         if trace_tag is not None:
             params["trace_tag"] = trace_tag
         if limit is not None:
@@ -346,13 +351,17 @@ class Aitelier:
 
     async def create_schedule(
         self, *,
-        name: str,
+        name: str | None = None,
         task: dict,
         interval_seconds: int | None = None,
         at_iso: str | None = None,
         webhook_url: str | None = None,
     ) -> Schedule:
-        body: dict[str, Any] = {"name": name, "task": task}
+        # `name` is optional — the server defaults it to "scheduled" (matches
+        # the TS SDK, which omits the key when unset).
+        body: dict[str, Any] = {"task": task}
+        if name is not None:
+            body["name"] = name
         if interval_seconds is not None:
             body["interval_seconds"] = interval_seconds
         if at_iso is not None:

@@ -89,6 +89,24 @@ def test_auth_rejects_wrong_bearer(client):
         cfg.service.api_key = None
 
 
+def test_auth_401_carries_correlation_id(client):
+    """The 401 must echo X-Correlation-Id — correlation runs outermost so the
+    rejection a consumer most needs to trace is still tagged."""
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        resp = client.get(
+            "/v1/discovery",
+            headers={"Authorization": "Bearer wrong-key",
+                     "X-Correlation-Id": "trace-401"},
+        )
+        assert resp.status_code == 401
+        assert resp.headers.get("X-Correlation-Id") == "trace-401"
+    finally:
+        cfg.service.api_key = None
+
+
 def test_health(client):
     resp = client.get("/v1/health")
     assert resp.status_code == 200
@@ -234,7 +252,7 @@ def test_redact_secrets_strips_mcp_headers_and_command_env():
         "tool_allowlist": ["fs.read"],
     }
     out = _redact_secrets(env)
-    assert out["mcp_servers"][0]["headers"] == ["[redacted]"]
+    assert out["mcp_servers"][0]["headers"] == [{"name": "Authorization", "value": "[redacted]"}]
     assert out["tool_allowlist"] == ["fs.read"]  # unchanged
 
     task = {
@@ -249,7 +267,34 @@ def test_redact_secrets_strips_mcp_headers_and_command_env():
     }
     out = _redact_secrets(task)
     cmd_env = out["aitelier"]["prepare"]["commands"][0]["env"]
-    assert cmd_env == ["[redacted]"]
+    assert cmd_env == [{"name": "DB_URL", "value": "[redacted]"}]
+
+
+def test_redact_secrets_strips_dict_shaped_env_and_headers():
+    """The schema declares prepare/sidecar `env` as an object {name: value}.
+    Dict-shaped env (and map-style headers) must redact values, keep keys."""
+    from aitelier.server import _redact_secrets
+    task = {
+        "aitelier": {
+            "prepare": {
+                "commands": [
+                    {"cmd": "x", "env": {"DB_URL": "postgres://u:secret@db", "PATH": "/bin"}},
+                ],
+                "sidecars": [
+                    {"name": "s", "cmd": "y", "env": {"REGISTRY_TOKEN": "ghp_secret"}},
+                ],
+            },
+            "mcp_servers": [
+                {"name": "x", "headers": {"Authorization": "Bearer SECRET"}},
+            ],
+        },
+    }
+    out = _redact_secrets(task)
+    cmd_env = out["aitelier"]["prepare"]["commands"][0]["env"]
+    assert cmd_env == {"DB_URL": "[redacted]", "PATH": "[redacted]"}
+    assert out["aitelier"]["prepare"]["sidecars"][0]["env"] == {"REGISTRY_TOKEN": "[redacted]"}
+    assert out["aitelier"]["mcp_servers"][0]["headers"] == {"Authorization": "[redacted]"}
+    assert "secret" not in str(out)
 
 
 def test_schedules_redacts_headers_and_env_on_get(client):
@@ -337,7 +382,7 @@ def test_run_to_dict_redacts_request_body_and_rendered_messages():
     out = _run_to_dict(_R())
     # MCP headers redacted; rest of structure intact.
     redacted_headers = out["request_body"]["aitelier"]["mcp_servers"][0]["headers"]
-    assert redacted_headers == ["[redacted]"]
+    assert redacted_headers == [{"name": "Authorization", "value": "[redacted]"}]
     assert out["request_body"]["model"] == "agent:claude"
     assert out["request_body"]["messages"] == [{"role": "user", "content": "hi"}]
     # Rendered messages pass through when no credential shape is present.
@@ -432,7 +477,7 @@ def test_redact_secrets_strips_metadata_and_result_on_run_to_dict():
 
     out = _run_to_dict(_R())
     assert out["result"]["authorization"] == "[redacted]"
-    assert out["metadata"]["headers"] == ["[redacted]"]
+    assert out["metadata"]["headers"] == [{"name": "X-Forwarded", "value": "[redacted]"}]
     # Non-secret fields stay intact.
     assert out["result"]["content"] == "ok"
     assert out["metadata"]["webhook_url"] == "https://hooks.example.com/X"
@@ -454,7 +499,7 @@ def test_event_to_dict_redacts_tool_call_payloads():
         },
     )
     out = _event_to_dict(ev)
-    assert out["payload"]["input"]["env"] == ["[redacted]"]
+    assert out["payload"]["input"]["env"] == [{"name": "DB_URL", "value": "[redacted]"}]
     assert out["payload"]["tool"] == "shell"
 
 
@@ -653,15 +698,6 @@ def test_chat_completions_accepts_reasoning_effort_field():
     assert body["max_completion_tokens"] == 500
 
 
-def test_aitelier_agent_opts_plan_mode_round_trips():
-    """plan_mode accepts bool | None and feeds into _open_acp_session
-    as planMode (via call_via_sandbox kwargs)."""
-    from aitelier.openai_compat import AitelierAgentOpts
-    assert AitelierAgentOpts(plan_mode=False).plan_mode is False
-    assert AitelierAgentOpts(plan_mode=True).plan_mode is True
-    assert AitelierAgentOpts().plan_mode is None
-
-
 def test_health_includes_dependencies_when_discovery_cache_warm(client):
     """When /v1/discovery has populated the cache, /v1/health surfaces
     a deps summary and flips status to "degraded" if any dep is down."""
@@ -766,11 +802,12 @@ def test_fold_response_format_injects_json_schema_into_system_prompt():
 
 
 def test_fold_response_format_no_op_for_other_types():
-    """response_format types other than json_schema are passed through
-    without prompt modification."""
+    """No response_format → passthrough. json_object now injects a JSON
+    directive (so it isn't silently dropped on the agent path)."""
     from aitelier.server import _fold_response_format
     assert _fold_response_format("hi", None) == "hi"
-    assert _fold_response_format("hi", {"type": "json_object"}) == "hi"
+    folded = _fold_response_format("hi", {"type": "json_object"})
+    assert folded != "hi" and "JSON object" in folded
 
 
 def test_chat_completions_does_not_emit_aitelier_trace_id(client):
@@ -874,7 +911,7 @@ def test_embeddings_passthrough(client):
 
 
 def test_models_endpoint(client):
-    with patch("aitelier.server.list_models",
+    with patch("aitelier.endpoints.inference.list_models",
                 new_callable=AsyncMock,
                 return_value=[
                     {"id": "claude-sonnet", "object": "model",
@@ -890,65 +927,35 @@ def test_models_endpoint(client):
     assert any(m["id"] == "claude-sonnet" for m in data["data"])
 
 
-def test_filter_chat_capable_drops_non_chat_routes():
-    """The LiteLLM catalog includes TTS, image, embedding, moderation,
-    transcription, realtime voice, and web-search routes that can't
-    drive a code agent. Filter them out of the inner-LLM picklist so
-    consumers don't see options that would fail at first call."""
-    from aitelier.endpoints.inference import _filter_chat_capable
-    ids = [
-        "claude-sonnet",
-        "openai/gpt-4o",
-        "openai/dall-e-3",
-        "openai/tts-1",
-        "openai/whisper-1",
-        "openai/text-embedding-3-small",
-        "openai/omni-moderation-latest",
-        "openai/sora-2-pro",
-        "openai/gpt-image-1",
-        "openai/gpt-realtime",
-        "openai/gpt-4o-realtime-preview",
-        "openai/gpt-4o-mini-realtime-preview-2024-12-17",
-        "openai/gpt-4o-search-preview",
-        "openai/gpt-4o-audio-preview",
-    ]
-    kept = _filter_chat_capable(ids)
-    assert "claude-sonnet" in kept
-    assert "openai/gpt-4o" in kept
-    assert "openai/dall-e-3" not in kept
-    assert "openai/tts-1" not in kept
-    assert "openai/whisper-1" not in kept
-    assert "openai/text-embedding-3-small" not in kept
-    assert "openai/omni-moderation-latest" not in kept
-    assert "openai/sora-2-pro" not in kept
-    assert "openai/gpt-image-1" not in kept
-    assert "openai/gpt-realtime" not in kept
-    assert "openai/gpt-4o-realtime-preview" not in kept
-    assert "openai/gpt-4o-mini-realtime-preview-2024-12-17" not in kept
-    assert "openai/gpt-4o-search-preview" not in kept
-    assert "openai/gpt-4o-audio-preview" not in kept
-
-
-def test_models_endpoint_declares_agent_request_caps(client):
-    """Agent entries declare the stricter request-field gates so consumer
-    pickers can pre-strip fields instead of waiting for a 400."""
+def _patch_models_env(agents, probe_return):
+    """Helper: patch list_models + the SA agents fetch + the per-backend
+    config-option probe so /v1/models can be exercised without live infra."""
     fake_resp = MagicMock()
     fake_resp.status_code = 200
-    fake_resp.json = MagicMock(return_value=[{
-        "id": "claude", "installed": True,
-        "capabilities": {"toolCalls": True, "reasoning": False},
-    }])
+    fake_resp.json = MagicMock(return_value=agents)
     fake_client = MagicMock()
     fake_client.get = AsyncMock(return_value=fake_resp)
 
     async def fake_get_shared():
         return fake_client
 
-    with patch("aitelier.server.list_models",
-                new_callable=AsyncMock,
-                return_value=[{"id": "claude-sonnet", "object": "model",
-                                "owned_by": "litellm"}]), \
-            patch("aitelier.providers.llm.get_shared_client", fake_get_shared):
+    return (
+        patch("aitelier.endpoints.inference.list_models", new_callable=AsyncMock,
+              return_value=[{"id": "claude-sonnet", "object": "model",
+                             "owned_by": "litellm"}]),
+        patch("aitelier.providers.llm.get_shared_client", fake_get_shared),
+        patch("aitelier.providers.sandbox_agent.probe_backend_config_options",
+              new_callable=AsyncMock, return_value=probe_return),
+    )
+
+
+def test_models_endpoint_declares_agent_request_caps(client):
+    """Agent entries declare the stricter request-field gates so consumer
+    pickers can pre-strip fields instead of waiting for a 400."""
+    agents = [{"id": "claude", "installed": True,
+               "capabilities": {"toolCalls": True, "reasoning": False}}]
+    p1, p2, p3 = _patch_models_env(agents, None)
+    with p1, p2, p3:
         resp = client.get("/v1/models")
     data = resp.json()["data"]
     agent_entry = next(m for m in data if m["id"] == "agent:claude")
@@ -957,10 +964,43 @@ def test_models_endpoint_declares_agent_request_caps(client):
     assert caps["tool_choice"] is False
     assert caps["n_gt_1"] is False
     assert caps["top_p"] is False
+    assert caps["temperature"] is False  # full sampling set now declared
     assert caps["streaming"] is True
-    assert caps["response_format"] == ["json_schema"]
+    assert caps["response_format"] == ["json_object", "json_schema"]
     # The ACP backend cap block is preserved separately.
     assert agent_entry["aitelier_capabilities"]["toolCalls"] is True
+
+
+def test_models_endpoint_surfaces_probed_backend_options(client):
+    """Agent entries carry the backend's real advertised models / reasoning
+    levels / approval modes (not the LiteLLM catalog)."""
+    from aitelier.endpoints.inference import _CONFIG_OPTS_CACHE
+    _CONFIG_OPTS_CACHE.clear()
+    agents = [{"id": "codex", "installed": True, "capabilities": {}}]
+    probe = {"models": ["gpt-5.4", "gpt-5.3-codex"],
+             "reasoning_levels": ["low", "medium", "high", "xhigh"],
+             "approval_modes": ["read-only", "auto", "full-access"]}
+    p1, p2, p3 = _patch_models_env(agents, probe)
+    with p1, p2, p3:
+        resp = client.get("/v1/models")
+    entry = next(m for m in resp.json()["data"] if m["id"] == "agent:codex")
+    assert entry["aitelier_inner_llms"] == ["gpt-5.4", "gpt-5.3-codex"]
+    assert entry["aitelier_reasoning_levels"] == ["low", "medium", "high", "xhigh"]
+    assert entry["aitelier_approval_modes"] == ["read-only", "auto", "full-access"]
+
+
+def test_models_endpoint_omits_options_when_probe_fails(client):
+    """A failed probe omits the advertised-option fields but the entry still
+    appears (with request caps)."""
+    from aitelier.endpoints.inference import _CONFIG_OPTS_CACHE
+    _CONFIG_OPTS_CACHE.clear()
+    agents = [{"id": "codex", "installed": True, "capabilities": {}}]
+    p1, p2, p3 = _patch_models_env(agents, None)  # probe returns None
+    with p1, p2, p3:
+        resp = client.get("/v1/models")
+    entry = next(m for m in resp.json()["data"] if m["id"] == "agent:codex")
+    assert "aitelier_inner_llms" not in entry
+    assert entry["aitelier_request_caps"]["tools"] is False
 
 
 def test_models_endpoint_logs_warning_when_sa_probe_fails(client, caplog):
@@ -2380,6 +2420,37 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
             _active_runs.pop(f"saturating-run-{i}", None)
 
 
+def test_embeddings_503s_when_saturated(client, monkeypatch):
+    """The concurrency cap covers the embeddings path too — a flood of
+    embedding calls must not slip past `max_in_flight_runs` just because
+    they're not agent runs."""
+    from aitelier.server import _active_runs
+    fake_task = MagicMock()
+    fake_task.done = MagicMock(return_value=False)
+    cap = 3
+    monkeypatch.setattr(
+        "aitelier.server.get_config",
+        lambda: MagicMock(service=MagicMock(
+            max_in_flight_runs=cap,
+            rate_limit_per_minute=0,
+            max_request_body_bytes=0,
+            api_key=None,
+        )),
+    )
+    for i in range(cap):
+        _active_runs[f"sat-embed-{i}"] = fake_task
+    try:
+        resp = client.post("/v1/embeddings", json={
+            "model": "nomic-embed-text",
+            "input": "hello",
+        })
+        assert resp.status_code == 503
+        assert "capacity" in resp.text.lower()
+    finally:
+        for i in range(cap):
+            _active_runs.pop(f"sat-embed-{i}", None)
+
+
 def test_wait_for_run_returns_terminal_run(client):
     """`POST /v1/runs/{id}/wait` blocks until terminal state then
     returns the Run row. Pre-seed a run already in `completed` so the
@@ -2835,6 +2906,35 @@ async def test_lifespan_sweeps_orphaned_runs_on_startup():
         assert run.ended_at is not None
 
 
+@pytest.mark.asyncio
+async def test_lifespan_orphan_webhook_fires_once_not_on_every_restart():
+    """The startup sweep delivers a terminal `orphaned` webhook for runs it
+    flips — exactly once. A second startup (crash-loop) must NOT re-enqueue
+    a webhook for a run already orphaned in a prior generation."""
+    from aitelier.server import app, lifespan
+    from aitelier.storage import RunSpec, get_store
+
+    store = await get_store()
+    # An async run that registered a webhook_url and died mid-flight.
+    await store.create_run(RunSpec(
+        run_id="orphan-wh", kind="agent",
+        metadata={"webhook_url": "https://hook.example.com/cb"},
+    ))
+    await store.update_run_state("orphan-wh", "running")
+
+    async with lifespan(app):
+        pass
+    first = await store.count_pending_webhooks()
+    assert first == 1, "orphan sweep should enqueue exactly one webhook"
+
+    # Second startup: the run is already `orphaned` (not pending/running),
+    # so the sweep must not match it again and must not re-fire.
+    async with lifespan(app):
+        pass
+    second = await store.count_pending_webhooks()
+    assert second == first, "restart must not re-enqueue stale orphan webhooks"
+
+
 def test_correlation_id_propagates_to_log_records(client, caplog):
     """Logging inside a request should pick up correlation_id from contextvar."""
     import logging
@@ -3032,3 +3132,215 @@ def test_export_runs_includes_request_body(client):
                 if ln and '"exp-r-body"' in ln]
     assert matching
     assert matching[0]["request_body"] == rb
+
+
+# --- Read-only /ui static page ---
+
+
+def test_ui_served_as_html(client):
+    """GET /ui returns the static dashboard page as HTML."""
+    resp = client.get("/ui")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert 'id="aitelier-ui"' in resp.text
+
+
+def test_root_redirects_to_ui(client):
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code in (307, 308)
+    assert resp.headers["location"] == "/ui"
+
+
+def test_ui_public_even_with_api_key(client):
+    """The page itself is exempt from auth (data calls still gate)."""
+    from aitelier.config import get_config
+    cfg = get_config()
+    cfg.service.api_key = "secret-key"
+    try:
+        assert client.get("/ui").status_code == 200
+        # Data endpoint still requires the bearer.
+        assert client.get("/v1/runs").status_code == 401
+    finally:
+        cfg.service.api_key = None
+
+
+# --- Claude-only agent options rejected on other backends ---
+
+
+def test_reject_claude_only_opts_on_non_claude():
+    from aitelier.openai_compat import AitelierAgentOpts, ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+    from fastapi import HTTPException
+
+    req = ChatCompletionRequest(
+        model="agent:codex",
+        messages=[{"role": "user", "content": "hi"}],
+        aitelier=AitelierAgentOpts(tool_allowlist=["Read"], max_turns=5),
+    )
+    with pytest.raises(HTTPException) as ei:
+        _reject_agent_incompatible_fields(req, "codex")
+    assert ei.value.status_code == 400
+    assert "tool_allowlist" in ei.value.detail and "max_turns" in ei.value.detail
+    assert "approval_mode" in ei.value.detail
+
+
+def test_claude_only_opts_allowed_on_claude():
+    from aitelier.openai_compat import AitelierAgentOpts, ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+
+    req = ChatCompletionRequest(
+        model="agent:claude",
+        messages=[{"role": "user", "content": "hi"}],
+        aitelier=AitelierAgentOpts(tool_allowlist=["Read"], max_turns=5),
+    )
+    _reject_agent_incompatible_fields(req, "claude")  # must not raise
+
+
+def test_reasoning_and_approval_not_rejected_on_non_claude():
+    from aitelier.openai_compat import AitelierAgentOpts, ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+
+    req = ChatCompletionRequest(
+        model="agent:codex",
+        messages=[{"role": "user", "content": "hi"}],
+        aitelier=AitelierAgentOpts(reasoning_effort="high", approval_mode="auto"),
+    )
+    _reject_agent_incompatible_fields(req, "codex")  # must not raise
+
+
+# --- Agent path rejects unmappable sampling/decoding fields ---
+
+
+def test_agent_path_rejects_sampling_fields():
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+    from fastapi import HTTPException
+
+    for field, value in [
+        ("temperature", 0.0), ("max_tokens", 50), ("max_completion_tokens", 50),
+        ("seed", 7), ("stop", ["END"]), ("frequency_penalty", 0.1),
+        ("presence_penalty", 0.1), ("top_p", 0.5), ("logprobs", True),
+        ("top_logprobs", 3),
+    ]:
+        req = ChatCompletionRequest(
+            model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+            **{field: value},
+        )
+        with pytest.raises(HTTPException) as ei:
+            _reject_agent_incompatible_fields(req, "claude")
+        assert ei.value.status_code == 400
+        assert field in ei.value.detail
+
+
+def test_agent_path_clean_request_not_rejected():
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+    req = ChatCompletionRequest(
+        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+    )
+    _reject_agent_incompatible_fields(req, "claude")  # must not raise
+
+
+def test_fold_response_format_json_object_injects_directive():
+    from aitelier.server import _fold_response_format
+    folded = _fold_response_format(None, {"type": "json_object"})
+    assert folded is not None
+    assert "JSON object" in folded
+    # passthrough when no response_format
+    assert _fold_response_format("sys", None) == "sys"
+
+
+def test_chat_completions_stream_finalizes_when_aborted_midstream(client):
+    """If the LLM stream ends without a terminal chunk (client disconnect /
+    abrupt error), the run must be finalized (cancelled), not left running."""
+    async def fake_stream(body, *, timeout):
+        yield {"choices": [{"index": 0, "delta": {"content": "partial"},
+                            "finish_reason": None}]}
+        raise RuntimeError("abort mid-stream")  # not LLMError → final stays None
+
+    with patch("aitelier.server.chat_completion_stream", fake_stream):
+        try:
+            client.post(
+                "/v1/chat/completions",
+                json={"model": "claude-sonnet",
+                      "messages": [{"role": "user", "content": "hi"}],
+                      "stream": True},
+                headers={"X-Correlation-Id": "disc-1"},
+            )
+        except Exception:
+            pass  # the abort may surface to the client; the run state is what matters
+
+    runs = [r for r in _runs_from_store() if r.correlation_id == "disc-1"]
+    assert runs, "run row should exist"
+    assert runs[0].state == "cancelled", f"expected cancelled, got {runs[0].state}"
+
+
+def test_examples_validation_rejects_malformed():
+    """Malformed few-shot examples (wrong keys / empty) fail fast at parse
+    time instead of folding silently into empty User:/Assistant: blocks."""
+    import pytest as _pytest
+    from aitelier.openai_compat import AitelierAgentOpts
+    from pydantic import ValidationError
+    # valid
+    AitelierAgentOpts(examples=[{"user": "q", "assistant": "a"}])
+    # wrong keys
+    with _pytest.raises(ValidationError):
+        AitelierAgentOpts(examples=[{"input": "q", "output": "a"}])
+    # empty value
+    with _pytest.raises(ValidationError):
+        AitelierAgentOpts(examples=[{"user": "q", "assistant": ""}])
+
+
+def test_agent_stream_rejects_prepare_artifacts():
+    from aitelier.openai_compat import AitelierAgentOpts, ChatCompletionRequest
+    from aitelier.server import _reject_agent_incompatible_fields
+    from fastapi import HTTPException
+
+    req = ChatCompletionRequest(
+        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+        aitelier=AitelierAgentOpts(prepare={"commands": [{"cmd": "ls"}]}),
+    )
+    with pytest.raises(HTTPException) as ei:
+        _reject_agent_incompatible_fields(req, "claude")
+    assert ei.value.status_code == 400 and "prepare" in ei.value.detail
+
+    # Non-streaming with prepare is fine.
+    req2 = ChatCompletionRequest(
+        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+        aitelier=AitelierAgentOpts(prepare={"commands": [{"cmd": "ls"}]}),
+    )
+    _reject_agent_incompatible_fields(req2, "claude")  # must not raise
+
+
+def test_redact_secrets_preserves_list_header_names():
+    """ACP list-shaped headers `[{name, value}]` keep their `name`; only the
+    value is redacted (was: whole dict replaced by a bare string)."""
+    from aitelier.server import _redact_secrets
+    out = _redact_secrets({"headers": [{"name": "Authorization", "value": "Bearer s3cr3t"}]})
+    assert out["headers"] == [{"name": "Authorization", "value": "[redacted]"}]
+    out2 = _redact_secrets({"env": {"DSN": "postgres://u:p@h/db"}})
+    assert out2["env"] == {"DSN": "[redacted]"}
+
+
+def test_mcp_servers_validator_rejects_bad_transport_and_missing_name():
+    from aitelier.openai_compat import AitelierAgentOpts
+    from pydantic import ValidationError
+    AitelierAgentOpts(mcp_servers=[{"name": "x", "transport": "http"}])  # ok
+    AitelierAgentOpts(mcp_servers=[{"name": "x", "transport": "stdio"}])  # ok
+    with pytest.raises(ValidationError):
+        AitelierAgentOpts(mcp_servers=[{"name": "x", "transport": "sse"}])
+    with pytest.raises(ValidationError):
+        AitelierAgentOpts(mcp_servers=[{"transport": "http"}])  # missing name
+
+
+def test_stream_chunk_for_done_respects_include_usage():
+    from aitelier.server import _stream_chunk_for_done
+    ev = {"type": "done", "status": "ok", "content": "hi",
+          "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}
+    c_on, _ = _stream_chunk_for_done(ev, model="agent:claude", run_id="r",
+                                     stamp=lambda c: c, include_usage=True)
+    assert "usage" in c_on
+    c_off, _ = _stream_chunk_for_done(ev, model="agent:claude", run_id="r",
+                                      stamp=lambda c: c, include_usage=False)
+    assert "usage" not in c_off

@@ -30,7 +30,7 @@ openai = ait.openai()   # preconfigured OpenAI client
 
 # LLM call
 resp = await openai.chat.completions.create(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet",
     messages=[{"role": "user", "content": "Summarize today's news."}],
 )
 

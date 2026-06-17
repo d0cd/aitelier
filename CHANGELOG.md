@@ -257,14 +257,13 @@ preserved; tests grew from 325 → 363.
 
 #### Backend primitives
 
-- **`aitelier.plan_mode`** — new request field gates the agent's
-  plan-mode default at session/new. Sent as
-  `session/set_config_option planMode`. Codex / cursor default to
-  interactive deliberation (`true`); set `false` for batch /
-  non-interactive callers. Unblocks the most common deepread shape
-  (codex as LiteLLM fallback) where plan mode made the agent refuse
-  to execute. Plumbed through `_open_acp_session` and
-  `aitelier_request.schema.json`.
+- **`aitelier.reasoning_effort` / `aitelier.approval_mode`** — agent
+  session config driven by what each backend advertises at `session/new`:
+  inner model via `session/set_model`, reasoning via
+  `session/set_config_option` (`thought_level`), approval/sandbox preset
+  via `session/set_mode` (`mode`). Values validated against the advertised
+  set; unknown values fail fast. (Supersedes the earlier inert `plan_mode`
+  field, which was removed.)
 - **claude-acp config via `session/new._meta`** — `maxTurns`, `model`,
   `allowedTools`, `systemPrompt` now flow via
   `_meta.claudeCode.options` instead of the silently-dropped

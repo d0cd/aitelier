@@ -228,8 +228,6 @@ def _classify_llm_status(status: int) -> str:
         return "RateLimited"
     if status in (401, 403):
         return "AuthError"
-    if status >= 500:
-        return "ProviderError"
     return "ProviderError"
 
 
@@ -532,6 +530,13 @@ async def list_models() -> list[dict]:
             "top_p": True,
             "streaming": True,
         }
+        # The Ollama bypass (`local` / `ollama/*`) maps a subset of options:
+        # it honors tools + sampling knobs but has no `n` (always 1) or
+        # `tool_choice` forcing, so advertise those honestly per route.
+        from aitelier.providers.ollama import routes_to_ollama
+        if routes_to_ollama(mid):
+            caps["n_gt_1"] = False
+            caps["tool_choice"] = False
         if supports is not None:
             caps["response_format"] = supports
         entry["aitelier_request_caps"] = caps

@@ -12,8 +12,13 @@
 
 FROM alpine:3.20
 
+# Install channel — `0.4.x` tracks the latest 0.4 patch. For reproducible
+# builds, override with an exact patch (e.g. `--build-arg SA_CHANNEL=0.4.3`)
+# and keep it in sync with scripts/start.sh's SANDBOX_AGENT_CHANNEL.
+ARG SA_CHANNEL=0.4.x
+
 RUN apk add --no-cache curl bash ca-certificates nodejs npm git \
- && curl -fsSL https://releases.rivet.dev/sandbox-agent/0.4.x/install.sh | bash \
+ && curl -fsSL "https://releases.rivet.dev/sandbox-agent/${SA_CHANNEL}/install.sh" | bash \
  && sandbox-agent --version
 
 # Credentials get mounted in by docker-compose, not baked in. SA reads

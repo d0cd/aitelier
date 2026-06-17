@@ -59,7 +59,7 @@ phase-by-phase history, read the code or `git log`.
 - Schedule `task` shape is the chat-completions request body — same code
   path on fire.
 - Durable webhook delivery (Postgres queue, exponential backoff 1s/5s/30s/5min/1hr).
-- Optional HMAC signing — `X-Aitelier-Signature: sha256=<hmac>` when
+- Optional Bearer auth — `Authorization: Bearer <secret>` when
   `service.webhook_secret` is set.
 
 ### SDKs

@@ -68,9 +68,11 @@ class ServiceConfig:
     """If set, every /v1/* endpoint (except /v1/health) requires
     Authorization: Bearer <api_key>. Unset = localhost-trust mode."""
     webhook_secret: str | None = None
-    """Shared secret for signing outbound webhook deliveries with
-    X-Aitelier-Signature: sha256=<hmac>. Unset = unsigned. Set this in
-    aitelier.secrets.toml in hosted-mode deployments."""
+    """Shared secret sent on outbound webhook deliveries as
+    `Authorization: Bearer <secret>`. Unset = no auth header. Receivers
+    verify with a constant-time compare. Set this in aitelier.secrets.toml
+    in hosted-mode deployments. (Bearer rather than an HMAC body signature
+    — rationale inline in webhook_worker.py.)"""
     log_format: str = "human"
     """`json` → one-line JSON per record (aggregator-friendly).
     anything else → human-readable with [correlation_id] prefix."""
@@ -79,10 +81,12 @@ class ServiceConfig:
     this return HTTP 503 with `error.type: "ProviderUnavailable"`. Set
     to 0 to disable the cap (single-tenant dev deployments)."""
     allow_loopback_webhooks: bool = False
-    """When false (default), `webhook_url` values pointing at loopback /
-    private / link-local addresses are rejected — independent of
-    `api_key`. Flip on only for dev workflows where aitelier and the
-    webhook target both live on `localhost`. Setting it disables the
+    """When false (default), aitelier refuses to connect to loopback /
+    private / link-local addresses — independent of `api_key`. This one
+    flag gates BOTH outbound `webhook_url` deliveries AND consumer-supplied
+    `aitelier.mcp_servers[*].url` on the agent path (the same SSRF guard
+    covers both outbound paths). Flip on only for dev workflows where
+    aitelier and those targets both live on `localhost`; it disables the
     SSRF guard entirely, so flip it off again before exposing the port."""
     max_request_body_bytes: int = 4 * 1024 * 1024
     """Per-request body size cap. Requests with Content-Length above
@@ -135,10 +139,16 @@ class PurgeConfig:
 @dataclass
 class StorageConfig:
     max_metadata_bytes: int = 64 * 1024
-    """Cap on the JSON-encoded size of run metadata. Aitelier persists the
-    whole dict as JSONB in Postgres; without a bound, a buggy consumer can
-    bloat the runs table. 64 KB is well above typical use (correlation_id +
-    a few tags ~= <500 bytes)."""
+    """Cap on the JSON-encoded size of run *metadata* only. Aitelier persists
+    the whole dict as JSONB in Postgres; without a bound, a buggy consumer
+    can bloat the runs table. 64 KB is well above typical use (correlation_id
+    + a few tags ~= <500 bytes).
+
+    Scope: this bounds `metadata` exclusively. The `request_body` and
+    `rendered_messages` JSONB columns are NOT covered here — `request_body`
+    is bounded by `service.max_request_body_bytes` (the HTTP body cap) and
+    `rendered_messages` is server-built from it. This is not a global
+    per-row cap."""
 
 
 @dataclass
@@ -212,9 +222,10 @@ class OtelConfig:
     protocol: str = "grpc"
     """`grpc` (default, port 4317) or `http` (port 4318, protobuf over HTTP)."""
     insecure: bool = True
-    """Disable TLS verification for the OTLP endpoint. Default true for
+    """Disable TLS for the OTLP endpoint (grpc only). Default true for
     local-collector setups; flip to false when shipping to a remote
-    collector over the internet."""
+    collector over the internet. On the http protocol this is ignored —
+    TLS is inferred from the endpoint URL scheme (http:// vs https://)."""
     service_name: str = "aitelier"
     """Resource attribute `service.name`. Set to the operator's own
     name (e.g., `aitelier-prod`, `aitelier-dev`) so multiple deployments

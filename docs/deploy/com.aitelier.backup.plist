@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for a daily aitelier Postgres backup.
+  @REPO_ROOT@ and @PATH@ are substituted by scripts/install-launchd.sh.
+  Installed to ~/Library/LaunchAgents/com.aitelier.backup.plist.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aitelier.backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@REPO_ROOT@/scripts/backup.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@REPO_ROOT@</string>
+
+    <!-- Run once a day at 03:00 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@PATH@</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>@REPO_ROOT@/runs/logs/backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>@REPO_ROOT@/runs/logs/backup.log</string>
+</dict>
+</plist>

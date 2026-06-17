@@ -19,6 +19,11 @@
 # against glibc — it'd fail with "not found" on alpine.
 FROM debian:bookworm-slim
 
+# Install channel — `0.4.x` tracks the latest 0.4 patch. For reproducible
+# builds, override with an exact patch (`--build-arg SA_CHANNEL=0.4.3`) and
+# keep it in sync with scripts/start.sh + docker/sandbox-agent.Dockerfile.
+ARG SA_CHANNEL=0.4.x
+
 # SA itself + node/npm for the claude-agent-acp bridge package, plus
 # curl/ca-certificates for the entrypoint.
 RUN apt-get update \
@@ -26,7 +31,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && ARCH=$(uname -m) \
  && curl -fsSL \
-        "https://releases.rivet.dev/sandbox-agent/0.4.x/binaries/sandbox-agent-${ARCH}-unknown-linux-musl" \
+        "https://releases.rivet.dev/sandbox-agent/${SA_CHANNEL}/binaries/sandbox-agent-${ARCH}-unknown-linux-musl" \
         -o /usr/local/bin/sandbox-agent \
  && chmod +x /usr/local/bin/sandbox-agent \
  && sandbox-agent --version

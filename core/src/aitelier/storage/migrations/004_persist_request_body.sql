@@ -4,8 +4,7 @@
 -- detect prompt drift but not to replay, grade, or inspect what the
 -- model actually saw. Adding the two JSONB columns below unblocks:
 --
---   - Phase H trace replay (re-dispatch a finalized run with one
---     field changed)
+--   - Trace replay (re-dispatch a finalized run with one field changed)
 --   - Static /ui browser (render the conversation as the model saw it)
 --   - Bolt-on eval frameworks (graders can't grade what they can't see)
 --   - OpenTelemetry GenAI export (`gen_ai.prompt` / `gen_ai.completion`

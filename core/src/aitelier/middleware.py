@@ -3,10 +3,13 @@
 Four middlewares, registered in the order needed for the stack to
 execute correctly (FastAPI runs the LAST-registered first):
 
-  1. auth          (registered last, runs first)  — Bearer-token gate
-  2. correlation   (registered third)             — X-Correlation-Id echo/mint
+  1. correlation   (registered last, runs first)  — X-Correlation-Id echo/mint
+  2. auth          (registered third)             — Bearer-token gate
   3. body_size     (registered second)            — Content-Length cap
   4. rate_limit    (registered first, runs last)  — per-caller token bucket
+
+Correlation runs outermost so EVERY response — including the auth 401 —
+carries X-Correlation-Id and every auth-rejection log line is tagged.
 
 `register_middleware(app)` from server.py wires all four. Each one is
 a plain coroutine that takes (request, call_next) — no decorator magic
@@ -55,7 +58,12 @@ def current_correlation_id() -> str:
 # ---------------------------------------------------------------------------
 
 
-_RATE_LIMIT_EXEMPT_PATHS = {"/v1/health"}
+# Paths exempt from auth, rate-limiting, and body-size checks — liveness
+# probes (k8s, load balancers) must reach them unconditionally, and the
+# read-only dashboard page itself loads without a token (the data calls it
+# makes are still gated).
+_PUBLIC_PATHS = frozenset({"/v1/health", "/", "/ui"})
+
 _RATE_LIMIT_BUCKET_CAP = 10_000
 
 _rate_limit_buckets: OrderedDict[str, tuple[float, float]] = OrderedDict()
@@ -76,28 +84,27 @@ def _rate_limit_key(request: Request) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Auth state
-# ---------------------------------------------------------------------------
-
-
-_AUTH_EXEMPT_PATHS = {"/v1/health"}
-
-
-# ---------------------------------------------------------------------------
 # Middleware callables — registered by register_middleware(app)
 # ---------------------------------------------------------------------------
 
 
 async def rate_limit_middleware(request: Request, call_next):
     """Per-caller token bucket. Returns 429 with Retry-After when the
-    bucket is empty. 0 = disabled (default). Excludes /v1/health.
+    bucket is empty. 0 = disabled (default). Excludes `_PUBLIC_PATHS`
+    (/v1/health, /, /ui).
 
     Bucket capacity equals the per-minute budget; the bucket refills
     linearly at budget/60 tokens per second. The bucket map is LRU-
     capped at _RATE_LIMIT_BUCKET_CAP entries so a caller cycling Bearer
-    values can't grow it without bound."""
+    values can't grow it without bound.
+
+    Caveat: when `service.api_key` is unset (localhost-trust mode), the
+    bucket keys on the Bearer token, so a caller can evade the limit by
+    rotating a dummy `Authorization` header. The limit is a courtesy cap
+    for trusted local use; hosted deployments set `api_key` (and ideally
+    enforce limits at a fronting proxy)."""
     budget = get_config().service.rate_limit_per_minute
-    if budget <= 0 or request.url.path in _RATE_LIMIT_EXEMPT_PATHS:
+    if budget <= 0 or request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
     now = time.monotonic()
@@ -133,9 +140,10 @@ async def body_size_middleware(request: Request, call_next):
       - Header-only check: clients that omit Content-Length (chunked
         transfer-encoding) are not blocked here. Put a reverse proxy
         in front of hosted aitelier if you need a hard cap.
-      - /v1/health is exempt — k8s probes shouldn't bounce off this.
+      - `_PUBLIC_PATHS` (/v1/health, /, /ui) are exempt — liveness probes
+        and the read-only dashboard shouldn't bounce off this.
     """
-    if request.url.path == "/v1/health":
+    if request.url.path in _PUBLIC_PATHS:
         return await call_next(request)
 
     cap = get_config().service.max_request_body_bytes
@@ -182,10 +190,11 @@ async def auth_middleware(request: Request, call_next):
     service.api_key is configured. When unset (default), no auth is enforced
     — preserves the localhost-trust model.
 
-    /v1/health is always public so liveness probes (k8s, load balancers)
-    can hit it without a token.
+    `_PUBLIC_PATHS` (/v1/health, /, /ui) are always public so liveness
+    probes and the read-only dashboard can load without a token. (The
+    dashboard's data calls to /v1/* are still gated.)
     """
-    if request.url.path not in _AUTH_EXEMPT_PATHS:
+    if request.url.path not in _PUBLIC_PATHS:
         configured = get_config().service.api_key
         if configured:
             auth = request.headers.get("Authorization") or ""
@@ -204,12 +213,12 @@ def register_middleware(app: FastAPI) -> None:
     """Register all four middlewares in the order FastAPI needs.
 
     FastAPI runs middlewares in REVERSE registration order, so to get
-    the desired logical flow (auth → correlation → body_size →
+    the desired logical flow (correlation → auth → body_size →
     rate_limit → handler), we register them in the opposite order
-    (rate_limit first, auth last). Same order the original inline
-    decorators in server.py used.
+    (rate_limit first, correlation last). Correlation is outermost so
+    its X-Correlation-Id header-stamping wraps even the auth 401.
     """
     app.middleware("http")(rate_limit_middleware)
     app.middleware("http")(body_size_middleware)
-    app.middleware("http")(correlation_id_middleware)
     app.middleware("http")(auth_middleware)
+    app.middleware("http")(correlation_id_middleware)

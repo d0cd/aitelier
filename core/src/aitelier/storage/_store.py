@@ -57,7 +57,16 @@ class Store(Protocol):
                                    sandbox_backend: str | None = None) -> None: ...
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None: ...
-    async def mark_orphaned_running_runs(self) -> int: ...
+    async def mark_orphaned_running_runs(self) -> list[str]: ...
+    async def runs_awaiting_webhook(self, since: datetime | None = None) -> list[Run]: ...
+    """Terminal runs (completed/failed/cancelled) with a `metadata.webhook_url`
+    but no webhook_delivery row — i.e. the process crashed between finalizing
+    the run and enqueuing its completion webhook. Used by the startup sweep to
+    deliver the webhook the async caller is still waiting on.
+
+    `since` bounds the result to runs that ended at/after it. The caller passes
+    the webhook-retention window so a long-completed run whose delivery row has
+    already been purged isn't mistaken for an undelivered one and re-fired."""
     async def aggregate_runs(self, *, group_by: str = "trace_tag",
                               since: datetime | None = None,
                               until: datetime | None = None,

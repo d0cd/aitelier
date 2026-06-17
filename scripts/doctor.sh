@@ -153,11 +153,36 @@ fi
 
 echo ""
 echo "=== Credentials ==="
-if [ -f "$HOME/.claude/.credentials.json" ]; then
-    _ok "Claude credentials present (~/.claude/.credentials.json)"
-else
-    _fail "Claude not logged in — run \`claude login\`"
-fi
+# Advisory only: the control plane and the local/ollama LLM paths need no
+# credential, so a missing or expired login never blocks startup — it just
+# disables the matching model families. (agent:claude manages its own
+# credential via the Sandbox Agent and is unaffected by the LiteLLM key here.)
+_claude_cred_state() {
+    # Prints: missing | no-token | expired | valid:<hours>
+    local f="$HOME/.claude/.credentials.json"
+    [ -f "$f" ] || { echo "missing"; return; }
+    python3 - "$f" <<'PY'
+import json, sys, time
+try:
+    o = json.load(open(sys.argv[1])).get("claudeAiOauth", {})
+    token, expires = o.get("accessToken", ""), o.get("expiresAt", 0)
+    if not token:
+        print("no-token")
+    elif expires and expires < time.time() * 1000:
+        print("expired")
+    else:
+        print(f"valid:{(expires - time.time() * 1000) / 3_600_000:.0f}" if expires else "valid:?")
+except Exception:
+    print("no-token")
+PY
+}
+claude_state="$(_claude_cred_state)"
+case "$claude_state" in
+    valid:*) _ok "Claude credentials valid (${claude_state#valid:}h remaining)" ;;
+    expired) _warn "Claude OAuth token expired — \`claude login\` to refresh (claude-*/anthropic/* LLM models unavailable until then)" ;;
+    no-token) _warn "Claude credentials file present but no token — \`claude login\` (claude-*/anthropic/* unavailable)" ;;
+    *) _warn "Claude not logged in — \`claude login\` for claude-*/anthropic/* LLM models (optional)" ;;
+esac
 
 if [ -f "$HOME/.codex/auth.json" ]; then
     _ok "Codex credentials present (~/.codex/auth.json)"

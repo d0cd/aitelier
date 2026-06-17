@@ -202,6 +202,11 @@ async def record_idempotency(
         return
     from aitelier.storage import IdempotencyRecord
     try:
+        # Never cache error responses (timeout / 503 / rate-limit). Caching
+        # would replay a transient failure under this key for the full TTL,
+        # defeating retry recovery. Mirrors the streaming path's guard.
+        if _is_error_response(response):
+            return
         store = await get_store()
         await store.record_idempotent(IdempotencyRecord(
             key=ctx.key, body_hash=ctx.body_hash, endpoint=ctx.endpoint,
@@ -214,6 +219,16 @@ async def record_idempotency(
     finally:
         if ctx._lock is not None:
             _release_idempotency_lock(ctx.key, ctx._lock)
+            ctx._lock = None  # symmetric with release_idempotency_ctx
+
+
+def _is_error_response(response: dict) -> bool:
+    """An agent/LLM error envelope carries an `aitelier_status_code` >= 400
+    and/or a top-level `error` block."""
+    status = response.get("aitelier_status_code")
+    if isinstance(status, int) and status >= 400:
+        return True
+    return "error" in response
 
 
 def release_idempotency_ctx(ctx: IdempotencyContext | None) -> None:
@@ -223,4 +238,5 @@ def release_idempotency_ctx(ctx: IdempotencyContext | None) -> None:
     if ctx is None or ctx._lock is None:
         return
     _release_idempotency_lock(ctx.key, ctx._lock)
+    ctx._lock = None
     ctx._lock = None

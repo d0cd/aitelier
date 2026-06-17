@@ -354,7 +354,6 @@ def test_build_session_new_meta_claude_packs_options_and_system_prompt():
         agent_model="claude-sonnet-4-5",
         tool_allowlist=["Read", "Glob"],
         max_turns=1,
-        plan_mode=None,
     )
     assert meta == {
         "systemPrompt": "be brief",
@@ -376,20 +375,21 @@ def test_build_session_new_meta_claude_omits_unset_fields():
     meta = _build_session_new_meta(
         "claude",
         system_prompt=None, agent_model=None,
-        tool_allowlist=None, max_turns=None, plan_mode=None,
+        tool_allowlist=None, max_turns=None,
     )
     assert meta is None
 
 
 def test_build_session_new_meta_non_claude_returns_none():
     """codex-acp / opencode / amp don't read `_meta.claudeCode`. Returning
-    None keeps the fallback `session/set_config_option` path live for them."""
+    None routes their model through `session/set_model`, reasoning through
+    `session/set_config_option`, and approval mode through `session/set_mode`."""
     from aitelier.providers.sandbox_agent import _build_session_new_meta
 
     meta = _build_session_new_meta(
         "codex",
         system_prompt="x", agent_model="gpt-5",
-        tool_allowlist=["Read"], max_turns=2, plan_mode=False,
+        tool_allowlist=["Read"], max_turns=2,
     )
     assert meta is None
 
@@ -422,6 +422,251 @@ async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
             system_prompt=None, agent_model=None,
             tool_allowlist=None, max_turns=None,
             run_id="r-1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_sets_inner_model_via_set_model_for_non_claude():
+    """Non-claude backends receive the inner LLM through session/set_model
+    (params {sessionId, modelId}), not the claude _meta path."""
+    from aitelier.providers.sandbox_agent import _open_acp_session
+
+    calls = []
+
+    class _FakeClient:
+        agent = "codex"
+        async def call(self, method, params, first=False):
+            calls.append((method, params))
+            if method == "session/new":
+                return {"sessionId": "sess-1"}
+            return {}
+        def start_stream(self):
+            pass
+        async def notify(self, *a, **k):
+            pass
+
+    sid = await _open_acp_session(
+        _FakeClient(),
+        agent_name="codex",
+        workspace=None, mcp_servers=None,
+        system_prompt=None, agent_model="gpt-5.4",
+        tool_allowlist=None, max_turns=None,
+        run_id="",
+    )
+    assert sid == "sess-1"
+    set_model = [p for (m, p) in calls if m == "session/set_model"]
+    assert set_model == [{"sessionId": "sess-1", "modelId": "gpt-5.4"}]
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_claude_uses_meta_not_set_model():
+    """claude carries its model in session/new `_meta`; it must NOT also be
+    pushed through session/set_model."""
+    from aitelier.providers.sandbox_agent import _open_acp_session
+
+    calls = []
+
+    class _FakeClient:
+        agent = "claude"
+        async def call(self, method, params, first=False):
+            calls.append((method, params))
+            if method == "session/new":
+                opts = params["_meta"]["claudeCode"]["options"]
+                assert opts["model"] == "claude-sonnet-4-5"
+                return {"sessionId": "sess-c"}
+            return {}
+        def start_stream(self):
+            pass
+        async def notify(self, *a, **k):
+            pass
+
+    await _open_acp_session(
+        _FakeClient(),
+        agent_name="claude",
+        workspace=None, mcp_servers=None,
+        system_prompt=None, agent_model="claude-sonnet-4-5",
+        tool_allowlist=None, max_turns=None,
+        run_id="",
+    )
+    assert not any(m == "session/set_model" for (m, _) in calls)
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_rejects_model_not_in_advertised_list():
+    """When the backend advertises a model configOption, an inner model
+    outside that list fails fast with the available values — before any
+    set_model call or prompt turn."""
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+
+    calls = []
+
+    class _FakeClient:
+        agent = "codex"
+        async def call(self, method, params, first=False):
+            calls.append(method)
+            if method == "session/new":
+                return {
+                    "sessionId": "s",
+                    "configOptions": [
+                        {"id": "model", "category": "model",
+                         "options": [{"value": "gpt-5.4"}, {"value": "gpt-5.3-codex"}]},
+                    ],
+                }
+            return {}
+        def start_stream(self):
+            pass
+        async def notify(self, *a, **k):
+            pass
+
+    with pytest.raises(AcpError, match="does not offer inner model"):
+        await _open_acp_session(
+            _FakeClient(),
+            agent_name="codex",
+            workspace=None, mcp_servers=None,
+            system_prompt=None, agent_model="openai/gpt-4o",
+            tool_allowlist=None, max_turns=None,
+            run_id="",
+        )
+    assert "session/set_model" not in calls  # rejected before the call
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_model_validation_is_exact_match():
+    """Models are validated by exact match against advertised values — a real
+    bracketed id like claude's `sonnet[1m]` is accepted; a bogus `[effort]`
+    suffix is not (effort is its own field now, not a model suffix)."""
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+
+    def make_client(calls):
+        class _FakeClient:
+            agent = "claude-x"
+            async def call(self, method, params, first=False):
+                calls.append((method, params))
+                if method == "session/new":
+                    return {"sessionId": "s",
+                            "configOptions": [{"id": "model", "category": "model",
+                                               "options": [{"value": "sonnet"},
+                                                           {"value": "sonnet[1m]"}]}]}
+                return {}
+            def start_stream(self): pass
+            async def notify(self, *a, **k): pass
+        return _FakeClient()
+
+    ok_calls = []
+    await _open_acp_session(
+        make_client(ok_calls), agent_name="other",
+        workspace=None, mcp_servers=None, system_prompt=None,
+        agent_model="sonnet[1m]", tool_allowlist=None, max_turns=None, run_id="",
+    )
+    assert ("session/set_model", {"sessionId": "s", "modelId": "sonnet[1m]"}) in ok_calls
+
+    with pytest.raises(AcpError, match="does not offer inner model"):
+        await _open_acp_session(
+            make_client([]), agent_name="other",
+            workspace=None, mcp_servers=None, system_prompt=None,
+            agent_model="sonnet[high]", tool_allowlist=None, max_turns=None, run_id="",
+        )
+
+
+def _config_client(calls):
+    class _FakeClient:
+        agent = "codex"
+        async def call(self, method, params, first=False):
+            calls.append((method, params))
+            if method == "session/new":
+                return {"sessionId": "s", "configOptions": [
+                    {"id": "model", "category": "model",
+                     "options": [{"value": "gpt-5.4"}]},
+                    {"id": "reasoning_effort", "category": "thought_level",
+                     "options": [{"value": "low"}, {"value": "high"}]},
+                    {"id": "mode", "category": "mode",
+                     "options": [{"value": "read-only"}, {"value": "auto"}]},
+                ]}
+            return {}
+        def start_stream(self): pass
+        async def notify(self, *a, **k): pass
+    return _FakeClient()
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_sets_reasoning_via_set_config_option():
+    """reasoning_effort → set_config_option {configId: <advertised id>, value}."""
+    from aitelier.providers.sandbox_agent import _open_acp_session
+    calls = []
+    await _open_acp_session(
+        _config_client(calls), agent_name="codex",
+        workspace=None, mcp_servers=None, system_prompt=None,
+        agent_model="gpt-5.4", tool_allowlist=None, max_turns=None,
+        reasoning_effort="high", run_id="",
+    )
+    assert ("session/set_config_option",
+            {"sessionId": "s", "configId": "reasoning_effort", "value": "high"}) in calls
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_sets_mode_via_set_mode():
+    """approval_mode → session/set_mode {modeId}."""
+    from aitelier.providers.sandbox_agent import _open_acp_session
+    calls = []
+    await _open_acp_session(
+        _config_client(calls), agent_name="codex",
+        workspace=None, mcp_servers=None, system_prompt=None,
+        agent_model=None, tool_allowlist=None, max_turns=None,
+        approval_mode="auto", run_id="",
+    )
+    assert ("session/set_mode", {"sessionId": "s", "modeId": "auto"}) in calls
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_applies_in_order_model_reasoning_mode():
+    from aitelier.providers.sandbox_agent import _open_acp_session
+    calls = []
+    await _open_acp_session(
+        _config_client(calls), agent_name="codex",
+        workspace=None, mcp_servers=None, system_prompt=None,
+        agent_model="gpt-5.4", tool_allowlist=None, max_turns=None,
+        reasoning_effort="high", approval_mode="auto", run_id="",
+    )
+    seq = [m for (m, _) in calls
+           if m in ("session/set_model", "session/set_config_option", "session/set_mode")]
+    assert seq == ["session/set_model", "session/set_config_option", "session/set_mode"]
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_invalid_reasoning_fails_fast_listing_values():
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+    calls = []
+    with pytest.raises(AcpError, match="reasoning_effort 'ultra' not offered.*low, high"):
+        await _open_acp_session(
+            _config_client(calls), agent_name="codex",
+            workspace=None, mcp_servers=None, system_prompt=None,
+            agent_model=None, tool_allowlist=None, max_turns=None,
+            reasoning_effort="ultra", run_id="",
+        )
+    assert "session/set_config_option" not in [m for (m, _) in calls]
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_reasoning_on_backend_without_option_errors():
+    """A backend that advertises no thought_level option → clear error."""
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+
+    class _FakeClient:
+        agent = "mock"
+        async def call(self, method, params, first=False):
+            if method == "session/new":
+                return {"sessionId": "s", "configOptions": [
+                    {"id": "model", "category": "model", "options": [{"value": "m1"}]}]}
+            return {}
+        def start_stream(self): pass
+        async def notify(self, *a, **k): pass
+
+    with pytest.raises(AcpError, match="does not support reasoning_effort"):
+        await _open_acp_session(
+            _FakeClient(), agent_name="mock",
+            workspace=None, mcp_servers=None, system_prompt=None,
+            agent_model=None, tool_allowlist=None, max_turns=None,
+            reasoning_effort="high", run_id="",
         )
 
 
@@ -565,8 +810,8 @@ async def test_call_via_sandbox_orchestrates_full_turn():
     assert result["status"] == "ok"
     assert result["provider"] == "claude-code"
     assert result["run_id"] == "run-x"
-    # Either streamed chunks or turn result content — both are valid
-    assert result["content"]
+    # Non-streaming aggregation uses the turn_result content verbatim.
+    assert result["content"] == "answer: 42"
     assert result["finish_reason"] == "completed"
 
     # Verify the call sequence
@@ -906,3 +1151,36 @@ def test_module_imports():
 
 # Silence ruff unused import in some Python configs
 _ = json
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_closes_session_on_validation_failure():
+    """An unadvertised inner model (or reasoning/mode) raises AFTER session/new;
+    the live session must be closed so the backend child process isn't orphaned.
+    Regression guard for the leaked-subprocess class."""
+    from aitelier.providers.sandbox_agent import AcpError, _open_acp_session
+
+    closed = []
+
+    class _FakeClient:
+        agent = "codex"
+        async def call(self, method, params, first=False):
+            if method == "session/new":
+                return {"sessionId": "s", "configOptions": [
+                    {"id": "model", "category": "model", "options": [{"value": "gpt-5.4"}]}]}
+            if method == "session/close":
+                closed.append(params)
+            return {}
+        def start_stream(self):
+            pass
+        async def notify(self, *a, **k):
+            pass
+
+    with pytest.raises(AcpError, match="does not offer inner model"):
+        await _open_acp_session(
+            _FakeClient(), agent_name="codex",
+            workspace=None, mcp_servers=None, system_prompt=None,
+            agent_model="bad-model", tool_allowlist=None, max_turns=None, run_id="",
+        )
+    # session/close must fire on the open-failure path (no leaked subprocess).
+    assert closed and closed[0]["sessionId"] == "s"

@@ -17,6 +17,18 @@ export interface HealthResponse {
   version: string;
   timestamp: string;
   knownLimitations?: string[];
+  /**
+   * False until /v1/discovery has warmed the dependency cache. Lets a
+   * consumer tell "deps checked and healthy" apart from "deps never
+   * probed" rather than reading a bare `status: "ok"` as a clean bill.
+   */
+  dependenciesProbed?: boolean;
+  /**
+   * Per-dependency reachability summary, surfaced opportunistically from
+   * the discovery cache. Omitted on cold start (before /v1/discovery has
+   * warmed the cache).
+   */
+  dependencies?: Record<string, { reachable: boolean }>;
 }
 
 // --- Discovery (GET /v1/discovery) ---
@@ -33,14 +45,14 @@ export interface CapabilityInfo {
 
 export interface LitellmDep {
   reachable: boolean;
-  baseUrl: string;
+  baseUrl?: string; // omitted in hosted mode (service.api_key set)
   models?: string[];
   reason?: string;
 }
 
 export interface SandboxAgentDep {
   reachable: boolean;
-  baseUrl: string;
+  baseUrl?: string; // omitted in hosted mode (service.api_key set)
   agents?: string[];
   reason?: string;
 }
@@ -120,6 +132,13 @@ export interface Run {
    * actually went on the wire. `null` for runs before v4 or where no
    * translation applies. */
   renderedMessages?: Array<Record<string, unknown>> | null;
+  /** On-disk run manifest, folded in by GET /v1/runs/{id} when the agent
+   * run wrote a run directory. Absent on list endpoints and for runs with
+   * no run dir. */
+  manifest?: Record<string, unknown>;
+  /** On-disk prompt text, folded in by GET /v1/runs/{id} when present.
+   * Absent on list endpoints and for runs with no run dir. */
+  prompt?: string;
 }
 
 export interface RunEvent {

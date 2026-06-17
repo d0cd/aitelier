@@ -18,7 +18,7 @@ Model routing is by the `model` field:
 
 | `model` value | Path |
 |---|---|
-| `claude-sonnet-4-6`, `nomic-embed-text`, `local`, … | LiteLLM (curated alias) |
+| `claude-sonnet`, `nomic-embed-text`, `local`, … | LiteLLM (curated alias) |
 | `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (passthrough wildcard) |
 | `agent:<backend>` | Sandbox Agent, backend's default LLM |
 | `agent:<backend>/<inner-llm>` | Sandbox Agent + explicit inner LLM |
@@ -29,12 +29,13 @@ Agent-specific options ride in `extra_body.aitelier.*`:
 {
   "model": "agent:claude/claude-sonnet-4-5",
   "messages": [{"role": "user", "content": "audit this repo"}],
-  "stream": true,
   "aitelier": {
     "workspace": "/path/to/repo",
     "mcp_servers": [...],
     "tool_allowlist": [...],
     "max_turns": 25,
+    "reasoning_effort": "high",
+    "approval_mode": "auto",
     "prepare":  { "commands": [...], "files": [...], "sidecars": [...] },
     "artifacts": { "fetch": ["/workspace/out.json"] },
     "trace_tag": "audit-run-2026-05"
@@ -42,8 +43,26 @@ Agent-specific options ride in `extra_body.aitelier.*`:
 }
 ```
 
+(`prepare`/`artifacts` run only on the non-streaming path — with `stream: true`
+they're rejected; `tool_allowlist`/`max_turns` are claude-only. Streaming works
+for plain `agent:<backend>` requests.)
+
+Inner-agent session config is driven by what each backend advertises at
+`session/new` (probed + surfaced in `/v1/models`): `agent:<backend>/<model>`
+selects the model (backend-native id, e.g. `gpt-5.4`, not `openai/*`);
+`aitelier.reasoning_effort` → the backend's `thought_level` option;
+`aitelier.approval_mode` → its sandbox/approval `mode`. Values are validated
+against the advertised set and fail fast. `system_prompt`/`max_turns`/
+`tool_allowlist` only work on `claude` (Claude Agent SDK via `_meta`); a system
+prompt is folded into the prompt for other backends, but `max_turns`/
+`tool_allowlist` are rejected there (use `approval_mode` for tool access).
+
 The agent path **hard-rejects** OpenAI fields it can't honestly map:
 `tools`, `tool_choice`, `n>1`, `top_p`. Silent drops are an anti-pattern.
+(`tools`/`tool_choice` have one opt-in escape hatch: set
+`aitelier.allow_tool_drop = true` to drop them server-side instead — for
+transports that emit a global toolset they can't suppress per-request.
+`n>1` and `top_p` are always rejected.)
 
 ### Control plane — aitelier-native
 

@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en" id="aitelier-ui">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aitelier</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #262b36; --fg: #d7dbe2;
+    --muted: #8b93a1; --accent: #6ea8fe; --ok: #4cc38a; --err: #f06a6a;
+    --warn: #e3b341;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; padding: 10px 16px;
+    background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: .5px; }
+  header .spacer { flex: 1; }
+  nav button {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font: inherit; padding: 6px 10px; border-radius: 6px;
+  }
+  nav button.active { color: var(--fg); background: #222734; }
+  input, select, button { font: inherit; }
+  input, select {
+    background: #0c0e12; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px;
+  }
+  .btn {
+    background: #222734; color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; cursor: pointer;
+  }
+  .btn:hover { border-color: var(--accent); }
+  main { padding: 16px; }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+  .filters label { color: var(--muted); display: flex; gap: 4px; align-items: center; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 52px; background: var(--bg); }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1b2029; }
+  .pill { padding: 1px 7px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border); }
+  .s-completed, .s-ok { color: var(--ok); border-color: var(--ok); }
+  .s-failed, .s-error { color: var(--err); border-color: var(--err); }
+  .s-running, .s-pending { color: var(--accent); border-color: var(--accent); }
+  .s-orphaned, .s-cancelled { color: var(--warn); border-color: var(--warn); }
+  .muted { color: var(--muted); }
+  pre {
+    background: #0c0e12; border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px; overflow: auto; max-height: 420px; white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-bottom: 16px; }
+  .card h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  a.back { color: var(--accent); cursor: pointer; text-decoration: none; }
+  #status { color: var(--muted); }
+  .err-text { color: var(--err); }
+  @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>aitelier</h1>
+  <nav>
+    <button id="tab-runs" class="active" onclick="show('runs')">runs</button>
+    <button id="tab-agg" onclick="show('agg')">aggregates</button>
+  </nav>
+  <span class="spacer"></span>
+  <span id="status"></span>
+  <input id="token" type="password" placeholder="bearer token (if api_key set)" size="22"
+         title="Stored in this browser only; sent as Authorization: Bearer on data calls.">
+</header>
+<main>
+  <section id="view-runs">
+    <div class="filters">
+      <label>state
+        <select id="f-state">
+          <option value="">any</option>
+          <option>pending</option><option>running</option><option>completed</option>
+          <option>failed</option><option>cancelled</option><option>orphaned</option>
+        </select>
+      </label>
+      <label>status
+        <select id="f-status">
+          <option value="">any</option><option>ok</option><option>error</option><option>cancelled</option>
+        </select>
+      </label>
+      <label>kind
+        <select id="f-kind">
+          <option value="">any</option><option>complete</option><option>embed</option><option>agent</option>
+        </select>
+      </label>
+      <label>trace_tag <input id="f-tracetag" size="14" placeholder=""></label>
+      <label>limit <input id="f-limit" type="number" value="50" min="1" max="500" size="5"></label>
+      <button class="btn" onclick="loadRuns()">refresh</button>
+    </div>
+    <div id="runs-table"></div>
+  </section>
+
+  <section id="view-detail" style="display:none">
+    <p><a class="back" onclick="show('runs')">&larr; back to runs</a></p>
+    <div id="detail"></div>
+  </section>
+
+  <section id="view-agg" style="display:none">
+    <div class="filters">
+      <label>group by
+        <select id="a-groupby">
+          <option>trace_tag</option><option>kind</option><option>model</option>
+          <option>agent_id</option><option>status</option><option>error_type</option><option>day</option>
+        </select>
+      </label>
+      <button class="btn" onclick="loadAgg()">refresh</button>
+    </div>
+    <div id="agg-table"></div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const base = window.location.origin;
+
+// Persist the token across reloads (this browser only).
+$("token").value = localStorage.getItem("aitelier_token") || "";
+$("token").addEventListener("change", (e) => localStorage.setItem("aitelier_token", e.target.value));
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function setStatus(msg, isErr) {
+  $("status").textContent = msg || "";
+  $("status").className = isErr ? "err-text" : "";
+}
+
+async function api(path) {
+  const headers = {};
+  const tok = $("token").value.trim();
+  if (tok) headers["Authorization"] = "Bearer " + tok;
+  setStatus("loading…");
+  const resp = await fetch(base + path, { headers });
+  if (!resp.ok) {
+    const hint = resp.status === 401 ? " — set a bearer token above" : "";
+    setStatus("HTTP " + resp.status + hint, true);
+    throw new Error("HTTP " + resp.status);
+  }
+  setStatus("");
+  return resp.json();
+}
+
+function show(view) {
+  for (const v of ["runs", "detail", "agg"]) $("view-" + v).style.display = "none";
+  $("tab-runs").classList.toggle("active", view === "runs" || view === "detail");
+  $("tab-agg").classList.toggle("active", view === "agg");
+  $("view-" + view).style.display = "";
+  if (view === "runs") loadRuns();
+  if (view === "agg") loadAgg();
+}
+
+function statusPill(s) {
+  const cls = s ? "s-" + s : "";
+  return '<span class="pill ' + cls + '">' + esc(s || "—") + "</span>";
+}
+
+async function loadRuns() {
+  const q = new URLSearchParams();
+  const map = { state: "f-state", status: "f-status", kind: "f-kind", trace_tag: "f-tracetag", limit: "f-limit" };
+  for (const [k, id] of Object.entries(map)) { const v = $(id).value.trim(); if (v) q.set(k, v); }
+  let runs;
+  try { runs = await api("/v1/runs?" + q.toString()); } catch { return; }
+  const rows = runs.map((r) =>
+    "<tr onclick=\"openRun('" + esc(r.run_id) + "')\">" +
+    "<td>" + statusPill(r.state) + "</td>" +
+    "<td>" + esc(r.kind) + "</td>" +
+    "<td>" + esc(r.model || r.agent_id || "—") + "</td>" +
+    "<td>" + esc(r.trace_tag || "—") + "</td>" +
+    "<td>" + (r.total_tokens || 0) + "</td>" +
+    "<td class=muted>" + esc(r.started_at || "") + "</td>" +
+    "<td class=muted>" + esc(r.run_id) + "</td>" +
+    "</tr>").join("");
+  $("runs-table").innerHTML = runs.length
+    ? "<table><thead><tr><th>state</th><th>kind</th><th>model / agent</th><th>trace_tag</th><th>tokens</th><th>started</th><th>run_id</th></tr></thead><tbody>" + rows + "</tbody></table>"
+    : "<p class=muted>no runs match.</p>";
+}
+
+async function openRun(id) {
+  show("detail");
+  let run, events = [];
+  try {
+    run = await api("/v1/runs/" + encodeURIComponent(id));
+    events = await api("/v1/runs/" + encodeURIComponent(id) + "/events?limit=2000");
+  } catch { return; }
+  const fields = ["state", "status", "kind", "model", "agent_id", "trace_tag",
+    "correlation_id", "parent_run_id", "started_at", "ended_at",
+    "input_tokens", "output_tokens", "total_tokens", "cost_usd",
+    "finish_reason", "tool_call_count", "error_type"];
+  const kv = fields.map((f) => "<div>" + f + "</div><div>" + esc(run[f]) + "</div>").join("");
+  const errCard = run.error_msg
+    ? '<div class="card"><h3>error</h3><pre class="err-text">' + esc(run.error_msg) + "</pre></div>" : "";
+  const msgs = run.rendered_messages
+    ? '<div class="card"><h3>rendered messages</h3><pre>' + esc(JSON.stringify(run.rendered_messages, null, 2)) + "</pre></div>" : "";
+  const evRows = events.map((e) =>
+    "<tr><td class=muted>" + e.seq + "</td><td>" + esc(e.kind) + "</td><td class=muted>" + esc(e.ts) +
+    "</td><td><pre style='max-height:120px;margin:0'>" + esc(JSON.stringify(e.payload)) + "</pre></td></tr>").join("");
+  $("detail").innerHTML =
+    "<h2>" + esc(id) + " " + statusPill(run.state) + "</h2>" +
+    '<div class="grid2">' +
+      '<div class="card"><h3>run</h3><div class="kv">' + kv + "</div></div>" +
+      '<div class="card"><h3>result</h3><pre>' + esc(JSON.stringify(run.result, null, 2)) + "</pre></div>" +
+    "</div>" +
+    errCard + msgs +
+    '<div class="card"><h3>events (' + events.length + ')</h3>' +
+      (events.length ? "<table><thead><tr><th>seq</th><th>kind</th><th>ts</th><th>payload</th></tr></thead><tbody>" + evRows + "</tbody></table>" : "<p class=muted>no events.</p>") +
+    "</div>";
+}
+
+async function loadAgg() {
+  const gb = $("a-groupby").value;
+  let data;
+  try { data = await api("/v1/traces/aggregates?group_by=" + encodeURIComponent(gb)); } catch { return; }
+  const rows = data.groups.map((g) =>
+    "<tr><td>" + esc(g.key) + "</td><td>" + g.count + "</td><td>" + (g.total_tokens || 0) +
+    "</td><td>" + (g.cost_usd == null ? "—" : g.cost_usd) + "</td><td>" + (g.error_count || 0) + "</td></tr>").join("");
+  const t = data.total || {};
+  $("agg-table").innerHTML =
+    "<table><thead><tr><th>" + esc(gb) + "</th><th>count</th><th>tokens</th><th>cost_usd</th><th>errors</th></tr></thead><tbody>" +
+    rows +
+    "<tr style='font-weight:bold'><td>TOTAL</td><td>" + (t.count || 0) + "</td><td>" + (t.total_tokens || 0) +
+    "</td><td>" + (t.cost_usd == null ? "—" : t.cost_usd) + "</td><td>" + (t.error_count || 0) + "</td></tr>" +
+    "</tbody></table>";
+}
+
+loadRuns();
+</script>
+</body>
+</html>

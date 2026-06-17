@@ -21,7 +21,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # --- Request models --------------------------------------------------------
 
@@ -45,15 +45,18 @@ class AitelierAgentOpts(BaseModel):
     mcp_servers: list[dict] | None = Field(default=None, max_length=32)
     tool_allowlist: list[str] | None = Field(default=None, max_length=256)
     max_turns: int | None = None
-    plan_mode: bool | None = None
-    """Whether the inner agent should enter plan-before-act mode. Codex
-    and cursor default `planMode: true` (interactive deliberation) which
-    blocks batch callers; claude has no plan mode and just executes.
-    Set explicitly per-request to override the backend default — `false`
-    for batch/non-interactive callers, `true` for interactive UX over
-    a deliberation-capable backend. Omit to inherit the backend default.
-    Plumbed through to ACP `session/set_config_option("planMode", value)`;
-    backends that don't recognize the option ignore it silently."""
+    reasoning_effort: str | None = None
+    """Inner-agent reasoning effort. Mapped to whichever session config option
+    the backend advertises in the ACP `thought_level` category (codex
+    `reasoning_effort`: low/medium/high/xhigh; claude `effort`:
+    low/medium/high/xhigh/max). Validated against the backend's advertised
+    values at session start — an unknown level fails fast with the list. Falls
+    back to the top-level OpenAI `reasoning_effort` when this is unset."""
+    approval_mode: str | None = None
+    """Inner-agent approval / sandboxing preset, mapped to the backend's ACP
+    `mode` option (codex: read-only/auto/full-access; claude:
+    auto/default/acceptEdits/plan/dontAsk/bypassPermissions). Validated against
+    advertised values at session start."""
     prepare: dict | None = None
     artifacts: dict | None = None
     trace_tag: str | None = None
@@ -68,6 +71,49 @@ class AitelierAgentOpts(BaseModel):
     # hard-reject; opt-in to "I know my tools won't run; do it anyway."
     # Drops both `tools` and `tool_choice` server-side.
     allow_tool_drop: bool = False
+
+    @field_validator("mcp_servers")
+    @classmethod
+    def _check_mcp_servers(cls, v: list[dict] | None) -> list[dict] | None:
+        """Each MCP server needs a `name` and a recognized `transport`. Reject
+        at the boundary instead of silently dropping (unknown transport) or
+        raising a raw KeyError deep in session setup (missing name)."""
+        if v is None:
+            return v
+        allowed = {"http", "stdio"}
+        for i, s in enumerate(v):
+            if not isinstance(s, dict):
+                raise ValueError(f"mcp_servers[{i}] must be an object")
+            if not isinstance(s.get("name"), str) or not s["name"].strip():
+                raise ValueError(f"mcp_servers[{i}] requires a non-empty `name`")
+            transport = s.get("transport", "http")
+            if transport not in allowed:
+                raise ValueError(
+                    f"mcp_servers[{i}] transport {transport!r} not supported; "
+                    f"use one of {sorted(allowed)}"
+                )
+        return v
+
+    @field_validator("examples")
+    @classmethod
+    def _check_examples(cls, v: list[dict] | None) -> list[dict] | None:
+        """Each few-shot example must carry non-empty `user` and `assistant`
+        strings. Reject at the boundary instead of folding a malformed entry
+        (e.g. `{input, output}`) into an empty `User:\\nAssistant:` block."""
+        if v is None:
+            return v
+        for i, ex in enumerate(v):
+            if not isinstance(ex, dict):
+                raise ValueError(f"examples[{i}] must be an object")
+            for key in ("user", "assistant"):
+                val = ex.get(key)
+                if not isinstance(val, str) or not val.strip():
+                    raise ValueError(
+                        f"examples[{i}] must have a non-empty string `{key}` "
+                        f"(got keys {sorted(ex)}); the shape is "
+                        '{"user": "...", "assistant": "..."}'
+                    )
+        return v
 
 
 class ChatCompletionRequest(BaseModel):
@@ -186,14 +232,24 @@ def parse_model_route(model: str) -> tuple[str, str | None, str | None]:
       `"anthropic/claude-opus-4-7"`         → ("llm", None, None)
       `"agent:claude"`                      → ("agent", "claude", None)
       `"agent:claude/claude-sonnet-4-5"`    → ("agent", "claude", "claude-sonnet-4-5")
+
+    Raises `ValueError` for `"agent:"` with an empty backend — callers
+    convert it to a 400 at the boundary rather than letting an empty
+    backend surface as a confusing Sandbox-Agent-side handshake error.
     """
     if not model.startswith("agent:"):
         return "llm", None, None
     tail = model[len("agent:"):]
     if "/" in tail:
         backend, inner = tail.split("/", 1)
-        return "agent", backend, inner or None
-    return "agent", tail, None
+    else:
+        backend, inner = tail, None
+    if not backend:
+        raise ValueError(
+            "agent model must name a backend: 'agent:<backend>[/<inner-llm>]' "
+            "(got an empty backend)"
+        )
+    return "agent", backend, inner or None
 
 
 # --- Result translation ----------------------------------------------------

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aitelier.dev/schemas/v1/health.schema.json",
+  "title": "HealthResponse",
+  "description": "Liveness probe response from GET /v1/health. Cheap by design — no fresh dependency probing. `/v1/discovery` is the readiness probe.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "version", "timestamp"],
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["ok", "degraded"],
+      "description": "`ok` unless the (opportunistically-read) discovery cache shows a tracked dependency unreachable, then `degraded`. Always `ok` on cold start — check `dependencies_probed`."
+    },
+    "version":   { "type": "string" },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "dependencies_probed": {
+      "type": "boolean",
+      "description": "False until /v1/discovery has warmed the dependency cache. Lets a consumer tell 'deps checked and healthy' apart from 'deps never probed'."
+    },
+    "known_limitations": { "type": "array", "items": { "type": "string" } },
+    "dependencies": {
+      "type": "object",
+      "description": "Per-dependency reachability summary from the discovery cache. Omitted on cold start (before /v1/discovery has run).",
+      "additionalProperties": {
+        "type": "object",
+        "properties": { "reachable": { "type": "boolean" } }
+      }
+    }
+  }
+}

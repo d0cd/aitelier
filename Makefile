@@ -1,4 +1,4 @@
-.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor
+.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor backup restore service-install service-uninstall
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -6,7 +6,7 @@
 
 install:
 	uv sync
-	uv pip install -e "./core[dev]" -e "./sdks/python[dev]"
+	uv pip install -e "./core[dev]" -e "./sdks/python[dev]" -e "./sdks/python-mcp[dev]"
 	cd sdks/typescript && pnpm install
 
 # ---------------------------------------------------------------------------
@@ -117,6 +117,34 @@ status:
 # Run this when `make start` fails with a confusing error.
 doctor:
 	@./scripts/doctor.sh
+
+# ---------------------------------------------------------------------------
+# Backup / restore (Postgres durable state). See docs/deploy/backup-restore.md.
+# ---------------------------------------------------------------------------
+
+# Dump the database to backups/aitelier-<timestamp>.dump (keeps newest 14).
+backup:
+	@./scripts/backup.sh
+
+# Restore from a dump. Usage: make restore FILE=backups/aitelier-....dump
+restore:
+	@if [ -z "$(FILE)" ]; then \
+		echo "usage: make restore FILE=backups/aitelier-<timestamp>.dump"; \
+		ls -1t backups/aitelier-*.dump 2>/dev/null | head -5 | sed 's/^/  /'; \
+		exit 2; \
+	fi
+	@./scripts/restore.sh "$(FILE)"
+
+# ---------------------------------------------------------------------------
+# launchd supervision (macOS): auto-start at login + restart on crash, plus a
+# daily backup agent. See docs/deploy/launchd.md.
+# ---------------------------------------------------------------------------
+
+service-install:
+	@./scripts/install-launchd.sh
+
+service-uninstall:
+	@./scripts/uninstall-launchd.sh
 
 # ---------------------------------------------------------------------------
 # Clean

@@ -13,6 +13,7 @@ node_modules/
 
 # aitelier
 runs/
+backups/
 
 # Pre-fetched agent binaries for brig-mode image builds — 200+ MB,
 # downloaded ad-hoc, not part of the source tree.

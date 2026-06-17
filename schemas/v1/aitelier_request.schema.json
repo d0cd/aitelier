@@ -19,17 +19,21 @@
     "tool_allowlist": {
       "type": ["array", "null"],
       "maxItems": 256,
-      "description": "Tools the agent is allowed to invoke. Sent as `session/set_config_option allowedTools`. Best-effort: backends may interpret differently.",
+      "description": "Tools the agent is allowed to invoke. Claude-only: passed via `session/new` `_meta.claudeCode.options.allowedTools`. Rejected (400) on other backends, which have no ACP channel for it — use `approval_mode` for tool access there.",
       "items": {"type": "string"}
     },
     "max_turns": {
       "type": ["integer", "null"],
       "minimum": 1,
-      "description": "Cap on agent reasoning turns. Sent as `session/set_config_option maxTurns`."
+      "description": "Cap on agent reasoning turns. Claude-only: passed via `session/new` `_meta.claudeCode.options.maxTurns`. Rejected (400) on other backends; bound those runs with the top-level `timeout` instead."
     },
-    "plan_mode": {
-      "type": ["boolean", "null"],
-      "description": "Whether the inner agent should deliberate before acting. Codex / cursor default `true` (interactive); claude has no plan mode and just executes. Set `false` for batch / non-interactive callers, `true` for deliberation. Sent as `session/set_config_option planMode`. Backends that don't recognize it ignore silently."
+    "reasoning_effort": {
+      "type": ["string", "null"],
+      "description": "Inner-agent reasoning effort, mapped to the backend's advertised `thought_level` option (codex: low/medium/high/xhigh; claude: low/medium/high/xhigh/max). Validated against the backend's advertised values; an unknown value fails fast. Falls back to the top-level OpenAI `reasoning_effort` when unset."
+    },
+    "approval_mode": {
+      "type": ["string", "null"],
+      "description": "Inner-agent approval / sandboxing preset, mapped to the backend's advertised `mode` option (codex: read-only/auto/full-access; claude: auto/default/acceptEdits/plan/dontAsk/bypassPermissions). Validated against advertised values."
     },
     "prepare": {
       "type": ["object", "null"],

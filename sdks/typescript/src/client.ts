@@ -75,7 +75,11 @@ export interface SubmitRunOpts {
   model: string;                       // must start with `agent:`
   messages: Array<Record<string, unknown>>;
   webhookUrl?: string;
-  aitelier?: Record<string, unknown>;  // workspace, mcpServers, prepare, ...
+  // Agent options, passed to the server VERBATIM (not camel→snake converted).
+  // The server model is `extra="forbid"`, so keys must be snake_case:
+  // { workspace, mcp_servers, tool_allowlist, max_turns, prepare, artifacts,
+  //   trace_tag, parent_run_id, ... }. camelCase keys (e.g. mcpServers) 422.
+  aitelier?: Record<string, unknown>;
   timeout?: number;                    // seconds — server-side limit
   idempotencyKey?: string;
   correlationId?: string;
@@ -153,10 +157,10 @@ export class Aitelier {
   /**
    * Submit an async agent run via POST /v1/runs.
    *
-   * Returns immediately with `{run_id, status: "accepted"}`. The final
-   * ChatCompletion (or error body) is delivered to `webhookUrl` when ready,
-   * if provided; otherwise consumers poll `getRun(run_id)` or
-   * `listRunEvents(run_id)`.
+   * Returns immediately with `{runId, status: "accepted"}` (camelCased like
+   * all SDK responses). The final ChatCompletion (or error body) is
+   * delivered to `webhookUrl` when ready, if provided; otherwise consumers
+   * poll `getRun(runId)` or `listRunEvents(runId)`.
    */
   async submitRun(opts: SubmitRunOpts): Promise<Record<string, unknown>> {
     const body: Record<string, unknown> = {
@@ -239,7 +243,7 @@ export class Aitelier {
    * Uses native `fetch` streaming. Cancellation: break out of the
    * async iteration and the underlying reader is released.
    */
-  async *streamRunEvents(runId: string): AsyncIterator<{ type: string; data: unknown }> {
+  async *streamRunEvents(runId: string): AsyncIterableIterator<{ type: string; data: unknown }> {
     const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/events/stream`, {
       headers: { ...this.authHeader(), Accept: "text/event-stream" },
     });
@@ -285,7 +289,7 @@ export class Aitelier {
       headers: { ...this.authHeader() },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as CancelAck;
   }
 
@@ -307,7 +311,7 @@ export class Aitelier {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`addRunScore failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`addRunScore failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as RunScore;
   }
 
@@ -337,7 +341,7 @@ export class Aitelier {
       `${this.baseUrl}/v1/runs/export?${params}`,
       { headers: { ...this.authHeader() } },
     );
-    if (!resp.ok) throw new Error(`exportRuns failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`exportRuns failed: ${resp.status} ${await resp.text()}`);
     if (!resp.body) return;
 
     const reader = resp.body.getReader();
@@ -383,11 +387,15 @@ export class Aitelier {
   }
 
   async aggregateTraces(opts: {
-    groupBy?: string; since?: string; traceTag?: string; limit?: number;
+    groupBy?: string; since?: string; until?: string;
+    traceTag?: string; limit?: number;
   } = {}): Promise<TracesAggregate> {
     const params = new URLSearchParams();
-    params.set("group_by", opts.groupBy ?? "model");
+    // Default matches the server's default group_by ("trace_tag") so the
+    // SDK doesn't silently override it.
+    params.set("group_by", opts.groupBy ?? "trace_tag");
     if (opts.since) params.set("since", opts.since);
+    if (opts.until) params.set("until", opts.until);
     if (opts.traceTag) params.set("trace_tag", opts.traceTag);
     if (opts.limit !== undefined) params.set("limit", String(opts.limit));
     return this.getJson<TracesAggregate>(`/v1/traces/aggregates?${params}`);
@@ -412,7 +420,7 @@ export class Aitelier {
       }),
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`createSchedule failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`createSchedule failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as Schedule;
   }
 
@@ -426,7 +434,7 @@ export class Aitelier {
       headers: { ...this.authHeader() },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`deleteSchedule failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`deleteSchedule failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as Record<string, unknown>;
   }
 
@@ -451,7 +459,7 @@ export class Aitelier {
       headers: { ...this.authHeader() },
       signal: AbortSignal.timeout(this.timeoutMs),
     });
-    if (!resp.ok) throw new Error(`GET ${path} failed: ${resp.status}`);
+    if (!resp.ok) throw new Error(`GET ${path} failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as T;
   }
 }
@@ -478,6 +486,10 @@ const PRESERVE_VALUE_KEYS = new Set([
   // `tool_calls`, `tool_call_id`, `function_call`, etc. as snake_case
   // in OpenAI's API.
   "rendered_messages",
+  // `result` is the OpenAI response body (finish_reason, prompt_tokens,
+  // tool_calls). Camel-casing it would break OpenAI-type compatibility and
+  // diverge from the Python SDK, which returns it untouched.
+  "result",
 ]);
 
 function snakeToCamelDeep(value: unknown): unknown {

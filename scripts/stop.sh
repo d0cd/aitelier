@@ -23,7 +23,21 @@ _kill_pid_file() {
         local pid
         pid="$(cat "$pid_file")"
         if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" && echo "  ✓ $label stopped (PID $pid)"
+            kill "$pid" 2>/dev/null || true
+            # Confirm exit before removing the PID file — otherwise a process
+            # that ignores SIGTERM keeps running while we drop its PID file,
+            # orphaning it. Wait ~5s, then escalate to SIGKILL.
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+                sleep 0.1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                kill -9 "$pid" 2>/dev/null || true
+                echo "  ✓ $label force-killed (PID $pid ignored SIGTERM)"
+            else
+                echo "  ✓ $label stopped (PID $pid)"
+            fi
         else
             echo "  - $label PID file stale (process not running)"
         fi
@@ -37,6 +51,12 @@ _kill_pid_file() {
 
 if [ "$MODE" = "full" ] || [ "$MODE" = "service" ]; then
     echo "=== Stopping aitelier service ==="
+    # Under launchd supervision, KeepAlive respawns the service the moment we
+    # kill it — so a plain stop looks like it didn't work. Warn explicitly.
+    if launchctl print "gui/$(id -u)/com.aitelier.agent" >/dev/null 2>&1; then
+        echo "  ! launchd agent com.aitelier.agent is loaded — it will respawn the"
+        echo "    service after this kill. To actually stop it: make service-uninstall"
+    fi
     _kill_pid_file "$AITELIER_PID_FILE" "aitelier service" "aitelier serve"
 fi
 

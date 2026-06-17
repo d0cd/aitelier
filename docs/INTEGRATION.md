@@ -48,7 +48,7 @@ openai = ait.openai()    # pre-configured AsyncOpenAI client
 
 # LLM call
 resp = await openai.chat.completions.create(
-    model="claude-sonnet-4-6",
+    model="claude-sonnet",
     messages=[{"role": "user", "content": "Summarize today's news."}],
 )
 print(resp.choices[0].message.content)
@@ -106,7 +106,7 @@ Routing decided by `model`:
 
 | `model` value | Path | Notes |
 |---|---|---|
-| `claude-sonnet-4-6`, `nomic-embed-text`, `local`, … | LiteLLM (alias) | Curated short names from `docker/litellm/config.yaml` |
+| `claude-sonnet`, `nomic-embed-text`, `local`, … | LiteLLM (alias) | Curated short names from `docker/litellm/config.yaml` |
 | `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (wildcard) | Pass-through; LiteLLM resolves the provider |
 | `agent:<backend>` | Sandbox Agent | Backend's default inner LLM |
 | `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM (e.g. `agent:claude/claude-sonnet-4-5`) |
@@ -137,7 +137,7 @@ The Python SDK defaults to `"float"`, so no action needed there.
 OpenAI-shape model list. Two flavors of entry:
 
 - **LLM**: standard OpenAI shape — `{id, object: "model", owned_by, response_format}`. `response_format` lists the `json_object` / `json_schema` modes the provider supports. Anthropic / `claude-*` is `[]` because LiteLLM's adapter rejects OpenAI-shape `json_schema`; `local` / `ollama/*` is both (aitelier bypasses LiteLLM and maps to Ollama's native `format` field); OpenAI / `gpt-*` is both.
-- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_inner_llms: [...], aitelier_capabilities: {...}}` — lists the LLM IDs you can pair after `/` for `agent:<backend>/<inner-llm>` routing, plus the Sandbox Agent capability flags.
+- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_inner_llms: [...], aitelier_reasoning_levels: [...], aitelier_approval_modes: [...], aitelier_capabilities: {...}}` — the Sandbox Agent capability flags plus the backend's **actually-advertised** options (probed live per backend and cached): the real inner-model ids, reasoning levels, and approval modes it accepts. These are the authoritative ids for `agent:<backend>/<model>` + `aitelier.reasoning_effort` / `aitelier.approval_mode`; passing one the backend doesn't offer fails fast with the valid list. The three option arrays are omitted for a backend whose probe fails (the entry still appears). See "Selecting the inner model" below.
 
 Every entry also carries an `aitelier_request_caps` block declaring which
 OpenAI request fields the route honors:
@@ -168,8 +168,9 @@ for field in ("tools", "tool_choice"):
         request.pop(field, None)
 ```
 
-Consumers can validate `agent:<backend>/<inner-llm>` strings upfront
-rather than after a failed run.
+For inner-LLM selection on agent routes, see "Selecting the inner model"
+under [Available agents](#available-agents) — the id must be backend-native,
+and `aitelier_inner_llms` is not the authoritative per-backend list.
 
 ### Reasoning models on `local` / `ollama/*`
 
@@ -274,8 +275,9 @@ The `aitelier` namespace is **only accepted when `model` starts with `agent:`** 
 The `aitelier` block is `additionalProperties: false` — see
 [`/v1/schemas/aitelier_request`](http://localhost:7777/v1/schemas/aitelier_request)
 for the authoritative field list. The accepted properties are exactly:
-`workspace, mcp_servers, tool_allowlist, max_turns, plan_mode, prepare,
-artifacts, trace_tag, parent_run_id, examples, allow_tool_drop`. Anything else (including
+`workspace, mcp_servers, tool_allowlist, max_turns, reasoning_effort,
+approval_mode, prepare, artifacts, trace_tag, parent_run_id, examples,
+allow_tool_drop`. Anything else (including
 common-misplacement candidates like `timeout`, `model`, `messages`,
 `stream`) is rejected.
 
@@ -302,24 +304,19 @@ Both SDKs map this correctly: TS `submitRun({timeout: 300})` writes
 `body.timeout`, Python `submit_run(..., timeout=300)` writes
 `body["timeout"]`. If you handcraft requests, mirror that placement.
 
-#### `aitelier.plan_mode` for batch / non-interactive callers
+#### `aitelier.approval_mode` for batch / non-interactive callers
 
-`codex` and `cursor` default to `planMode: true` — they deliberate
-and ask clarifying questions before acting. Useful for interactive
-UX, blocking for batch workloads ("summarize this doc and return
-JSON"). `claude` has no plan mode and just executes.
-
-Set `aitelier.plan_mode = false` to force immediate execution on
-deliberation-capable backends. Plumbed through ACP as
-`session/set_config_option("planMode", false)`. Backends that don't
-recognize the option ignore it silently — safe to set on every
-agent-path call.
+A backend's deliberation/approval behavior is controlled by its advertised
+`mode` option, surfaced as `aitelier.approval_mode` (see "Reasoning effort &
+approval mode"). For codex, `auto` lets it read+edit+run without per-step
+approval; `read-only` is the cautious default. For claude, `plan` makes it
+plan-before-acting and `bypassPermissions`/`acceptEdits` reduce prompts.
 
 ```jsonc
 {
   "model": "agent:codex",
   "messages": [...],
-  "aitelier": { "plan_mode": false }
+  "aitelier": { "approval_mode": "auto" }
 }
 ```
 
@@ -396,12 +393,24 @@ usage.prompt_tokens_details.cache_creation_tokens
 The agent path **hard-rejects** OpenAI fields it can't honestly honor:
 
 - `tools` / `tool_choice` — the inner agent runs its own tools; we don't bridge
-  them. Use `aitelier.tool_allowlist` to constrain which tools the agent uses.
+  them. Use `aitelier.tool_allowlist` (claude-only) to constrain which tools the
+  agent uses.
 - `n > 1` — the inner agent produces one response.
-- `top_p` — the agent backend controls sampling.
+- **Sampling / decoding / length budget** — `temperature`, `top_p`, `max_tokens`,
+  `max_completion_tokens`, `seed`, `stop`, `frequency_penalty`, `presence_penalty`,
+  `logprobs`, `top_logprobs`: the inner agent controls these itself. Bound a run
+  with the top-level `timeout`.
+- `aitelier.max_turns` / `aitelier.tool_allowlist` on **non-claude** backends —
+  claude-only (Claude Agent SDK options); other backends have no ACP channel.
 
-Silent drops would be the "worst category of bug." 400 with a clear message
-is the contract.
+Accepted-and-honored on the agent path: `response_format` (`json_object` and
+`json_schema` both fold a directive into the prompt — best-effort, since coding
+agents may ignore native schema), `stream_options` (`include_usage: false`
+suppresses the terminal usage chunk), and the `aitelier.*` block. `user` is
+accepted and recorded in the run's `request_body` for audit/correlation but is
+not forwarded to the inner agent (no agent-side mechanism honors it). Silent
+drops would be the "worst category of bug" — 400 with a clear message is the
+contract.
 
 **Escape hatch for `tools` / `tool_choice` only**: consumers whose transport
 sends `tools` per a global toolset config and can't suppress it per-profile
@@ -417,6 +426,7 @@ Every non-streaming response (and every SSE chunk) carries three IDs:
 |---|---|
 | `id` | OpenAI chat-completion id — `chatcmpl-<run_id>`. Set by aitelier so an OpenAI client's correlation logic works against aitelier responses. |
 | `aitelier_run_id` | The aitelier run id. Use this to fetch `/v1/runs/{id}`, `/v1/runs/{id}/events`, `/v1/runs/{id}/cancel`, or `/v1/traces/{id}` (trace id == run id; one trace per run). |
+| `correlation_id` | The request's correlation id — echoed from `X-Correlation-Id` (or minted if absent). Also returned in the `X-Correlation-Id` response header and stamped on every log line for the request. Use it to tie your logs to aitelier's. |
 
 ### aitelier-specific response signals
 
@@ -643,7 +653,7 @@ probes on a tight cadence. Public (no auth required even in hosted mode).
 dependency probes (LiteLLM, Sandbox Agent, traces), per-model
 `response_format` capabilities, and the `schemas.*` map pointing at
 `GET /v1/schemas/{name}` (JSON Schema source for `aitelier_request`,
-`run`, `run_event`, `schedule`, `active_runs`, `cancel`,
+`run`, `run_event`, `run_score`, `schedule`, `active_runs`, `cancel`,
 `traces_aggregate`, `discovery`). 5s response cache so consumers can
 poll without hammering downstreams.
 
@@ -744,7 +754,7 @@ covers everything else without aitelier needing config changes.
 | OpenAI wildcard | `openai/gpt-4o`, `openai/gpt-4-turbo` |
 | Ollama wildcard | `ollama/qwen2.5-coder`, `ollama/llama3.2:8b` |
 | Agent (Claude Code) | `agent:claude`, `agent:claude/claude-sonnet-4-5` |
-| Agent (Codex) | `agent:codex`, `agent:codex/gpt-4o` |
+| Agent (Codex) | `agent:codex`, `agent:codex/gpt-5.4` |
 
 Capability discovery at runtime: `GET /v1/models` returns each model
 annotated with the `response_format` types it supports.
@@ -783,8 +793,80 @@ dependencies.sandbox_agent.agents`. Typical list:
 `claude` (Claude Code), `codex` (OpenAI Codex CLI), `opencode`, `cursor`,
 `amp`, `pi`.
 
-Use `model: "agent:<backend>"` to route to one. Optional inner-LLM override:
-`model: "agent:<backend>/<inner-llm>"`.
+Use `model: "agent:<backend>"` to route to one. Omitting the inner LLM runs
+the backend's own default model.
+
+### Selecting the inner model
+
+Append `/<inner-llm>` to pick the model the backend runs:
+`model: "agent:<backend>/<inner-llm>"`. **The id must be one the backend itself
+recognizes — a backend-native id, not an aitelier LLM-path id.** `/v1/models`
+lists each backend's real ids under `aitelier_inner_llms` (see below).
+
+| Backend | Inner-model id format | Examples | Wired via |
+|---|---|---|---|
+| `claude` | Anthropic aliases or full ids | `agent:claude/sonnet`, `agent:claude/haiku`, `agent:claude/claude-sonnet-4-5` | `session/new` `_meta` |
+| `codex` | Codex-native ids | `agent:codex/gpt-5.4`, `agent:codex/gpt-5.3-codex` | `session/set_model` |
+| `opencode`, `cursor`, `amp`, `pi` | the backend's own ids | (see `/v1/models`) | `session/set_model` |
+
+Common mistake: `agent:codex/openai/gpt-4o`. The `openai/*` strings (and curated
+aliases like `claude-sonnet`) are **LLM-path** ids — they work for
+`/v1/chat/completions` with `model: "openai/gpt-4o"`, but a coding-agent backend
+doesn't understand them. aitelier validates the id against the model list the
+backend advertises and, on a miss, returns a `ProviderError` **before** running
+any turn, naming the ids that are valid:
+
+```jsonc
+// agent:codex/openai/gpt-4o  →  HTTP 500
+{ "error": { "type": "ProviderError",
+  "message": "backend 'codex' does not offer inner model 'openai/gpt-4o'. Available: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.2. Use a backend-native id ..." } }
+```
+
+### Reasoning effort & approval mode
+
+Two `aitelier.*` knobs map to the corresponding session option each backend
+advertises (normalized on the ACP option *category*, so the same request works
+across backends even though the underlying ids differ):
+
+```jsonc
+{ "model": "agent:codex/gpt-5.4",
+  "aitelier": { "reasoning_effort": "high", "approval_mode": "auto" } }
+```
+
+- **`reasoning_effort`** → the backend's `thought_level` option. codex:
+  `low/medium/high/xhigh`; claude: `low/medium/high/xhigh/max`. (Falls back to
+  the top-level OpenAI `reasoning_effort` field when unset.)
+- **`approval_mode`** → the backend's sandbox/approval preset. codex:
+  `read-only/auto/full-access`; claude: `auto/default/acceptEdits/plan/dontAsk/bypassPermissions`.
+
+Both are validated against the backend's advertised values at session start; an
+unknown value returns a `ProviderError` listing the valid ones, before any turn.
+
+### Discovering valid ids — `/v1/models`
+
+Each agent entry carries the backend's actually-advertised options (probed live,
+cached), so consumers can pre-validate instead of hard-coding:
+
+```jsonc
+{ "id": "agent:codex", "aitelier_agent": true,
+  "aitelier_inner_llms":      ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
+  "aitelier_reasoning_levels": ["low", "medium", "high", "xhigh"],
+  "aitelier_approval_modes":   ["read-only", "auto", "full-access"] }
+```
+
+These fields are omitted for a backend whose probe fails (the entry still
+appears). They are the authoritative source of valid ids — not the LLM-path
+catalog.
+
+### Claude-only options on other backends
+
+`system_prompt`, `aitelier.max_turns`, and `aitelier.tool_allowlist` only have an
+ACP channel on `claude` (they ride `session/new` `_meta` into the Claude Agent
+SDK). A system prompt is still delivered to other backends — folded into the
+prompt text — but `max_turns` / `tool_allowlist` can't be honored, so the agent
+path **rejects them with a 400** rather than dropping them silently. For tool
+access on codex etc., use `aitelier.approval_mode`; bound the run with the
+top-level `timeout`.
 
 ## Multi-agent workflows
 
@@ -924,8 +1006,18 @@ worker:
 - **Queued** in Postgres (table `webhook_deliveries`).
 - **Retry policy**: exponential backoff `1s / 5s / 30s / 5min / 1hr`,
   5 attempts.
-- **Optional HMAC signing**: set `[service] webhook_secret` to enable a
-  `X-Aitelier-Signature: sha256=<hmac>` header on every delivery.
+- **Optional Bearer auth**: set `[service] webhook_secret` to send an
+  `Authorization: Bearer <secret>` header on every delivery. Receivers
+  verify with a constant-time compare:
+  ```python
+  import hmac
+  token = request.headers.get("Authorization", "").removeprefix("Bearer ")
+  if not hmac.compare_digest(token, expected_secret):
+      reject()  # 401
+  ```
+  (Bearer over HTTPS rather than an HMAC body signature — HTTPS already
+  protects body integrity in transit, and body-byte fidelity between
+  sender and receiver is easy to get wrong.)
 - **SSRF guard** (always on): webhook URLs must resolve to a public,
   non-loopback host at enqueue time AND at delivery time (DNS-rebinding
   protection across both windows). Set `[service]
@@ -968,7 +1060,6 @@ Error types (classified in `core/src/aitelier/errors.py`):
 | `ProviderError` | Other 4xx/5xx from upstream | No |
 | `UnsupportedResponseFormat` | `json_schema` on a provider without support | No (change model or drop the format) |
 | `PrepareFailed` | `aitelier.prepare` phase failed before the agent ran | No |
-| `NonZeroExit` | Agent CLI exited with error | No |
 | `Cancelled` | Run cancelled via `/v1/runs/{id}/cancel` or consumer disconnect | No |
 | `Orphaned` | Run was in-flight when aitelier restarted; finalised via orphan-sweep + terminal webhook (see "Run state machine" → `orphaned`) | No |
 | `SchemaViolation` | JSON parse / validation error | No |
@@ -1192,7 +1283,7 @@ For **brig-cell deployments**, the recommended shape is the cell
 itself as the sandbox — aitelier + SA both run inside one cell with
 `mode = "host"` (within the cell). The cell's podman boundary +
 Warden network policy provide isolation. A sample
-`docs/deploy/aitelier.cell.yaml` shows the layout, including
+`docs/deploy/sandbox-agent.cell.yaml` shows the layout, including
 workspace mount declarations, ingress on :7777, and the recommended
 `policy.allow` list.
 
@@ -1201,7 +1292,7 @@ workspace mount declarations, ingress on :7777, and the recommended
 Three tiers, ordered by cost:
 
 1. **Shape validation** (`core/tests/test_deploy_samples.py`) — runs
-   on every CI commit. Parses `docs/deploy/aitelier.cell.yaml`,
+   on every CI commit. Parses `docs/deploy/sandbox-agent.cell.yaml`,
    checks required brig keys (`name`, `image`, `command`, `network`,
    `policy.allow`, `ingress.port == 7777`, …), validates
    `docker/sandbox-agent.Dockerfile` mentions the Rivet install URL +
@@ -1342,7 +1433,11 @@ tool semantics, embeddings, model listing.
 | `get_run` / `getRun` | `GET /v1/runs/{id}` |
 | `list_runs` / `listRuns` | `GET /v1/runs` |
 | `list_run_events` / `listRunEvents` | `GET /v1/runs/{id}/events` |
-| `stream_run_events` (Python) | `GET /v1/runs/{id}/events/stream` (SSE) |
+| `stream_run_events` / `streamRunEvents` | `GET /v1/runs/{id}/events/stream` (SSE) |
+| `wait_for_run` / `waitForRun` | `POST /v1/runs/{id}/wait` |
+| `add_run_score` / `addRunScore` | `POST /v1/runs/{id}/scores` |
+| `list_run_scores` / `listRunScores` | `GET /v1/runs/{id}/scores` |
+| `export_runs` / `exportRuns` | `GET /v1/runs/export` (NDJSON) |
 | `recent_traces` / `recentTraces` | `GET /v1/traces` |
 | `get_trace` / `getTrace` | `GET /v1/traces/{id}` |
 | `aggregate_traces` / `aggregateTraces` | `GET /v1/traces/aggregates` |

@@ -67,7 +67,7 @@ def routes_to_ollama(model: str) -> bool:
 def _resolve_ollama_model(model: str) -> str:
     if model == "local":
         return get_config().ollama.default_model
-    return model[len("ollama/"):]  # strip prefix
+    return model[len("ollama/"):]
 
 
 def _build_ollama_request(body: dict, *, stream: bool) -> dict:
@@ -84,11 +84,28 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
         options["temperature"] = body["temperature"]
     if body.get("top_p") is not None:
         options["top_p"] = body["top_p"]
+    # OpenAI sampling/decoding knobs Ollama supports natively under `options`.
+    # Forwarded so they aren't silently dropped on the Ollama bypass (they're
+    # honored on every other LLM route).
+    if body.get("seed") is not None:
+        options["seed"] = int(body["seed"])
+    stop = body.get("stop")
+    if stop is not None:
+        options["stop"] = [stop] if isinstance(stop, str) else stop
+    if body.get("frequency_penalty") is not None:
+        options["frequency_penalty"] = body["frequency_penalty"]
+    if body.get("presence_penalty") is not None:
+        options["presence_penalty"] = body["presence_penalty"]
     out: dict[str, Any] = {
         "model": _resolve_ollama_model(body["model"]),
         "messages": body["messages"],
         "stream": stream,
     }
+    # Function-calling: Ollama /api/chat accepts `tools` and returns
+    # `message.tool_calls`, which the response mappers already translate. Without
+    # this, the `tools: true` capability /v1/models advertises was inert here.
+    if body.get("tools"):
+        out["tools"] = body["tools"]
     # Map OpenAI's `reasoning_effort` to Ollama's binary `think` toggle.
     # Hybrid-reasoning models (qwen3 family) default to thinking ON and
     # will silently burn the `num_predict` budget on hidden reasoning under
@@ -130,6 +147,13 @@ def _ollama_to_chat_completion(
     if msg.get("tool_calls"):
         out_msg["tool_calls"] = msg["tool_calls"]
     done_reason = ollama_resp.get("done_reason") or "stop"
+    # Ollama's done_reason is never "tool_calls"; it reports "stop" even when
+    # the turn ended to call a tool. OpenAI consumers branch on
+    # finish_reason == "tool_calls" to drive the tool loop, so surface it.
+    finish_reason = (
+        "tool_calls" if out_msg.get("tool_calls")
+        else _FINISH_REASON_MAP.get(done_reason, "stop")
+    )
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
         "object": "chat.completion",
@@ -138,7 +162,7 @@ def _ollama_to_chat_completion(
         "choices": [{
             "index": 0,
             "message": out_msg,
-            "finish_reason": _FINISH_REASON_MAP.get(done_reason, "stop"),
+            "finish_reason": finish_reason,
             "logprobs": None,
         }],
         "usage": {
@@ -189,6 +213,7 @@ async def chat_completion_via_ollama_stream(
     created = int(time.time())
     client = await _llm.get_shared_client()
     first = True
+    tool_calls_seen = False
 
     async with client.stream(
         "POST",
@@ -222,6 +247,7 @@ async def chat_completion_via_ollama_stream(
                 delta["reasoning_content"] = msg["thinking"]
             if msg.get("tool_calls"):
                 delta["tool_calls"] = msg["tool_calls"]
+                tool_calls_seen = True
 
             choices: list[dict[str, Any]] = []
             if delta:
@@ -229,17 +255,43 @@ async def chat_completion_via_ollama_stream(
                     "index": 0, "delta": delta, "finish_reason": None,
                 })
             if chunk.get("done"):
+                # Residual content delta (if any) on its own chunk so each
+                # chunk keeps one choice per index.
+                if choices:
+                    yield {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": body["model"],
+                        "choices": choices,
+                    }
                 done_reason = chunk.get("done_reason") or "stop"
-                choices.append({
-                    "index": 0, "delta": {},
-                    "finish_reason": _FINISH_REASON_MAP.get(done_reason, "stop"),
-                })
+                # See _ollama_to_chat_completion: Ollama never reports
+                # "tool_calls" itself, so derive it from whether any
+                # tool_calls delta appeared across the stream.
+                finish_reason = (
+                    "tool_calls" if tool_calls_seen
+                    else _FINISH_REASON_MAP.get(done_reason, "stop")
+                )
                 yield {
                     "id": chunk_id,
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": body["model"],
-                    "choices": choices,
+                    "choices": [{
+                        "index": 0, "delta": {},
+                        "finish_reason": finish_reason,
+                    }],
+                }
+                # Usage rides on a dedicated empty-choices frame, matching the
+                # LiteLLM include_usage convention so strict SSE consumers
+                # don't miss it.
+                yield {
+                    "id": chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": body["model"],
+                    "choices": [],
                     "usage": {
                         "prompt_tokens": chunk.get("prompt_eval_count", 0) or 0,
                         "completion_tokens": chunk.get("eval_count", 0) or 0,

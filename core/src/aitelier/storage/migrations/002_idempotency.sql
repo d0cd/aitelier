@@ -22,4 +22,4 @@ CREATE TABLE IF NOT EXISTS idempotency_keys (
 );
 CREATE INDEX IF NOT EXISTS idx_idempotency_expiry ON idempotency_keys(expires_at);
 
-INSERT INTO schema_version (version) VALUES (2) ON CONFLICT DO NOTHING;
+-- Version recorded by migrate(), not self-inserted here. See 001_initial.sql.
