@@ -55,9 +55,12 @@ print("host")
 fi
 
 # Sandbox Agent mode: aitelier.toml [sandbox_agent] mode = "host" |
-# "docker" | "remote". "docker" flips the compose `sa` profile and skips
-# the host binary install. "remote" is auto-detected later by checking
-# whether base_url points off-localhost (preserves current behavior).
+# "docker" | "brig" | "remote". "docker" flips the compose `sa` profile.
+# "brig" launches SA in an isolated brig cell and points aitelier at the
+# cell's ingress (skips the host binary install). "remote" assumes SA runs
+# elsewhere — honored explicitly here, or auto-detected when base_url points
+# off-localhost (preserves prior behavior). host (default) installs + runs
+# the SA binary locally.
 SA_MODE="$(uv run python -c '
 import sys, tomllib
 from pathlib import Path
@@ -144,7 +147,12 @@ _existing_sa_url() {
         | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 
-if [ "$SA_MODE" = "docker" ]; then
+if [ "$SA_MODE" = "brig" ] || [ "$SA_MODE" = "remote" ]; then
+    # SA is off-host (brig cell / remote URL). There is no local port to
+    # resolve, and base_url comes from aitelier.toml — skip the free-port
+    # dance so we don't write a bogus local base_url into the overlay.
+    SANDBOX_AGENT_PORT=""
+elif [ "$SA_MODE" = "docker" ]; then
     # docker compose binds the container's 2468 to host 2468 — it can't take
     # a dynamic host port. Skip the free-port dance entirely; picking a random
     # port here would write a base_url into the session overlay that nothing
@@ -172,10 +180,37 @@ fi
 # file is for things start.sh discovers at runtime that the user can't write
 # ahead of time. stop.sh removes it.
 mkdir -p "$REPO_ROOT/runs"
-cat > "$SESSION_TOML" <<EOF
-# Written by scripts/start.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ"). Ephemeral.
+_overlay_header="# Written by scripts/start.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ"). Ephemeral.
 # Removed by scripts/stop.sh. Do not edit by hand — your changes will be
-# overwritten on next start. Put persistent config in aitelier.toml instead.
+# overwritten on next start. Put persistent config in aitelier.toml instead."
+if [ "$SA_MODE" = "brig" ]; then
+    # SA runs in a brig cell. base_url comes from aitelier.toml (the cell
+    # ingress); inject the ingress bearer token from brig's own secret store
+    # so it isn't duplicated into aitelier.secrets.toml — single source of
+    # truth is the brig secret. Deep-merges over aitelier.toml's
+    # [sandbox_agent], so base_url is preserved.
+    _sa_ingress_token="$(cat "$(_brig_ingress_token_file)" 2>/dev/null || true)"
+    {
+        echo "$_overlay_header"
+        echo ""
+        echo "[sandbox_agent]"
+        [ -n "$_sa_ingress_token" ] && echo "token = \"$_sa_ingress_token\""
+        echo ""
+        echo "[database]"
+        echo "url = \"postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier\""
+    } > "$SESSION_TOML"
+elif [ "$SA_MODE" = "remote" ]; then
+    # base_url + token come from aitelier.toml / aitelier.secrets.toml; the
+    # overlay only carries the runtime DB DSN.
+    {
+        echo "$_overlay_header"
+        echo ""
+        echo "[database]"
+        echo "url = \"postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier\""
+    } > "$SESSION_TOML"
+else
+    cat > "$SESSION_TOML" <<EOF
+$_overlay_header
 
 [sandbox_agent]
 base_url = "http://127.0.0.1:${SANDBOX_AGENT_PORT}"
@@ -183,6 +218,7 @@ base_url = "http://127.0.0.1:${SANDBOX_AGENT_PORT}"
 [database]
 url = "postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier"
 EOF
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Extract credentials from CLI credential files
@@ -425,8 +461,30 @@ finally:
             echo "  ✗ docker sandbox-agent not responding after 30s"
             echo "    Check: docker compose --profile sa logs sandbox-agent"
         fi
-    elif [[ "$RESOLVED_SANDBOX_URL" != *"localhost"* ]] \
-       && [[ "$RESOLVED_SANDBOX_URL" != *"127.0.0.1"* ]]; then
+    elif [ "$SA_MODE" = "brig" ]; then
+        echo "  Brig: Sandbox Agent runs in an isolated brig cell"
+        if ! _brig_cell_up "$REPO_ROOT"; then
+            echo "  ✗ could not bring up the brig SA cell (see above)."
+            echo "    [sandbox_agent] mode = \"brig\" requires the cell — not"
+            echo "    falling back to a local SA. Fix the prereq above and retry."
+            exit 1
+        fi
+        # base_url = aitelier.toml's cell ingress; the ingress token was
+        # injected into the session overlay above. Verify reachability.
+        SANDBOX_TOKEN_VAL="$(cat "$(_brig_ingress_token_file)" 2>/dev/null || true)"
+        auth_header=()
+        if [ -n "$SANDBOX_TOKEN_VAL" ]; then
+            auth_header=("-H" "Authorization: Bearer $SANDBOX_TOKEN_VAL")
+        fi
+        if curl -sf "${auth_header[@]}" "$RESOLVED_SANDBOX_URL/v1/agents" >/dev/null 2>&1; then
+            echo "  ✓ brig SA reachable via ingress $RESOLVED_SANDBOX_URL"
+        else
+            echo "  ✗ brig SA unreachable at $RESOLVED_SANDBOX_URL after cell start"
+            exit 1
+        fi
+    elif [ "$SA_MODE" = "remote" ] \
+       || { [[ "$RESOLVED_SANDBOX_URL" != *"localhost"* ]] \
+            && [[ "$RESOLVED_SANDBOX_URL" != *"127.0.0.1"* ]]; }; then
         echo "  Remote: $RESOLVED_SANDBOX_URL (skipping local install)"
         # Rewrite the session overlay so the remote URL wins over the
         # dynamic local port we provisionally wrote earlier.
@@ -547,5 +605,9 @@ fi
 echo ""
 echo "=== Ready ==="
 echo "  LiteLLM proxy:    http://localhost:4000"
-echo "  Sandbox Agent:    http://127.0.0.1:${SANDBOX_AGENT_PORT}"
+if [ "$SA_MODE" = "brig" ] || [ "$SA_MODE" = "remote" ]; then
+    echo "  Sandbox Agent:    ${RESOLVED_SANDBOX_URL:-(see [sandbox_agent] in aitelier.toml)} ($SA_MODE)"
+else
+    echo "  Sandbox Agent:    http://127.0.0.1:${SANDBOX_AGENT_PORT}"
+fi
 echo "  aitelier service: http://localhost:7777"

@@ -14,6 +14,21 @@ _ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 _warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 _fail() { printf "  \033[31m✗\033[0m %s\n" "$*"; issues=$((issues + 1)); }
 
+# Sandbox Agent mode drives which preflight checks apply (brig vs host).
+cd "$REPO_ROOT" || exit 1
+SA_MODE="$(uv run python -c '
+import sys, tomllib
+from pathlib import Path
+for p in [Path("aitelier.toml"), Path.home()/".config"/"aitelier"/"config.toml"]:
+    if p.exists():
+        try:
+            print(tomllib.loads(p.read_text()).get("sandbox_agent", {}).get("mode", "host"))
+            sys.exit(0)
+        except Exception:
+            pass
+print("host")
+' 2>/dev/null || echo "host")"
+
 _compose_service_for_port() {
     # If the port is forwarded from one of our docker compose services,
     # print "<service>:<container_name>"; otherwise print empty.
@@ -188,6 +203,35 @@ if [ -f "$HOME/.codex/auth.json" ]; then
     _ok "Codex credentials present (~/.codex/auth.json)"
 else
     _warn "Codex not logged in (non-critical) — run \`codex login\` if you want OpenAI access"
+fi
+
+if [ "$SA_MODE" = "brig" ]; then
+    echo ""
+    echo "=== Brig (Sandbox Agent in a cell) ==="
+    if command -v brig >/dev/null 2>&1; then
+        _ok "brig: $(command -v brig)"
+        if brig system doctor --quick >/dev/null 2>&1; then
+            _ok "brig VM up (warden reachable)"
+        else
+            _warn "brig VM down — start.sh runs 'brig system up' automatically (first start waits for boot)"
+        fi
+    else
+        _fail "[sandbox_agent] mode = \"brig\" but brig not on PATH"
+        printf "      → uv tool install -e ~/projects/brig   (or switch mode in aitelier.toml)\n"
+    fi
+    brig_token="$HOME/.brig/secrets/sandbox-agent-ingress-token"
+    if [ -f "$brig_token" ]; then
+        _ok "brig ingress token registered"
+    else
+        _fail "brig ingress token missing ($brig_token)"
+        printf "      → python3 -c 'import secrets;print(secrets.token_urlsafe(32))' | brig secrets add sandbox-agent-ingress-token\n"
+    fi
+    if [ -x "$REPO_ROOT/docker/prebaked-agents/claude/claude" ]; then
+        _ok "prebaked claude binary present"
+    else
+        _fail "prebaked claude binary missing (docker/prebaked-agents/claude/claude)"
+        printf "      → see docker/sandbox-agent.brig.Dockerfile for the one-time fetch command\n"
+    fi
 fi
 
 echo ""

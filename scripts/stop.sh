@@ -16,6 +16,24 @@ AITELIER_PID_FILE="$REPO_ROOT/runs/.aitelier.pid"
 SESSION_TOML="$REPO_ROOT/runs/.session.toml"
 MODE="${1:-full}"
 
+# shellcheck source=lib.sh
+. "$(dirname "$0")/lib.sh"
+
+# Sandbox Agent mode — decides how to stop SA (local PID vs brig cell).
+cd "$REPO_ROOT" || exit 1
+SA_MODE="$(uv run python -c '
+import sys, tomllib
+from pathlib import Path
+for p in [Path("aitelier.toml"), Path.home()/".config"/"aitelier"/"config.toml"]:
+    if p.exists():
+        try:
+            print(tomllib.loads(p.read_text()).get("sandbox_agent", {}).get("mode", "host"))
+            sys.exit(0)
+        except Exception:
+            pass
+print("host")
+' 2>/dev/null || echo "host")"
+
 _kill_pid_file() {
     # $1 = pid file path, $2 = label, $3 = fallback pkill pattern.
     local pid_file="$1" label="$2" fallback_pattern="$3"
@@ -62,7 +80,11 @@ fi
 
 if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     echo "=== Stopping Sandbox Agent ==="
-    _kill_pid_file "$SANDBOX_AGENT_PID_FILE" "sandbox-agent" "sandbox-agent server"
+    if [ "$SA_MODE" = "brig" ]; then
+        _brig_cell_down && echo "  ✓ brig SA cell stopped + removed"
+    else
+        _kill_pid_file "$SANDBOX_AGENT_PID_FILE" "sandbox-agent" "sandbox-agent server"
+    fi
 
     echo "=== Stopping infrastructure ==="
     cd "$REPO_ROOT/docker"
