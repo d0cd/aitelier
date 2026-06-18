@@ -1004,8 +1004,8 @@ Async run completions and scheduled jobs route through a durable webhook
 worker:
 
 - **Queued** in Postgres (table `webhook_deliveries`).
-- **Retry policy**: exponential backoff `1s / 5s / 30s / 5min / 1hr`,
-  5 attempts.
+- **Retry policy**: exponential backoff `1s / 5s / 30s / 5min / 1hr`
+  (5 retry delays), then marked `failed` on the 6th attempt.
 - **Optional Bearer auth**: set `[service] webhook_secret` to send an
   `Authorization: Bearer <secret>` header on every delivery. Receivers
   verify with a constant-time compare:

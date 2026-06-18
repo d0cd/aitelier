@@ -263,7 +263,7 @@ guidance: [`docs/INTEGRATION.md`](docs/INTEGRATION.md) → "Error handling".
 - **Postgres** for durable run/event/schedule/webhook state; `InMemoryStore`
   fallback for tests and `[database] url`-less dev.
 - Webhook delivery is durable: queued in Postgres, retried with exponential
-  backoff (1s / 5s / 30s / 5min / 1hr, 5 attempts).
+  backoff (1s / 5s / 30s / 5min / 1hr), failed on the 6th attempt.
 - **Agent workflow consolidation**: `aitelier.prepare` + `aitelier.artifacts` lets one
   HTTP call orchestrate install → commands → file seed → sidecars → agent → artifacts.
   Edge cases beyond this workflow hit Sandbox Agent directly via the URL in

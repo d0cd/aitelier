@@ -15,6 +15,8 @@ Mapping (https://github.com/ollama/ollama/blob/main/docs/api.md):
     message.tool_calls                  choices[0].message.tool_calls
     done_reason: "length"               choices[0].finish_reason: "length"
     done_reason: "stop"                 choices[0].finish_reason: "stop"
+      (overridden to "tool_calls" when the message carries tool_calls —
+       Ollama never reports that done_reason itself)
     eval_count                          usage.completion_tokens
     prompt_eval_count                   usage.prompt_tokens
 
