@@ -20,7 +20,8 @@ make start                # Postgres + LiteLLM + Sandbox Agent + aitelier servic
 ```
 
 The service is now at `http://localhost:7777`. Health check:
-`curl localhost:7777/v1/health`.
+`curl localhost:7777/v1/health`. A read-only dashboard (runs, events, trace
+aggregates) is at `http://localhost:7777/ui`.
 
 ```python
 from aitelier_client import Aitelier
@@ -38,7 +39,11 @@ resp = await openai.chat.completions.create(
 resp = await openai.chat.completions.create(
     model="agent:claude/claude-sonnet-4-5",
     messages=[{"role": "user", "content": "Audit this repo for security issues."}],
-    extra_body={"aitelier": {"workspace": "/path/to/repo"}},
+    extra_body={"aitelier": {
+        "workspace": "/path/to/repo",
+        "reasoning_effort": "high",   # mapped to the backend's advertised levels
+        "approval_mode": "auto",      # sandbox/approval preset
+    }},
 )
 ```
 
@@ -53,6 +58,8 @@ resp = await openai.chat.completions.create(
 | `make status` | What's running, where logs are, are dependencies healthy. |
 | `make doctor` | Preflight checks. Run when `make start` fails with a confusing error. |
 | `make test` | Python + TS test suites. |
+| `make backup` / `make restore FILE=…` | Dump / restore the Postgres durable state (see `docs/deploy/backup-restore.md`). |
+| `make service-install` / `make service-uninstall` | macOS: run aitelier always-on via launchd (auto-start at login, restart on crash, daily backup) — see `docs/deploy/launchd.md`. |
 | `make reset` | **Destructive.** Stops everything *and* wipes the Postgres volume. Asks before doing it. |
 
 ## When something's wrong

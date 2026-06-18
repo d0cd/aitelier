@@ -542,8 +542,12 @@ use case; ad-hoc httpx inconsistent with how other code calls the service.
 **LangGraph as the agent framework.** Rejected. Heavy abstractions for
 control flow we don't have.
 
-**Web dashboard.** Rejected for now. Observability comes from structured
-JSON logs + `/v1/traces*` queries + future LLM-trace tooling.
+**Web dashboard.** A *full* dashboard stays rejected — observability is
+primarily structured JSON logs + `/v1/traces*` queries. But a minimal,
+read-only `/ui` now ships: a single static page (no build step) over the
+existing GET endpoints (`/v1/runs`, run events, `/v1/traces/aggregates`).
+A read/write dashboard (run replay, behavior graphs) remains future work
+(see PLAN.md Tier 1).
 
 **Monorepo tooling (Nx, Turborepo).** Rejected as overkill for a personal
 project; plain pnpm + uv coexisting is simpler.

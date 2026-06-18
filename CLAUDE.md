@@ -75,6 +75,7 @@ transports that emit a global toolset they can't suppress per-request.
 - `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
 - `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
 - `GET  /v1/health`, `GET /v1/discovery`, `GET /v1/metrics` — liveness + endpoint inventory + dependency probes + runtime counters
+- `GET  /ui` (+ `/` redirect) — read-only static dashboard over `/v1/runs*` + `/v1/traces/aggregates` (no build step; public path, data calls still gated)
 
 All requests accept `X-Correlation-Id` (generated if absent), echoed in
 response header + body field + SSE chunks + run metadata.
@@ -151,7 +152,8 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
 - `sdks/typescript/` — TypeScript SDK (`aitelier`); inference via `Aitelier.openai()`
 - `examples/` — runnable recipes (fan-out, MCP orchestrator, scheduled audit, webhook receiver)
 - `docker/` — Postgres (always-on) + LiteLLM proxy + optional Ollama profile
-- `scripts/` — start.sh, stop.sh, release.sh, doctor.sh
+- `scripts/` — start.sh, stop.sh, release.sh, doctor.sh, backup.sh, restore.sh, generate-types.sh, supervise.sh + install/uninstall-launchd.sh (macOS always-on)
+- `core/src/aitelier/static/ui.html` — the read-only `/ui` dashboard (vanilla, no build)
 - `runs/` — gitignored agent run output (prompt, manifest); durable state lives in Postgres
 
 ## Infrastructure
@@ -294,6 +296,10 @@ make restart              # restart just the service (after editing core/)
 make logs                 # tail service + sandbox-agent logs
 make status               # what's running + log paths + dep healthchecks
 make doctor               # preflight: ports, tools, creds, docker
+make backup               # pg_dump → backups/ (retention-pruned)
+make restore FILE=...     # restore from a backup dump (confirmed)
+make service-install      # macOS launchd: auto-start at login + restart + daily backup
+make service-uninstall    # remove the launchd agents
 make reset                # nuclear: stop + drop Postgres volume + wipe runs/
 make clean                # remove venv, build artifacts
 ./scripts/release.sh X.Y.Z  # lockstep version bump
