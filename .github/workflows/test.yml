@@ -9,6 +9,23 @@ on:
 jobs:
   unit:
     runs-on: ubuntu-latest
+    # The storage integration tests assert (not skip) when no Postgres is
+    # reachable — "no silent skips" is the project policy — so CI must
+    # provide one. Creds match docker/docker-compose.yml's dev Postgres.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: aitelier
+          POSTGRES_PASSWORD: aitelier_local
+          POSTGRES_DB: aitelier
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U aitelier -d aitelier"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
@@ -21,9 +38,11 @@ jobs:
         run: uv python install 3.11
 
       - name: Install Python deps
+        # `[otel]` brings the OTLP exporters the otel tests import; without
+        # it they fail (not skip) with ModuleNotFoundError.
         run: |
           uv sync
-          uv pip install -e "./core[dev]" -e "./sdks/python[dev]"
+          uv pip install -e "./core[dev,otel]" -e "./sdks/python[dev]"
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -39,6 +58,8 @@ jobs:
 
       - name: Test (Python + TS type-check)
         # Skips smoke tests (need live infra). Unit + SDK tests only.
+        env:
+          AITELIER_TEST_DATABASE_URL: postgresql://aitelier:aitelier_local@localhost:5432/aitelier
         run: |
           uv run pytest core/tests/ sdks/python/tests/ -v --ignore=core/tests/smoke_test.py
           cd sdks/typescript && npx tsc --noEmit
