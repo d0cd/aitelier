@@ -1,7 +1,7 @@
 # Feedback from running Sandbox Agent in a brig cell
 
 **First report:** 2026-05-18 (brig 0.3.0 base, aitelier+SA co-located in cell)
-**Latest update:** 2026-05-20 (latest 0.3.0 — CA bugs fixed, SSE buffering surfaced)
+**Latest update:** 2026-06-04 (orphan-subnet block + 403-vs-502 ingress after a VM restart)
 **Consumer:** aitelier (runs on host; talks to SA-in-cell via brig ingress)
 **Test artifact:** `docs/deploy/sandbox-agent.cell.yaml`,
 `docker/sandbox-agent.brig.Dockerfile`, `scripts/test-brig-mode.sh`
@@ -22,6 +22,116 @@ incrementally through ingress. Aitelier-on-host + SA-in-brig is a
 working deployment. The items below are the surprises we hit — most
 are bugs brig has since shipped fixes for, with a couple of
 adoption-quality items still open.
+
+
+## 2026-06-04 — surprises after an overnight VM restart
+
+aitelier-on-host + SA-in-brig was running fine. Came back the next day
+and SA was unreachable; aitelier's `/v1/discovery` reported
+`sandbox_agent.reachable: false`. Diagnosed + worked around. These are
+sharper variants of the "exited cell → 502" item in *Smaller frictions*
+below — worth their own writeup because the recovery path is different.
+
+> **✅ Addressed in brig (commit `8dbb26b`, branch `feat/host-mounts`).**
+> `allocate()` is now idempotent per cell name (subnet reclaim — §1);
+> a `restart: always` cell field re-launches gone cells on `brig system up`
+> (§3); the ingress returns a descriptive 404 + attributes rejects to the
+> cell (§2); and `brig ps` / `brig cell ls` / `brig cell status` aliases
+> landed (CLI §).
+> **Verified by us:** CLI aliases work; relaunch no longer hits the
+> subnet error (now blocked on an unrelated `mount_roots` VM-state issue
+> from the in-flight host-mounts work — recreate the VM to clear it).
+> **Adopted:** `restart: always` added to
+> `docs/deploy/sandbox-agent.cell.yaml`.
+
+### 1. Orphan subnet outlives the cell and blocks relaunch; no targeted cleanup
+
+After the restart the `sandbox-agent` cell was **gone** from
+`brig cell list` (not `exited` — fully absent; its image had been
+evicted too). But the subnet allocation persisted, so relaunch from yaml
+hard-failed:
+
+```
+$ brig run --file docs/deploy/sandbox-agent.cell.yaml -d
+[ERROR] Failed to start cell 'sandbox-agent': Cell 'sandbox-agent' already has subnet allocated
+```
+
+`brig cell stop sandbox-agent` and `brig cell rm sandbox-agent` did **not**
+free it (there's no live/stopped cell left to remove — only the leaked
+subnet). The only thing that cleared it was the broad `brig system prune`:
+
+```
+$ brig system prune
+  freeing subnet: 10.60.1.0/24 (sandbox-agent)
+  removing orphan workspace: /Users/d0c/.brig/state/{sandbox-agent,test,cell-with-ingress,cell-without}
+Pruned: 4 cells, 0 log files, 1 subnets
+$ brig run --file docs/deploy/sandbox-agent.cell.yaml -d   # now succeeds
+[INFO] Registered 1 ingress routes for 'sandbox-agent'
+```
+
+Pain points:
+- `brig run` for a given name should **reclaim/reuse** an orphan subnet
+  held by that same name instead of erroring — it already knows it's the
+  same cell.
+- The error should name the remedy (`brig system prune`), not just the
+  symptom.
+- `brig system prune` is too broad as the *only* fix: it also swept three
+  unrelated orphan workspaces (`test`, `cell-with-ingress`,
+  `cell-without`). A **targeted** `brig cell rm --force <name>` (or
+  `brig cell network <name> --release`) that frees just that cell's
+  subnet + workspace would let a consumer self-heal one cell without
+  nuking every orphan.
+- This recurs on **every** VM restart, so it's a daily papercut for any
+  persistent brig-hosted service.
+
+**Suggestion:** make `brig run --file` idempotent w.r.t. a same-named
+orphan subnet, or add a per-cell force-cleanup.
+
+### 2. Ingress returns 403 (not 502) when no cell is bound to the route
+
+Different from the documented "exited cell → 502". With the cell fully
+absent (post-restart, pre-relaunch), the ingress returned **403** for the
+route — with *and* without the correct bearer token:
+
+```
+$ curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" \
+    http://127.0.0.1:8443/sandbox-agent/v1/agents
+403
+$ curl -s -o /dev/null -w "%{http_code}\n" \
+    http://127.0.0.1:8443/sandbox-agent/v1/agents          # no token → still 403
+403
+```
+
+403 reads as auth failure — we spent time confirming the token still
+matched the `sandbox-agent-ingress-token` secret (it did) before
+realizing the route just had no upstream. The ingress now has two opaque
+"no upstream" behaviors (502 when the cell exists-but-exited, 403 when no
+cell is bound), neither of which says so.
+
+**Suggestion:** distinguish auth (401/403) from missing-upstream
+(502/503 with a body like `no cell bound to route 'sandbox-agent'`).
+Today a consumer can't tell a bad token from a down cell.
+
+### 3. Cell + image don't survive `brig system up`; no autostart
+
+The restart left VM down, cell gone, image evicted. Recovery meant a slow
+cold image rebuild through warden (see *Still blocking* item 2) **plus**
+the subnet block above. There's no "persistent cell" / "re-launch on
+`brig system up`" concept, and the VM doesn't autostart at login — rough
+for a service you want always-on (we point a launchd supervisor at it).
+
+**Suggestion:** a cell-yaml `restart: always` (or
+`brig system up --restore-cells`) that re-launches declared cells and
+re-registers their ingress after a VM bounce, plus optional VM autostart
+(a brig launchd agent).
+
+### Minor CLI ergonomics
+
+`brig cell ls`, `brig ls`, and `brig cell status <name>` aren't
+recognized (it's `brig cell list` / `brig cell inspect`). The argparse
+error helpfully lists valid choices, but `ls`/`status` are near-universal
+aliases — accepting them (or a top-level `brig ps`) would cut friction
+during incident triage.
 
 
 ## Fixed since first report
@@ -334,12 +444,16 @@ That also removes the misleading warden log lines.
 
 | # | Severity | Item |
 |---|---|---|
-| 1 | Adoption | Raw TCP host_services, OR a documented socat-bridge recipe for unix sockets → host TCP services. Aitelier sidesteps by running outside the cell; the next consumer will hit this. |
-| 2 | Quality | Feed warden into `brig image build` so first-run agent installs (`npm install`, agent CLI binary fetch) aren't multi-minute through MITM. Today the build/runtime asymmetry forces pre-baking large binaries into the image. |
-| 3 | Minor | `brig system doctor`: add `[OK] Warden CA matches all cells' staged bundles` to surface stale entrypoint-managed `SSL_CERT_FILE` overrides before they become silent TLS hangs. |
-| 4 | Minor | `brig cell network` to include ingress hits (currently egress-only). |
-| 5 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the ingress-route / host-service exemption metadata is actually populated when the check runs. |
-| 6 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source). |
+| 1 | ✅ Shipped 8dbb26b | Orphan subnet outlives a cell across VM restart and blocks `brig run`. Fixed: `allocate()` is idempotent per cell name, so `brig run` reclaims a same-named orphan. (2026-06-04 §1) |
+| 2 | ⚠ Partial 8dbb26b | `restart: always` cell field now re-launches gone cells on `brig system up` (re-registering ingress). VM autostart at login was intentionally not added — our `lib.sh` self-heals via `brig system up`. (2026-06-04 §3) |
+| 3 | Adoption | Raw TCP host_services, OR a documented socat-bridge recipe for unix sockets → host TCP services. Aitelier sidesteps by running outside the cell; the next consumer will hit this. |
+| 4 | Quality | Feed warden into `brig image build` so first-run agent installs (`npm install`, agent CLI binary fetch) aren't multi-minute through MITM. Today the build/runtime asymmetry forces pre-baking large binaries into the image. |
+| 5 | ✅ Shipped 8dbb26b | Ingress now returns a descriptive 404 body for a no-route request and attributes rejected attempts (auth/oversize) to the cell in `brig cell network`. (2026-06-04 §2) |
+| 6 | Minor | `brig system doctor`: add `[OK] Warden CA matches all cells' staged bundles` to surface stale entrypoint-managed `SSL_CERT_FILE` overrides before they become silent TLS hangs. |
+| 7 | Minor | `brig cell network` to include ingress hits (currently egress-only). |
+| 8 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the ingress-route / host-service exemption metadata is actually populated when the check runs. |
+| 9 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source). |
+| 10 | ✅ Shipped 8dbb26b | CLI aliases `brig cell ls` / `brig cell status` + top-level `brig ps` now accepted. Verified working. (2026-06-04) |
 
 With SSE flowing, aitelier-on-host + SA-in-brig is a real, working
 shape. Items 1 and 2 are about widening the adoption surface for the

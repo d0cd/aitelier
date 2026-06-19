@@ -113,20 +113,36 @@ _brig_cell_up() {
         echo "    be pre-baked. Fetch it once (see $_BRIG_DOCKERFILE)."
         return 1
     fi
-    if ! brig image ls 2>/dev/null | grep -q "sandbox-agent-brig"; then
-        echo "  Building $_BRIG_IMAGE_TAG (first run) ..."
-        if ! ( cd "$repo_root" && brig image build --tag "$_BRIG_IMAGE_TAG" --file "$_BRIG_DOCKERFILE" . ); then
-            echo "  ✗ brig image build failed"
-            return 1
-        fi
+    # brig has no image-existence query, and `brig image build` is
+    # layer-cached + idempotent, so just build — a cached build is cheap and
+    # this only runs on the cold path (the warm path returned above).
+    echo "  Building $_BRIG_IMAGE_TAG (cached layers reused if present) ..."
+    if ! ( cd "$repo_root" && brig image build --tag "$_BRIG_IMAGE_TAG" --file "$_BRIG_DOCKERFILE" . ); then
+        echo "  ✗ brig image build failed"
+        return 1
     fi
     echo "  Launching cell from $_BRIG_CELL_YAML ..."
     brig cell stop "$_BRIG_CELL" >/dev/null 2>&1 || true
     brig cell rm "$_BRIG_CELL" >/dev/null 2>&1 || true
-    if ! ( cd "$repo_root" && brig run --file "$_BRIG_CELL_YAML" -d ); then
+    # Retry once through `brig system up` when the run reports warden/VM not
+    # serving. `doctor --quick` above passes when the VM is reachable but
+    # warden is down (e.g. right after a `brig config set mount_roots` bounce),
+    # so the upfront self-heal can miss it — recover on the actual run error.
+    local attempt out
+    for attempt in 1 2; do
+        if out="$( cd "$repo_root" && brig run --file "$_BRIG_CELL_YAML" -d 2>&1 )"; then
+            break
+        fi
+        printf '%s\n' "$out" | sed 's/^/    /'
+        if [ "$attempt" -eq 1 ] && \
+           printf '%s' "$out" | grep -qiE "warden proxy is not running|vm is not running|brig system up"; then
+            echo "  Warden/VM not serving — running 'brig system up' and retrying ..."
+            brig system up >/dev/null 2>&1 || true
+            continue
+        fi
         echo "  ✗ brig run failed. Check: brig secrets list; brig policy show $_BRIG_CELL"
         return 1
-    fi
+    done
     echo "  Waiting for SA ingress on $ingress ..."
     for i in $(seq 1 60); do
         if curl -sf -H "Authorization: Bearer $token" "$ingress/v1/agents" >/dev/null 2>&1; then

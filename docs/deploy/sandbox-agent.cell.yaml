@@ -24,6 +24,12 @@ name: sandbox-agent
 image: localhost/sandbox-agent-brig:latest
 # Entrypoint stages secrets + trusts warden's MITM CA, then execs SA.
 command: ["/app/cell-entrypoint.sh"]
+# Re-launch this cell on `brig system up` after a VM restart drops every
+# container (requires brig with the subnet-reclaim / restart:always change).
+# Aitelier is a daily-driver dependency; auto-restore + re-registered
+# ingress means `make start` after a reboot just works instead of hitting
+# an exited cell. An explicit `brig cell stop` is still respected.
+restart: always
 memory: 8g
 cpus: 4
 pids_limit: 4096
