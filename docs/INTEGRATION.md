@@ -1109,6 +1109,36 @@ Error types (classified in `core/src/aitelier/errors.py`):
 | `Orphaned` | Run was in-flight when aitelier restarted; finalised via orphan-sweep + terminal webhook (see "Run state machine" → `orphaned`) | No |
 | `SchemaViolation` | JSON parse / validation error | No |
 
+### Debugging a call by `runId`
+
+Every response (and error envelope) carries `aitelier_run_id`. That id is
+the trace id, and **`GET /v1/runs/{runId}` is the durable record of what
+happened** — populated on success *and* failure. It answers the common
+"what did aitelier actually do with my request?" questions without
+cross-referencing logs:
+
+- **`request_body`** — your request exactly as aitelier received it. Confirm
+  the knobs you sent arrived (`num_ctx`, `reasoning_effort`,
+  `response_format`, `max_tokens`, …). If a field you expected isn't here,
+  your client/shim dropped it before aitelier — that's where to look.
+- **`rendered_messages`** — the messages as they went on the wire.
+- **`error_type` / `error_msg`** — the typed failure (e.g. `Timeout`).
+- **`input/output/total_tokens`, `duration_ms`, `model`, `finish_reason`,
+  `result`** — usage, latency, routing, outcome.
+
+The provider-bound translation is deterministic (e.g. `request_body.num_ctx`
+→ Ollama `options.num_ctx`; `reasoning_effort:"minimal"` → `think:false`),
+so `request_body` plus the documented mappings above tell you what the
+provider received — there's no separate per-call provider payload to chase.
+
+> The **`runs/` directory on disk is not the trace store** — it holds only
+> optional agent run artifacts (prompt/manifest) and dev logs. Durable
+> per-call traces live in Postgres, queried via `GET /v1/runs/{runId}`
+> (full record) or `GET /v1/traces/{runId}` (summary projection).
+
+Record `aitelier_run_id` on your side at every outcome so a failure pivots
+straight into this lookup.
+
 ### Retries
 
 Retries are **the OpenAI SDK's responsibility** on the LLM path —
