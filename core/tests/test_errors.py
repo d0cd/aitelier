@@ -255,3 +255,47 @@ def test_classify_network_errors_as_provider_unavailable():
     from aitelier.errors import classify_error
     assert classify_error(httpx.ReadError("peer reset")) == "ProviderUnavailable"
     assert classify_error(httpx.WriteError("broken pipe")) == "ProviderUnavailable"
+
+
+# --- scrub_upstream_body: regex + entropy recall net for provider bodies ----
+
+
+def test_scrub_upstream_body_masks_prefixed_api_key_in_prose():
+    """An OpenAI-style key embedded in an error sentence is redacted even
+    though it isn't a named field (the recall net, not the named patterns)."""
+    from aitelier.errors import scrub_upstream_body
+    body = ("Incorrect API key provided: sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56. "
+            "You can find your API key at https://platform.openai.com/account.")
+    out = scrub_upstream_body(body)
+    assert "sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56" not in out
+    assert "[redacted]" in out
+    # Surrounding prose is preserved.
+    assert "Incorrect API key provided" in out
+
+
+def test_scrub_upstream_body_masks_jwt_and_long_hex_and_high_entropy():
+    from aitelier.errors import scrub_upstream_body
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dQw4w9WgXcQabcdefg"
+    hexsecret = "deadbeefcafebabedeadbeefcafebabe0123456789abcdef"  # 48 hex
+    b64 = "aGVsbG8gd29ybGRzZWNyZXR2YWx1ZXh5eg=="
+    for secret in (jwt, hexsecret, b64):
+        out = scrub_upstream_body(f"upstream said: {secret} (oops)")
+        assert secret not in out, secret
+        assert "[redacted]" in out
+
+
+def test_scrub_upstream_body_preserves_run_id_uuid_numbers_and_skus():
+    """Must NOT redact aitelier's 32-hex run_id/trace_id (the whole point of
+    surfacing the trace), nor uuids, plain numbers, model SKUs, or prose."""
+    from aitelier.errors import scrub_upstream_body
+    run_id = "abcdef0123456789abcdef0123456789"          # 32 lowercase hex
+    uuid = "550e8400-e29b-41d4-a716-446655440000"
+    keep = f"model not found (run {run_id}, req {uuid}, code 404, model claude-sonnet-4-5)"
+    out = scrub_upstream_body(keep)
+    for token in (run_id, uuid, "404", "claude-sonnet-4-5", "model not found"):
+        assert token in out, token
+
+
+def test_scrub_upstream_body_empty():
+    from aitelier.errors import scrub_upstream_body
+    assert scrub_upstream_body("") == ""

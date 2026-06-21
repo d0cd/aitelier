@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import collections
+import math
 import re
 
 import httpx
@@ -225,3 +227,74 @@ def scrub_error_text(message: str) -> str:
     for pattern, replacement in _SECRET_PATTERNS:
         out = pattern.sub(replacement, out)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Aggressive recall net for UPSTREAM PROVIDER bodies (scrub_upstream_body).
+#
+# scrub_error_text (above) is deliberately conservative — it only masks
+# *named* credentials, to avoid mangling general error text (paths, SKUs,
+# tracebacks). Upstream provider error bodies are a narrower, riskier case:
+# they're surfaced to the consumer + persisted to runs.error_msg, and a cloud
+# provider's body can carry an unprefixed/unenumerated key fragment, org id,
+# or session token in free prose that the named patterns miss. So for those
+# bodies specifically we add a token-shape + Shannon-entropy recall net,
+# adapted from brig's warden_addons/_common.py. It is heuristic — imperfect
+# recall, some over-redaction — and is meant to be monitored (the full body
+# is still logged at WARNING for operators) and tuned over time.
+# ---------------------------------------------------------------------------
+
+_ENTROPY_MIN_LEN = 16
+_ENTROPY_MIN_BITS = 4.0
+
+# A token-ish run in free text: starts alnum, ≥12 chars of credential charset.
+_TOKEN_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-+/=.]{11,}")
+
+# Audit ids — high-cardinality but NOT secret; keep them so a consumer can
+# still read the trace/request id out of an error. Critically includes
+# aitelier's own run_id/trace_id (32 lowercase hex) — redacting that would
+# defeat the whole point of surfacing the error.
+_AUDIT_UUID = re.compile(r"\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+                         r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z")
+_AUDIT_RUN_ID = re.compile(r"\A[0-9a-f]{32}\Z")
+_ALL_DIGITS = re.compile(r"\A[0-9]+\Z")
+
+# Secret shapes (whole-run): long hex, mixed-alnum token (key/JWT-segment).
+_LONG_HEX = re.compile(r"\A[0-9a-fA-F]{16,}\Z")
+_MIXED_TOKEN = re.compile(r"\A(?=[^.]*[A-Za-z])(?=[^.]*[0-9])[A-Za-z0-9_\-]{20,}\Z")
+
+
+def _shannon_entropy(s: str) -> float:
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return -sum((c / n) * math.log2(c / n)
+                for c in collections.Counter(s).values())
+
+
+def _looks_secret(token: str) -> bool:
+    """Heuristic: does this free-text token look like a credential? Keeps
+    audit ids (numeric / uuid / 32-hex run_id); redacts long hex, mixed-alnum
+    tokens, and high-entropy strings."""
+    if _ALL_DIGITS.match(token) or _AUDIT_UUID.match(token) or _AUDIT_RUN_ID.match(token):
+        return False
+    if _LONG_HEX.match(token) or _MIXED_TOKEN.match(token):
+        return True
+    return (len(token) >= _ENTROPY_MIN_LEN
+            and _shannon_entropy(token) >= _ENTROPY_MIN_BITS)
+
+
+def scrub_upstream_body(body: str) -> str:
+    """Scrub an upstream provider error body for surfacing to consumers +
+    persisting to `runs.error_msg`. Runs the conservative named-credential
+    patterns first, then the token-shape/entropy recall net for unenumerated
+    secrets. Heuristic by design — monitor the surfaced output and tune
+    `_looks_secret` over time. The unredacted body stays in the WARNING log
+    for operator review."""
+    if not body:
+        return body
+    out = scrub_error_text(body)
+    return _TOKEN_RUN.sub(
+        lambda m: "[redacted]" if _looks_secret(m.group(0)) else m.group(0),
+        out,
+    )

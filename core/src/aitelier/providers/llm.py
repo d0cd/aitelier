@@ -245,27 +245,31 @@ def _safe_connect_message(exc: BaseException) -> str:
 
 
 def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
-    """Build a sanitized error message from an upstream LiteLLM response.
+    """Build an error message from an upstream LiteLLM/Ollama response,
+    including the provider's own body (scrubbed) so failures are
+    diagnosable from the run/response — not just a bare status.
 
-    The raw response body can contain provider names, model SKUs,
-    internal request IDs, or echoed API key fragments — all of which
-    leak to /v1/* consumers as 4xx/5xx response bodies in hosted mode.
-    We surface only status + a short canonical phrase so consumers can
-    branch on type and operators can correlate via the run row's
-    `error_msg` (and full body in the log).
+    The raw body can carry provider internals or an echoed key fragment in
+    free prose, so it goes through `scrub_upstream_body` (named-credential
+    patterns + a token-shape/entropy recall net) before being surfaced to
+    consumers and persisted to `runs.error_msg`. The scrub is heuristic; the
+    full unredacted body stays in the WARNING log for operator review +
+    tuning.
     """
+    from aitelier.errors import scrub_upstream_body
     canonical = {
         "RateLimited":   "Upstream rate limit",
         "AuthError":     "Upstream auth failure",
         "ProviderError": "Upstream provider error",
     }.get(_classify_llm_status(status), "Upstream provider error")
     body_preview = resp.text[:500] if resp.text else ""
-    if body_preview:
-        logger.warning(
-            "Upstream %d (%s); response body: %s",
-            status, canonical, body_preview,
-        )
-    return f"{canonical} (HTTP {status})"
+    if not body_preview:
+        return f"{canonical} (HTTP {status})"
+    logger.warning(
+        "Upstream %d (%s); response body: %s",
+        status, canonical, body_preview,
+    )
+    return f"{canonical} (HTTP {status}): {scrub_upstream_body(body_preview)}"
 
 
 # Ollama bypass routing lives in `providers/ollama.py` — the
