@@ -1,7 +1,7 @@
 # Feedback from running Sandbox Agent in a brig cell
 
 **First report:** 2026-05-18 (brig 0.3.0 base, aitelier+SA co-located in cell)
-**Latest update:** 2026-06-04 (orphan-subnet block + 403-vs-502 ingress after a VM restart)
+**Latest update:** 2026-06-08 (codex `HOME` under `/tmp` helper-binary warning)
 **Consumer:** aitelier (runs on host; talks to SA-in-cell via brig ingress)
 **Test artifact:** `docs/deploy/sandbox-agent.cell.yaml`,
 `docker/sandbox-agent.brig.Dockerfile`, `scripts/test-brig-mode.sh`
@@ -322,6 +322,28 @@ runtime was warden-MITM'd npm fetches. Cached after first run.
 
 ## Smaller frictions (now that we hit them, worth flagging)
 
+### `HOME` under `/tmp` makes codex refuse to create helper binaries
+
+The cell rootfs is read-only except `/work`, `/tmp`, `/run`, so the
+entrypoint relocates `HOME=/tmp/home` (where the credential secrets are
+symlinked). codex CLI then logs on every spawn:
+
+```
+WARNING: proceeding, even though we could not update PATH: Refusing to
+create helper binaries under temporary dir "/tmp"
+(codex_home: AbsolutePathBuf("/tmp/home/.codex"))
+```
+
+It's a WARNING and the run completed normally (verified: a tool-using
+`agent:codex/gpt-5.5` run executed its shell tool and returned output),
+so it's non-fatal today — but codex treats a `/tmp`-rooted `codex_home`
+as untrusted and skips a feature (helper-binary creation) that some codex
+workflows may need. A brig-provided **writable non-`/tmp` HOME mount**
+(e.g. a small per-cell `/home/<cell>` tmpfs not under `/tmp`) would let
+HOME-sensitive CLIs behave normally without the cell author hand-rolling
+a mount. Low priority; logging it so the next CLI that's stricter about
+`/tmp` HOME doesn't surprise someone.
+
 ### `brig cell start` doesn't re-register ingress routes after a brig restart
 
 After `brig system up` (e.g., reboot, or `brig system down/up`), any
@@ -454,6 +476,7 @@ That also removes the misleading warden log lines.
 | 8 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the ingress-route / host-service exemption metadata is actually populated when the check runs. |
 | 9 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source). |
 | 10 | ✅ Shipped 8dbb26b | CLI aliases `brig cell ls` / `brig cell status` + top-level `brig ps` now accepted. Verified working. (2026-06-04) |
+| 11 | Minor | A writable non-`/tmp` HOME mount option, so HOME-sensitive CLIs (codex refuses helper-binary creation under a `/tmp`-rooted `codex_home`) work without the cell author hand-rolling a mount. (2026-06-08) |
 
 With SSE flowing, aitelier-on-host + SA-in-brig is a real, working
 shape. Items 1 and 2 are about widening the adoption surface for the

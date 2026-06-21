@@ -807,8 +807,18 @@ lists each backend's real ids under `aitelier_inner_llms` (see below).
 | Backend | Inner-model id format | Examples | Wired via |
 |---|---|---|---|
 | `claude` | Anthropic aliases or full ids | `agent:claude/sonnet`, `agent:claude/haiku`, `agent:claude/claude-sonnet-4-5` | `session/new` `_meta` |
-| `codex` | Codex-native ids | `agent:codex/gpt-5.4`, `agent:codex/gpt-5.3-codex` | `session/set_model` |
+| `codex` | Codex-native ids | `agent:codex/gpt-5.5`, `agent:codex/gpt-5.4` | `session/set_model` |
 | `opencode`, `cursor`, `amp`, `pi` | the backend's own ids | (see `/v1/models`) | `session/set_model` |
+
+> **codex + ChatGPT-account login:** always pass an explicit model
+> (`agent:codex/gpt-5.5`). Bare `agent:codex` lets codex-acp fall back to its
+> own default (`gpt-5.3-codex`), which a **ChatGPT-subscription** OAuth login
+> can't use — the turn fails. aitelier surfaces only codex-acp's wire-level
+> `ACP error -32603: Internal error` (the actionable detail —
+> *"'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT
+> account"* — is logged to codex's stderr inside the sandbox, not returned
+> over ACP, so aitelier can't relay it). The `-codex`-suffixed ids in
+> particular are API-key-only; ChatGPT accounts want a plain `gpt-5.x`.
 
 Common mistake: `agent:codex/openai/gpt-4o`. The `openai/*` strings (and curated
 aliases like `claude-sonnet`) are **LLM-path** ids — they work for
