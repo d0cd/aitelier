@@ -188,7 +188,7 @@ async def _schedule_handler(entry: dict) -> None:
                 run_id=run_id,
             )
     except Exception as exc:
-        logger.warning("Scheduled run %s failed: %s", run_id, exc)
+        logger.exception("Scheduled run %s failed: %s", run_id, exc)
         # Persist a synthetic failed run row so /v1/runs and /v1/traces
         # surface this failure. Without this, schedule-side failures (bad
         # task body, model-route parse error, validator rejection) only
@@ -326,7 +326,7 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:
         awaiting = []
-        logger.warning("Webhook reconciliation query failed on startup: %s", exc)
+        logger.exception("Webhook reconciliation query failed on startup: %s", exc)
     for run in awaiting:
         meta = run.metadata if isinstance(run.metadata, dict) else {}
         webhook_url = meta.get("webhook_url")

@@ -347,13 +347,19 @@ def test_record_span_tree_uses_run_id_as_trace_id_and_emits_tool_children():
 
     rid = "abcdef0123456789abcdef0123456789"
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    # ACP fires multiple result pings per call; pairing is by toolCallId, not
+    # adjacency — so this still yields exactly ONE span for the call.
     events = [
         RunEvent(run_id=rid, seq=1, kind="start", payload={}, ts=t0),
         RunEvent(run_id=rid, seq=2, kind="tool_call",
-                 payload={"tool": "Read", "server": "fs"}, ts=t0 + timedelta(seconds=1)),
+                 payload={"id": "tc-1", "tool": "Read", "server": "fs"},
+                 ts=t0 + timedelta(seconds=1)),
         RunEvent(run_id=rid, seq=3, kind="tool_result",
-                 payload={"elapsed_ms": 120}, ts=t0 + timedelta(seconds=2)),
-        RunEvent(run_id=rid, seq=4, kind="finish", payload={}, ts=t0 + timedelta(seconds=3)),
+                 payload={"id": "tc-1", "tool": None},
+                 ts=t0 + timedelta(seconds=1, milliseconds=500)),
+        RunEvent(run_id=rid, seq=4, kind="tool_result",
+                 payload={"id": "tc-1", "elapsed_ms": 120}, ts=t0 + timedelta(seconds=2)),
+        RunEvent(run_id=rid, seq=5, kind="finish", payload={}, ts=t0 + timedelta(seconds=3)),
     ]
     with _capturing_tracer() as exporter:
         record_inference_span(
@@ -439,17 +445,26 @@ def test_record_span_content_skipped_for_embeddings_even_when_on():
 
 
 def test_init_tracer_provider_noop_when_disabled():
-    """Default config has [otel] disabled — init must leave _tracer None."""
+    """With [otel] disabled, init must leave _tracer None. Sets the config
+    explicitly rather than relying on the on-disk aitelier.toml — that file
+    is machine-local/gitignored and may enable otel for a real deployment."""
     # Save existing state; the conftest doesn't reset _tracer between tests.
     prev_tracer = _otel_module._tracer
+    prev_cfg = get_config()
     _otel_module._tracer = None
-    reset_config()
+    set_config(Config(otel=OtelConfig(enabled=False)))
     try:
         _otel_module.init_tracer_provider()
         assert _otel_module._tracer is None
     finally:
         _otel_module._tracer = prev_tracer
-        reset_config()
+        set_config(prev_cfg)
+
+
+def test_otel_config_default_is_disabled():
+    """The dataclass default is disabled — a default install pays no OTel
+    import cost and emits nothing until an operator opts in."""
+    assert OtelConfig().enabled is False
 
 
 def test_init_tracer_provider_is_idempotent():

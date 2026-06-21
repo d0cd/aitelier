@@ -2977,6 +2977,30 @@ def test_correlation_id_propagates_to_log_records(client, caplog):
     assert getattr(matched[0], "correlation_id", None) == "log-cid-1"
 
 
+def test_request_completion_log_line(client, caplog):
+    """Every non-health request emits one structured completion line at INFO
+    with method, path, status, and duration_ms — the access record dashboards
+    need (uvicorn's line lacks duration). /v1/health is exempt (probe noise)."""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="aitelier.access"):
+        resp = client.get("/v1/runs?limit=1")
+    assert resp.status_code == 200
+    rec = [r for r in caplog.records if r.name == "aitelier.access"]
+    assert rec, "expected an aitelier.access completion line"
+    r = rec[-1]
+    assert getattr(r, "http_method", None) == "GET"
+    assert getattr(r, "http_path", None) == "/v1/runs"
+    assert getattr(r, "http_status", None) == 200
+    assert isinstance(getattr(r, "duration_ms", None), int)
+
+    # /v1/health is exempt — no completion line for probes.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="aitelier.access"):
+        client.get("/v1/health")
+    assert not [r for r in caplog.records if r.name == "aitelier.access"]
+
+
 def test_correlation_id_in_sse_events(client):
     async def fake_stream(body, *, timeout):
         yield {"choices": [{"index": 0, "delta": {"content": "hi"},

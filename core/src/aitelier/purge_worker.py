@@ -48,8 +48,8 @@ async def _purge_tick() -> None:
             if removed:
                 logger.info("purge_%s removed %d row(s)", name, removed)
         except Exception as exc:
-            logger.warning("purge_%s failed: %s: %s",
-                            name, type(exc).__name__, exc)
+            logger.exception("purge_%s failed: %s: %s",
+                             name, type(exc).__name__, exc)
 
 
 async def _loop() -> None:
@@ -63,7 +63,7 @@ async def _loop() -> None:
     try:
         await _purge_tick()
     except Exception as exc:
-        logger.warning("purge worker initial tick errored: %s", exc)
+        logger.exception("purge worker initial tick errored: %s", exc)
     while True:
         try:
             await asyncio.sleep(interval)
@@ -71,7 +71,7 @@ async def _loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("purge worker tick errored: %s", exc)
+            logger.exception("purge worker tick errored: %s", exc)
 
 
 def start_purge_worker() -> None:

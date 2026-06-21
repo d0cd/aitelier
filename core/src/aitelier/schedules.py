@@ -161,7 +161,7 @@ async def _run_tick(now: datetime,
             await store.update_schedule_run_times(s.id, last_run_at=now,
                                                      next_run_at=nxt)
         except Exception as exc:
-            logger.warning("Schedule %s (%s) tick failed: %s", s.id, s.name, exc)
+            logger.exception("Schedule %s (%s) tick failed: %s", s.id, s.name, exc)
 
 
 async def _tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:
@@ -172,7 +172,7 @@ async def _tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Schedule tick error: %s", exc)
+            logger.exception("Schedule tick error: %s", exc)
 
 
 def start_tick_loop(handler: Callable[[dict], Awaitable[None]]) -> None:

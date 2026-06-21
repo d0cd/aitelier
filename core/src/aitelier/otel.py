@@ -471,33 +471,67 @@ def _to_ns(dt) -> int | None:
 
 
 def _emit_event_child_spans(tracer, parent_ctx, events) -> None:
-    """One child span per tool invocation, paired tool_call → tool_result so
-    the span spans the tool's wall-clock. start/finish/delta/error frame the
-    root span and aren't re-emitted as children. Tool spans use the OTel
-    `execute_tool` operation name per the GenAI conventions."""
+    """One child `execute_tool` span per tool invocation (per the GenAI
+    conventions), spanning the tool's wall-clock. start/finish/delta/thought/
+    error frame the root span and aren't re-emitted as children.
+
+    Pairs each `tool_call` with its `tool_result`(s) by the ACP `toolCallId`
+    when present — ACP fires several result pings per call, so adjacency
+    mispairs. The span runs from the call's ts to its LAST result's ts.
+    Falls back to call→next-result adjacency for id-less events (runs
+    recorded before the id was captured)."""
+    calls = [e for e in events if getattr(e, "kind", None) == "tool_call"]
+    results = [e for e in events if getattr(e, "kind", None) == "tool_result"]
+    if not calls:
+        return
+
+    def _id(ev):
+        return (getattr(ev, "payload", None) or {}).get("id")
+
+    have_ids = all(_id(c) for c in calls) and any(_id(r) for r in results)
+    if have_ids:
+        last_result: dict = {}
+        for r in results:
+            rid = _id(r)
+            if rid is not None:
+                last_result[rid] = r  # events are seq-ordered → last wins
+        for call in calls:
+            end_ev = last_result.get(_id(call))
+            _emit_tool_span(tracer, parent_ctx, call, end_ev)
+        return
+
+    # Adjacency fallback: each call closes on the next result.
     open_call = None
     for ev in events:
         kind = getattr(ev, "kind", None)
-        payload = getattr(ev, "payload", None) or {}
         if kind == "tool_call":
             open_call = ev
         elif kind == "tool_result" and open_call is not None:
-            name = (getattr(open_call, "payload", None) or {}).get("tool") or "tool"
-            child = tracer.start_span(
-                f"execute_tool {name}", context=parent_ctx,
-                start_time=_to_ns(getattr(open_call, "ts", None)),
-            )
-            try:
-                child.set_attribute("gen_ai.operation.name", "execute_tool")
-                child.set_attribute("gen_ai.tool.name", str(name))
-                cp = getattr(open_call, "payload", None) or {}
-                if cp.get("server"):
-                    child.set_attribute("gen_ai.tool.server", str(cp["server"]))
-                if payload.get("elapsed_ms") is not None:
-                    child.set_attribute("aitelier.tool.elapsed_ms", payload["elapsed_ms"])
-            finally:
-                child.end(end_time=_to_ns(getattr(ev, "ts", None)))
+            _emit_tool_span(tracer, parent_ctx, open_call, ev)
             open_call = None
+
+
+def _emit_tool_span(tracer, parent_ctx, call, end_ev) -> None:
+    """Emit one execute_tool span from a tool_call event to its terminal
+    result event (None → span has just the call's start time)."""
+    cp = getattr(call, "payload", None) or {}
+    name = cp.get("tool") or "tool"
+    child = tracer.start_span(
+        f"execute_tool {name}", context=parent_ctx,
+        start_time=_to_ns(getattr(call, "ts", None)),
+    )
+    try:
+        child.set_attribute("gen_ai.operation.name", "execute_tool")
+        child.set_attribute("gen_ai.tool.name", str(name))
+        if cp.get("server"):
+            child.set_attribute("gen_ai.tool.server", str(cp["server"]))
+        if cp.get("id"):
+            child.set_attribute("gen_ai.tool.call.id", str(cp["id"]))
+        rp = getattr(end_ev, "payload", None) or {}
+        if rp.get("elapsed_ms") is not None:
+            child.set_attribute("aitelier.tool.elapsed_ms", rp["elapsed_ms"])
+    finally:
+        child.end(end_time=_to_ns(getattr(end_ev, "ts", None)))
 
 
 def _emit_message_events(span: Any, request_body: dict | None,

@@ -777,6 +777,11 @@ def _notification_to_event(note: dict) -> dict | None:
     if kind in ("tool_call", "toolCall"):
         return {
             "type": "tool_call",
+            # ACP's stable per-invocation id — correlates this call with its
+            # tool_result update(s), which arrive as separate notifications
+            # (often several status pings per call). Without it, call↔result
+            # pairing degrades to fragile adjacency.
+            "id":     _acp_tool_call_id(update),
             "server": update.get("server") or update.get("serverName"),
             "tool":   update.get("name") or update.get("toolName") or update.get("title"),
             "input":  update.get("arguments") or update.get("input") or update.get("rawInput"),
@@ -796,12 +801,19 @@ def _notification_to_event(note: dict) -> dict | None:
                 return None
         return {
             "type":       "tool_result",
+            "id":         _acp_tool_call_id(update),
             "tool":       update.get("name") or update.get("toolName"),
             "output":     output,
             "elapsed_ms": update.get("elapsed_ms") or update.get("elapsedMs"),
         }
 
     return None
+
+
+def _acp_tool_call_id(update: dict) -> str | None:
+    """ACP's stable per-invocation id, across naming variants."""
+    return (update.get("toolCallId") or update.get("tool_call_id")
+            or update.get("id"))
 
 
 def _adapt_mcp_servers(

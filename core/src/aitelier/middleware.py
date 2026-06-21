@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextvars
 import hmac
+import logging
 import re
 import time
 import uuid
@@ -33,6 +34,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from aitelier.config import get_config
+
+# Separate logger so operators can route/level access lines independently of
+# `aitelier`'s operational logs. Records carry structured fields
+# (http_method/http_path/http_status/duration_ms) for the json formatter.
+_access_logger = logging.getLogger("aitelier.access")
 
 # ---------------------------------------------------------------------------
 # Correlation ID — contextvar that the LogRecord factory reads on every log
@@ -177,12 +183,31 @@ async def correlation_id_middleware(request: Request, call_next):
         cid = str(uuid.uuid4())
     request.state.correlation_id = cid
     token = _correlation_id_var.set(cid)
+    started = time.monotonic()
+    status = 500  # if call_next raises, the request completed as a 500
     try:
         response = await call_next(request)
+        status = response.status_code
+        response.headers["X-Correlation-Id"] = cid
+        return response
     finally:
         _correlation_id_var.reset(token)
-    response.headers["X-Correlation-Id"] = cid
-    return response
+        # One structured completion line per request — carries duration_ms,
+        # which uvicorn's access line doesn't. Skipped for liveness probes
+        # (/v1/health) so a tight probe cadence doesn't flood the log. The
+        # correlation_id is stamped on the record by the LogRecord factory.
+        if request.url.path not in _PUBLIC_PATHS:
+            _access_logger.info(
+                "%s %s %s %dms",
+                request.method, request.url.path, status,
+                round((time.monotonic() - started) * 1000),
+                extra={
+                    "http_method": request.method,
+                    "http_path": request.url.path,
+                    "http_status": status,
+                    "duration_ms": round((time.monotonic() - started) * 1000),
+                },
+            )
 
 
 async def auth_middleware(request: Request, call_next):

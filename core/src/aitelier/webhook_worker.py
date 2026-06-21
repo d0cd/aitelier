@@ -162,7 +162,7 @@ async def _worker_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Webhook worker tick error: %s", exc)
+            logger.exception("Webhook worker tick error: %s", exc)
 
 
 def start_webhook_worker() -> None:

@@ -165,6 +165,21 @@ def test_notification_to_event_acp_discriminator():
     assert ev["input"] == {"path": "/tmp/x"}
 
 
+def test_notification_to_event_captures_tool_call_id():
+    """The ACP toolCallId is captured on both tool_call and tool_result so
+    the OTLP span emitter can pair them by id (ACP fires several result
+    pings per call; adjacency would mispair)."""
+    from aitelier.providers.sandbox_agent import _notification_to_event
+    call = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "tool_call", "toolCallId": "tc-7", "name": "Read"}}})
+    assert call["id"] == "tc-7"
+    result = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "tool_call_update", "toolCallId": "tc-7",
+        "status": "completed", "rawOutput": "done"}}})
+    assert result["type"] == "tool_result"
+    assert result["id"] == "tc-7"
+
+
 def test_notification_to_event_camelcase_toolcall():
     """Older sandbox-agent versions emitted `type: toolCall`; mapper must
     accept both that and the spec-compliant `sessionUpdate: tool_call`."""
