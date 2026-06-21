@@ -1109,6 +1109,14 @@ Error types (classified in `core/src/aitelier/errors.py`):
 | `Orphaned` | Run was in-flight when aitelier restarted; finalised via orphan-sweep + terminal webhook (see "Run state machine" → `orphaned`) | No |
 | `SchemaViolation` | JSON parse / validation error | No |
 
+For upstream failures (`ProviderError`, `AuthError`, `RateLimited`,
+`Timeout`), the `error.message` includes the **provider's own error body**
+(e.g. Ollama's `model "…" not found`), so you can diagnose without digging
+into logs. That body is run through a regex + entropy secret scrubber
+first — credential-shaped tokens are masked (`[redacted]`) while the
+diagnostic text and ids survive. The scrubber is heuristic; the full
+unredacted body is also written to the service WARNING log for operators.
+
 ### Debugging a call by `runId`
 
 Every response (and error envelope) carries `aitelier_run_id`. That id is

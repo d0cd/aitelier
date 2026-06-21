@@ -14,7 +14,7 @@
 | 1 | Reasoning models emit to `reasoning_content`, `content` empty | ✅ Resolved — `reasoning_effort:"minimal"` |
 | 2 | Local `complete()` fails on large payloads | ✅ Resolved — typed `Timeout` + new `num_ctx`; raise `timeout` |
 | 3 | Structured output via JSON Schema constrained decoding | ✅ Already implemented — send `json_schema` |
-| 4 | Observability: trace a consumer failure into the inference call | ✅ Mostly shipped — `GET /v1/runs/{runId}` already carries the full trace (request_body, error, tokens, latency); record runId (or the `X-Correlation-Id` header for pre-dispatch rejections). Partial: upstream error *body* is scrubbed to status-only. |
+| 4 | Observability: trace a consumer failure into the inference call | ✅ Shipped — `GET /v1/runs/{runId}` carries the full trace (request_body, error, tokens, latency); record runId (or the `X-Correlation-Id` header for pre-dispatch rejections). The upstream provider's error **body** is now surfaced too (scrubbed via a regex+entropy recall net), so a provider 4xx is one lookup. |
 
 > **Routing correction (from aitelier):** `local` and `ollama/*` do **not** go
 > through LiteLLM. aitelier has its own Ollama adapter
@@ -186,13 +186,16 @@ inference boundary. Most of this already exists; verified against live runs:
   `format:<schema>`). Persisting the translated payload would be redundant state
   derivable from `request_body` + the documented mappings, so we're declining it
   on principle rather than adding a column.
-- **One real partial gap: the upstream error *body*.** aitelier scrubs upstream
-  provider responses to status-only (`"Upstream provider error (HTTP 404)"`) —
-  a hosted-mode safety default that also hides a locally-useful Ollama message
-  (e.g. "model not found"). Surfacing/persisting more of the upstream body for
-  local routes is a reasonable follow-up, but it's a scrubbing-policy decision
-  (what's safe to retain) rather than a missing trace — flagging, not yet
-  actioned.
+- **Upstream error *body* now surfaced (resolved).** Previously aitelier
+  scrubbed provider responses to status-only (`"Upstream provider error (HTTP
+  404)"`), hiding a locally-useful message. Now the provider's body is included
+  in `error_msg` (and the response), run through a **regex + Shannon-entropy
+  secret scrubber** (`scrub_upstream_body`, adapted from brig's redactor) so an
+  embedded key fragment is masked while the diagnostic survives. Verified live:
+  a bad Ollama model now returns `… (HTTP 404): {"error":"model '…' not
+  found"}`. The scrubber is heuristic — the full unredacted body stays in the
+  WARNING log for operator review + tuning, and aitelier's 32-hex
+  run_id/trace_id is explicitly exempt so it's never masked.
 
 Net: the queryable inference trace deepread asked for is **already shipped**;
 record the id (runId or correlation header) and pivot into `GET /v1/runs/{id}`.
