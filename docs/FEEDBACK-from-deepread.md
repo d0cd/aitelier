@@ -206,9 +206,12 @@ consumer-controllable causes + fixes:
    **`timeout`** field (seconds). The default is 60.
 2. **Silent truncation.** Ollama defaults `num_ctx` to a small window and
    silently drops input past it. We **shipped a sanctioned `num_ctx`
-   field** (this change) — Ollama-routes only, ignored elsewhere. Verified:
-   a ~84k-char request that previously 504'd now completes with
-   `num_ctx:32768` + `timeout:240`.
+   field** (this change) — Ollama-routes only, ignored elsewhere. Verified
+   end-to-end: a ~84k-char request with `num_ctx:32768` + `timeout:240`
+   completes (~53s) and is accepted (no 422); the field reaches the Ollama
+   adapter (unit-tested) and is withheld from LiteLLM routes. (The 504
+   above was a separate ~122k-char run at the default 60s timeout — large
+   inputs need both the window sizing *and* a raised `timeout`.)
 
 Neither is LiteLLM, and there's no generic-500 path here to fix.
 
