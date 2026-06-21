@@ -1,7 +1,7 @@
 # Feedback from running Sandbox Agent in a brig cell
 
 **First report:** 2026-05-18 (brig 0.3.0 base, aitelier+SA co-located in cell)
-**Latest update:** 2026-06-08 (codex `HOME` under `/tmp` helper-binary warning)
+**Latest update:** 2026-06-09 (source re-verification @ brig d6e0553 — nearly all feedback shipped)
 **Consumer:** aitelier (runs on host; talks to SA-in-cell via brig ingress)
 **Test artifact:** `docs/deploy/sandbox-agent.cell.yaml`,
 `docker/sandbox-agent.brig.Dockerfile`, `scripts/test-brig-mode.sh`
@@ -248,9 +248,19 @@ on brig SA — claude-acp's `session/update` notifications flow through
 the ingress in real time. 🎉
 
 
-## Still blocking real-shaped deployments
+## Previously blocking — now shipped
 
-### 1. Raw TCP host_services still missing (sidestepped by SA-only refactor)
+> **2026-06-09 source re-verification (brig @ d6e0553):** both items in this
+> section have since shipped. Raw TCP `host_services` (`protocol: tcp` →
+> warden `reverse:tcp`) and `brig image build --use-warden` (build traffic
+> through warden, ending the pre-bake workaround) both exist in source. The
+> original write-ups are kept below for context; see the wishlist table for
+> current status. **Net: essentially all aitelier feedback is addressed —
+> the only items still open are VM autostart-at-login (we self-heal via
+> `lib.sh`) and a writable non-`/tmp` HOME mount (codex helper-binary
+> warning, non-fatal).**
+
+### 1. Raw TCP host_services (shipped — see wishlist #3)
 
 The `host_services` flattening is HTTP-only. Cells still can't reach
 Postgres / Redis / MongoDB / MySQL / ssh / gRPC-over-h2c on the host.
@@ -468,13 +478,13 @@ That also removes the misleading warden log lines.
 |---|---|---|
 | 1 | ✅ Shipped 8dbb26b | Orphan subnet outlives a cell across VM restart and blocks `brig run`. Fixed: `allocate()` is idempotent per cell name, so `brig run` reclaims a same-named orphan. (2026-06-04 §1) |
 | 2 | ⚠ Partial 8dbb26b | `restart: always` cell field now re-launches gone cells on `brig system up` (re-registering ingress). VM autostart at login was intentionally not added — our `lib.sh` self-heals via `brig system up`. (2026-06-04 §3) |
-| 3 | Adoption | Raw TCP host_services, OR a documented socat-bridge recipe for unix sockets → host TCP services. Aitelier sidesteps by running outside the cell; the next consumer will hit this. |
-| 4 | Quality | Feed warden into `brig image build` so first-run agent installs (`npm install`, agent CLI binary fetch) aren't multi-minute through MITM. Today the build/runtime asymmetry forces pre-baking large binaries into the image. |
+| 3 | ✅ Shipped | Raw TCP `host_services` now supported (`protocol: tcp` → warden `reverse:tcp` listener; `src/brig/sdk.py` `_require_tcp_listeners_bound`). Caveat: binding a new TCP port needs a warden restart (mitmproxy can't hot-add listeners), which `brig run` prompts for. (verified 2026-06-09 @ source d6e0553) |
+| 4 | ✅ Shipped | `brig image build --use-warden` routes build-time HTTP(S) through warden via HTTPS_PROXY + mounts the warden CA (`src/brig/commands/image_cmd.py:280`), so build and runtime hit the same path — no more pre-baking to dodge the build/runtime asymmetry. (verified 2026-06-09) |
 | 5 | ✅ Shipped 8dbb26b | Ingress now returns a descriptive 404 body for a no-route request and attributes rejected attempts (auth/oversize) to the cell in `brig cell network`. (2026-06-04 §2) |
-| 6 | Minor | `brig system doctor`: add `[OK] Warden CA matches all cells' staged bundles` to surface stale entrypoint-managed `SSL_CERT_FILE` overrides before they become silent TLS hangs. |
-| 7 | Minor | `brig cell network` to include ingress hits (currently egress-only). |
-| 8 | Minor | Move the DNS-rebinding check from `server_connected` to `responseheaders` so the ingress-route / host-service exemption metadata is actually populated when the check runs. |
-| 9 | Minor | Document the `<cell-name>-ingress-token` naming convention in `brig run --help` / cell-yaml reference (currently only discoverable from source). |
+| 6 | ✅ Shipped | `brig system doctor` now verifies every cell's staged CA bundle ends with the current warden CA — the stale-CA / silent-TLS-hang foot-gun (`src/brig/commands/system_cmd.py:227-250`). (verified 2026-06-09) |
+| 7 | ✅ Shipped | `brig cell network` now surfaces ingress hits (`ingress_route` in `src/brig/commands/network_cmd.py:125,171`), not just egress. (verified 2026-06-09) |
+| 8 | ✅ Shipped | DNS-rebinding reworked: a connect-time `server_connect` guard refuses blocked-range upstreams via mitmproxy's own `data.server.error` (not the old latent `close()`), with warden's host_service + ingress routing exempt; passthrough guarded at `tls_clienthello` (`src/addons/enforce.py:786`). The latent-bug dependency is gone. (verified 2026-06-09) |
+| 9 | ✅ Shipped | `<cell>-ingress-token` naming documented in `docs/reference/cell-metadata.md` + `addons.md`. (verified 2026-06-09) |
 | 10 | ✅ Shipped 8dbb26b | CLI aliases `brig cell ls` / `brig cell status` + top-level `brig ps` now accepted. Verified working. (2026-06-04) |
 | 11 | Minor | A writable non-`/tmp` HOME mount option, so HOME-sensitive CLIs (codex refuses helper-binary creation under a `/tmp`-rooted `codex_home`) work without the cell author hand-rolling a mount. (2026-06-08) |
 
