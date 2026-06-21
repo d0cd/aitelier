@@ -511,8 +511,9 @@ curl -X POST http://localhost:7777/v1/runs \
     "messages": [{"role": "user", "content": "Long task..."}],
     "webhook_url": "https://your.app/aitelier-callback"
   }'
-# → {"run_id": "2026-05-14T...-chat_agent_async", "status": "accepted",
+# → {"run_id": "9f3c2a1b...e07", "status": "accepted",
 #    "correlation_id": "...", "webhook_url": "https://..."}
+#   run_id is a 128-bit hex value — also the W3C trace id (trace_id == run_id).
 ```
 
 The webhook receives the ChatCompletion (or an error body) when the run
@@ -1101,7 +1102,7 @@ Useful for retried submissions where the agent path has side effects
 In-flight runs can be cancelled by `run_id`:
 
 ```
-GET  /v1/runs/active            # → {"active": ["2026-05-14T...-chat_agent", ...]}
+GET  /v1/runs/active            # → {"active": ["9f3c2a1b...e07", ...]}
 POST /v1/runs/{run_id}/cancel   # → {"run_id": "...", "cancelled": true}
 ```
 
@@ -1322,23 +1323,35 @@ lives in those projects' CI, not here.
 
 ## Cost tracking
 
-LLM-path calls go through LiteLLM, which exposes cost via the
-`response._hidden_params["response_cost"]` field. aitelier persists this
-on `runs.cost_usd` when LiteLLM reports it.
+LLM-path calls go through LiteLLM, which reports per-call cost in the
+`x-litellm-response-cost` response header. aitelier reads that header and
+persists the value on `runs.cost_usd` (using LiteLLM's own number, not a
+homemade pricing table). Streaming has no usable cost header, so streamed
+calls leave `cost_usd: null`.
 
 Agent-path runs always have `cost_usd: null` by design: agent LLM calls
 happen inside the Sandbox Agent process and go directly to Anthropic /
-OpenAI, bypassing LiteLLM. Token usage *is* captured when the backend
-surfaces it (`runs.input_tokens` / `output_tokens` / `total_tokens`).
+OpenAI, bypassing LiteLLM.
+
+Token usage (`runs.input_tokens` / `output_tokens` / `total_tokens`) is
+captured per path and normalized — the LLM/embed paths report OpenAI-shape
+`prompt_tokens`/`completion_tokens`; the agent path reports
+`input_tokens`/`output_tokens`. **`null` means the backend reported no
+usage** (some agent backends, or a failed/in-flight run) — distinct from a
+genuine `0`, so dashboards can tell "unknown" from "zero".
 
 ## Observability — OpenTelemetry export
 
-aitelier can emit one OTLP span per inference request, tagged with the
+aitelier can emit an OTLP span *tree* per run, tagged with the
 [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 (`gen_ai.system`, `gen_ai.request.*`, `gen_ai.response.*`,
-`gen_ai.usage.*`). Point any OTLP-speaking backend at the configured
-endpoint and you'll see request/response shape, model, token counts,
-finish reason, and error type per call.
+`gen_ai.usage.*`). The **trace id is the run id** (a 32-hex W3C value), so a
+run is addressable by id in any backend. A root span carries the
+request/response attributes; each agent tool call becomes a child
+`execute_tool` span (reconstructed from the durable `run_events` log at
+finalize, so it's off the request hot path). Point any OTLP-speaking
+backend at the configured endpoint and you'll see the full agent trace —
+model, token counts, finish reason, error type, and per-tool timing.
 
 The export is **off by default** and the OTel SDK is an optional
 dependency — a default install pays no import cost.
@@ -1361,7 +1374,7 @@ service_name    = "aitelier"
 capture_content = false                     # true → emit message bodies as span events
 ```
 
-**What gets exported** (one span per request):
+**What gets exported** (root span per run, + an `execute_tool` child span per agent tool call):
 
 | Attribute | Source |
 |---|---|

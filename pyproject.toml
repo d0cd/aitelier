@@ -25,5 +25,10 @@ markers = [
 dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.3.0",
-    "datamodel-code-generator>=0.25",
+    # Build-time only (scripts/generate-types.sh). 0.57 changed directory
+    # input to require modular/package output and breaks our
+    # `--input schemas/v1 --output _generated/models.py` single-file flow
+    # ("Modular references require an output directory"); 0.60 didn't fix it.
+    # Pin below 0.57 until the directory→single-file path is restored upstream.
+    "datamodel-code-generator>=0.25,<0.57",
 ]

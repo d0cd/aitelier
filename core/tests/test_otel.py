@@ -338,6 +338,44 @@ def test_record_span_marks_error_status_and_attribute():
     assert "429 from upstream" in (span.status.description or "")
 
 
+def test_record_span_tree_uses_run_id_as_trace_id_and_emits_tool_children():
+    """run_id (32-hex) becomes the trace id; tool_call → tool_result events
+    become child spans under the root, reconstructing the agent step tree."""
+    from datetime import UTC, datetime, timedelta
+
+    from aitelier.storage.models import RunEvent
+
+    rid = "abcdef0123456789abcdef0123456789"
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    events = [
+        RunEvent(run_id=rid, seq=1, kind="start", payload={}, ts=t0),
+        RunEvent(run_id=rid, seq=2, kind="tool_call",
+                 payload={"tool": "Read", "server": "fs"}, ts=t0 + timedelta(seconds=1)),
+        RunEvent(run_id=rid, seq=3, kind="tool_result",
+                 payload={"elapsed_ms": 120}, ts=t0 + timedelta(seconds=2)),
+        RunEvent(run_id=rid, seq=4, kind="finish", payload={}, ts=t0 + timedelta(seconds=3)),
+    ]
+    with _capturing_tracer() as exporter:
+        record_inference_span(
+            operation="chat",
+            request_body={"model": "agent:claude/claude-sonnet"},
+            result={"usage": {"input_tokens": 10, "output_tokens": 5}},
+            run_id=rid, events=events,
+            started_at=t0, ended_at=t0 + timedelta(seconds=3),
+        )
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 2  # root + one tool span (start/finish/delta aren't spans)
+    by_name = {s.name: s for s in spans}
+    root = by_name["chat agent:claude/claude-sonnet"]
+    tool = by_name["execute_tool Read"]
+    # Both share the trace id derived verbatim from run_id.
+    assert format(root.context.trace_id, "032x") == rid
+    assert format(tool.context.trace_id, "032x") == rid
+    # Tool span nests under the root.
+    assert tool.parent.span_id == root.context.span_id
+    assert dict(tool.attributes)["gen_ai.tool.name"] == "Read"
+
+
 def test_record_span_content_off_by_default_emits_no_message_events():
     """Default (capture_content=false): no per-message events on the
     span. Protects against accidentally exporting PII/secrets."""
@@ -752,12 +790,12 @@ def test_record_inference_span_swallows_sdk_failures(caplog):
     """Best-effort guard: if span emission raises (bad attr, exporter
     bug), the function must catch, log, and return — never propagate
     into the request path. Validated by installing a tracer whose
-    `start_as_current_span` raises."""
+    `start_span` raises."""
     import logging
     from unittest.mock import MagicMock
 
     bad_tracer = MagicMock()
-    bad_tracer.start_as_current_span.side_effect = RuntimeError("simulated SDK bug")
+    bad_tracer.start_span.side_effect = RuntimeError("simulated SDK bug")
 
     prev_tracer = _otel_module._tracer
     _otel_module._tracer = bad_tracer

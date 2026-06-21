@@ -37,13 +37,16 @@ phase-by-phase history, read the code or `git log`.
 - Correlation-ID middleware: echo header, body field, every SSE chunk, run.metadata.
 - Structured logging (`[service] log_format = "json"`) — aggregator-friendly.
 - **OpenTelemetry GenAI export** (opt-in, `[otel] enabled = true`).
-  One OTLP span per inference call tagged with the GenAI semantic
+  An OTLP span tree per run — root span tagged with the GenAI semantic
   conventions (`gen_ai.system`, `gen_ai.request.*`, `gen_ai.response.*`,
-  `gen_ai.usage.*`). Optional install via `aitelier[otel]`; default
-  install pays no import cost. Any OTLP backend (Jaeger, Tempo,
-  Honeycomb, Datadog, Phoenix, Langfuse-via-OTel) ingests without
-  adapter code. Content opt-in (`capture_content = true`) emits message
-  bodies as span events; off by default.
+  `gen_ai.usage.*`) plus an `execute_tool` child span per agent tool call,
+  reconstructed from `run_events` at finalize (off the hot path). The trace
+  id IS the run id (32-hex W3C value), so a run is addressable by id in any
+  backend. Optional install via `aitelier[otel]`; default install pays no
+  import cost. Any OTLP backend (Jaeger, Tempo, Honeycomb, Datadog,
+  Phoenix, Langfuse-via-OTel) ingests without adapter code. Content opt-in
+  (`capture_content = true`) emits message bodies as span events; off by
+  default.
 - **Eval framework substrate** (migration v5).
   - `POST /v1/runs/{run_id}/scores` — write-back scoring sink. No
     uniqueness on (run, name, evaluator) so re-grading is a write.

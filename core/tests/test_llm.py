@@ -273,6 +273,34 @@ async def test_chat_completion_returns_litellm_response_verbatim(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_completion_captures_litellm_cost_header(monkeypatch):
+    """LiteLLM's per-call cost (x-litellm-response-cost header) is folded into
+    cost_usd so finalize persists it — using LiteLLM's own number, never a
+    homemade pricing table."""
+    fake_client = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.status_code = 200
+    fake_resp.headers = {"x-litellm-response-cost": "0.0123"}
+    fake_resp.json = MagicMock(return_value={
+        "id": "x", "model": "claude-sonnet",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+    })
+    fake_client.post = AsyncMock(return_value=fake_resp)
+
+    async def fake_get_shared():
+        return fake_client
+    monkeypatch.setattr("aitelier.providers.llm.get_shared_client", fake_get_shared)
+
+    resp = await chat_completion({
+        "model": "claude-sonnet",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert resp["cost_usd"] == 0.0123
+
+
+@pytest.mark.asyncio
 async def test_chat_completion_maps_429_to_rate_limited(monkeypatch):
     fake_client = MagicMock()
     fake_resp = MagicMock()

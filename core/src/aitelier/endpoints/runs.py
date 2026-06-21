@@ -84,7 +84,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
         if req.webhook_url:
             await _check_webhook_url_or_die(req.webhook_url)
 
-        run_id = make_run_id("chat_agent_async")
+        run_id = make_run_id()
         webhook_url = req.webhook_url
         inner_req = req  # ChatCompletionRequest fields are a subset
 

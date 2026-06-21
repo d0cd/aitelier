@@ -162,12 +162,12 @@ async def _schedule_handler(entry: dict) -> None:
     from starlette.datastructures import State
 
     task = dict(entry.get("task") or {})
-    run_id = make_run_id(entry.get("name", "scheduled"))
+    run_id = make_run_id()
 
     # Construct a minimal `Request`-like with the correlation_id the helpers
     # expect. Schedules don't have a real client correlation id; mint one.
     fake_req_state = State()
-    fake_req_state.correlation_id = f"sched-{entry['id']}-{run_id[-12:]}"
+    fake_req_state.correlation_id = f"sched-{entry['id']}-{run_id}"
 
     class _FakeRequest:
         state = fake_req_state
@@ -990,8 +990,9 @@ async def _agent_chat_completion(
     # caller's request_body (captured into spec earlier) and the result
     # envelope so input/output tokens, finish_reason, and the rendered
     # model land on the span. No-op when `[otel] enabled = false`.
-    from aitelier.otel import record_inference_span
-    record_inference_span(
+    from aitelier.otel import record_run_trace
+    await record_run_trace(
+        run_id=run_id,
         operation="chat",
         request_body=spec.request_body,
         result=result if result.get("status") != "error" else None,
@@ -1359,8 +1360,9 @@ async def _finalize_stream_run(
         # finds usage in the OpenAI slots. No-op when OTel is disabled;
         # internally guarded against SDK-side failure.
         if otel_request_body is not None:
-            from aitelier.otel import record_inference_span
-            record_inference_span(
+            from aitelier.otel import record_run_trace
+            await record_run_trace(
+                run_id=run_id,
                 operation="chat",
                 request_body=otel_request_body,
                 result=_synth_otel_result(final, otel_model),
@@ -1446,8 +1448,9 @@ async def _llm_chat_completion(
     # OTel: emit a gen_ai.chat span describing this LLM call. No-op when
     # `[otel] enabled = false` (the default). Off the hot path, after
     # the run is durably recorded.
-    from aitelier.otel import record_inference_span
-    record_inference_span(
+    from aitelier.otel import record_run_trace
+    await record_run_trace(
+        run_id=run_id,
         operation="chat",
         request_body=spec.request_body,
         result=result if result.get("status") != "error" else None,
@@ -1628,8 +1631,9 @@ async def _llm_chat_completion_stream(
             # OTel is disabled. Synthesize a chat-completions-shape
             # result so `gen_ai_response_attrs` finds usage in the
             # OpenAI slots (`prompt_tokens` / `completion_tokens`).
-            from aitelier.otel import record_inference_span
-            record_inference_span(
+            from aitelier.otel import record_run_trace
+            await record_run_trace(
+                run_id=run_id,
                 operation="chat",
                 request_body=req.model_dump(exclude_none=True),
                 result=_synth_otel_result(final, req.model),
@@ -1700,11 +1704,20 @@ def _redact_secrets(value):
 # the observability summary while /v1/runs surfaces operational fields
 # (state, sandbox info, environment).
 _TRACE_RECORD_KEYS = frozenset({
-    "trace_id", "started_at", "ended_at", "model", "kind", "finish_reason",
-    "tool_call_count", "input_tokens", "output_tokens", "total_tokens",
-    "cost_usd", "system_prompt_hash", "trace_tag", "parent_run_id", "status",
-    "error_type", "error_msg", "metadata",
+    "trace_id", "started_at", "ended_at", "duration_ms", "model", "kind",
+    "finish_reason", "tool_call_count", "input_tokens", "output_tokens",
+    "total_tokens", "cost_usd", "system_prompt_hash", "trace_tag",
+    "parent_run_id", "status", "error_type", "error_msg", "metadata",
 })
+
+
+def _duration_ms(run) -> int | None:
+    """Wall-clock run duration in milliseconds (ended − started), or None
+    when the run hasn't ended. Precomputed so dashboards don't re-derive it;
+    maps to the OTel span duration."""
+    if run.started_at and run.ended_at:
+        return round((run.ended_at - run.started_at).total_seconds() * 1000)
+    return None
 
 
 def _run_to_dict(run) -> dict:
@@ -1723,6 +1736,7 @@ def _run_to_dict(run) -> dict:
         "model": run.model,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "ended_at": run.ended_at.isoformat() if run.ended_at else None,
+        "duration_ms": _duration_ms(run),
         "trace_tag": run.trace_tag,
         "correlation_id": run.correlation_id,
         "parent_run_id": run.parent_run_id,

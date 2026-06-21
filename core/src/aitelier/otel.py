@@ -25,8 +25,12 @@ Design notes:
 - Helper functions to build gen_ai attribute dicts live in this module
   and are pure (no SDK imports), so they can be unit-tested without
   the SDK installed.
-- Span emission goes through `record_inference_span`, which checks
-  `_tracer` directly — when OTel is off it no-ops cleanly.
+- Span emission goes through `record_run_trace` (async; reads the run's
+  events from the store) → `record_inference_span` (builds the span tree),
+  both of which check `_tracer` directly — when OTel is off they no-op
+  cleanly and a default deployment pays nothing.
+- The trace id IS the run id (a 32-hex W3C value), so a run is addressable
+  by id in any OTLP backend; agent tool calls become child spans.
 """
 
 from __future__ import annotations
@@ -317,74 +321,183 @@ def gen_ai_response_attrs(result: dict | None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def record_inference_span(
+async def record_run_trace(
     *,
+    run_id: str,
     operation: str,
     request_body: dict | None,
     result: dict | None,
     error_type: str | None = None,
     error_msg: str | None = None,
 ) -> None:
-    """Emit a single completed gen_ai.* span describing one inference call.
+    """Emit the OTLP span tree for one finalized run and return.
 
-    `operation` is the OTel `gen_ai.operation.name` ("chat" or
-    "embeddings"). Aitelier uses one combined span per request — we
-    don't model the agent's inner turns as nested spans here (those
-    are already in `run_events` and the OTel-side fidelity would
-    require deeper SA cooperation).
-
-    Call sites:
-        from aitelier.otel import record_inference_span
-        ...
+    Reads the run's timestamps + durable `run_events` from the store (the
+    single source of truth) and hands them to `record_inference_span`,
+    which builds a root span carrying the gen_ai.* attributes plus a child
+    span per tool call. The trace id IS the run id, so the run is
+    addressable by id in any OTLP backend. Reconstructed at finalize —
+    fully off the hot path. No-op (and one cheap `_tracer is None` check)
+    when OTel is disabled, so a default deployment pays nothing."""
+    if _tracer is None:
+        return
+    try:
+        from aitelier.storage import get_store
+        store = await get_store()
+        run = await store.get_run(run_id)
+        events = await store.list_events(run_id, limit=5000) if run else []
         record_inference_span(
-            operation="chat",
-            request_body=req.model_dump(exclude_none=True),
-            result=resp,
+            operation=operation, request_body=request_body, result=result,
+            run_id=run_id, events=events,
+            started_at=run.started_at if run else None,
+            ended_at=run.ended_at if run else None,
+            error_type=error_type, error_msg=error_msg,
+        )
+    except Exception as exc:
+        logger.warning(
+            "OTel run-trace emission failed (%s: %s) — request unaffected.",
+            type(exc).__name__, exc,
         )
 
-    No-op when OTel isn't enabled.
+
+def record_inference_span(
+    *,
+    operation: str,
+    request_body: dict | None,
+    result: dict | None,
+    run_id: str | None = None,
+    events: list | None = None,
+    started_at=None,
+    ended_at=None,
+    error_type: str | None = None,
+    error_msg: str | None = None,
+) -> None:
+    """Emit a gen_ai.* root span for one inference call, plus a child span
+    per surfaced `run_event` (tool calls), reconstructing the agent's step
+    tree. When `run_id` is a 32-hex value the span tree's trace id IS the
+    run id, so the run is addressable by id in any OTLP backend.
+
+    `operation` is the OTel `gen_ai.operation.name` ("chat" or
+    "embeddings"). With no `events`/`run_id`/timestamps this degrades to a
+    single live-timed span (used by the unit tests). No-op when OTel isn't
+    enabled.
     """
     if _tracer is None:
         return
     tracer = _tracer
 
-    # Wrap the whole emission in a best-effort guard. A bug in the SDK
-    # (bad attribute value, exporter connection refused at span end)
-    # must not propagate into the request path — at this point the run
-    # has already been recorded and the client either has its response
-    # or its idempotency cache write is queued. Surface OTel breakage
-    # as a warning, not a 500.
+    # Best-effort: a bug in the SDK (bad attribute value, exporter refused
+    # at span end) must not propagate into the request path — the run is
+    # already durably recorded. Surface OTel breakage as a warning, not a 500.
     try:
         from opentelemetry import trace as _trace
+        from opentelemetry.trace import (
+            NonRecordingSpan,
+            SpanContext,
+            TraceFlags,
+            set_span_in_context,
+        )
+
+        # Seed the trace id from the run id via a phantom parent context, so
+        # the root span and its children all share trace_id == run_id.
+        parent_ctx = None
+        trace_id = _trace_id_from_run_id(run_id)
+        if trace_id is not None:
+            phantom = SpanContext(
+                trace_id=trace_id, span_id=_derive_span_id(run_id, "root-parent"),
+                is_remote=True, trace_flags=TraceFlags(TraceFlags.SAMPLED),
+            )
+            parent_ctx = set_span_in_context(NonRecordingSpan(phantom))
+
         span_name = (
             f"{operation} {request_body.get('model')}"
             if isinstance(request_body, dict) and request_body.get("model")
             else operation
         )
-        with tracer.start_as_current_span(span_name) as span:
-            span.set_attribute("gen_ai.operation.name", operation)
+        root = tracer.start_span(
+            span_name, context=parent_ctx, start_time=_to_ns(started_at),
+        )
+        try:
+            root.set_attribute("gen_ai.operation.name", operation)
             for k, v in gen_ai_request_attrs(request_body).items():
-                span.set_attribute(k, v)
+                root.set_attribute(k, v)
             for k, v in gen_ai_response_attrs(result).items():
-                span.set_attribute(k, v)
+                root.set_attribute(k, v)
 
-            # Optional content events — off by default. When on, emit one
-            # event per role per the conventions. Skip for embeddings (no
-            # message structure).
             from aitelier.config import get_config
             if get_config().otel.capture_content and operation == "chat":
-                _emit_message_events(span, request_body, result)
+                _emit_message_events(root, request_body, result)
 
-            # Error status — caller passes error_type when classified.
             if error_type:
-                span.set_status(_trace.Status(_trace.StatusCode.ERROR,
+                root.set_status(_trace.Status(_trace.StatusCode.ERROR,
                                               description=error_msg or error_type))
-                span.set_attribute("error.type", error_type)
+                root.set_attribute("error.type", error_type)
+
+            if events:
+                _emit_event_child_spans(tracer, set_span_in_context(root), events)
+        finally:
+            root.end(end_time=_to_ns(ended_at))
     except Exception as exc:
         logger.warning(
             "OTel span emission failed (%s: %s) — request unaffected.",
             type(exc).__name__, exc,
         )
+
+
+def _trace_id_from_run_id(run_id: str | None) -> int | None:
+    """A run id is a 32-hex W3C trace id → use it verbatim as the OTLP trace
+    id. None for pre-hex (legacy) ids, letting the SDK generate one."""
+    if isinstance(run_id, str) and len(run_id) == 32:
+        try:
+            value = int(run_id, 16)
+            return value or None  # all-zero trace ids are invalid
+        except ValueError:
+            return None
+    return None
+
+
+def _derive_span_id(run_id: str, salt: str) -> int:
+    """Deterministic non-zero 64-bit span id from (run_id, salt) so a
+    re-export of the same run reproduces the same span ids (idempotent)."""
+    import hashlib
+    digest = hashlib.sha256(f"{run_id}:{salt}".encode()).digest()
+    return int.from_bytes(digest[:8], "big") or 1
+
+
+def _to_ns(dt) -> int | None:
+    """Datetime → epoch nanoseconds for OTel start/end times. None → the SDK
+    falls back to the current time."""
+    return int(dt.timestamp() * 1_000_000_000) if dt is not None else None
+
+
+def _emit_event_child_spans(tracer, parent_ctx, events) -> None:
+    """One child span per tool invocation, paired tool_call → tool_result so
+    the span spans the tool's wall-clock. start/finish/delta/error frame the
+    root span and aren't re-emitted as children. Tool spans use the OTel
+    `execute_tool` operation name per the GenAI conventions."""
+    open_call = None
+    for ev in events:
+        kind = getattr(ev, "kind", None)
+        payload = getattr(ev, "payload", None) or {}
+        if kind == "tool_call":
+            open_call = ev
+        elif kind == "tool_result" and open_call is not None:
+            name = (getattr(open_call, "payload", None) or {}).get("tool") or "tool"
+            child = tracer.start_span(
+                f"execute_tool {name}", context=parent_ctx,
+                start_time=_to_ns(getattr(open_call, "ts", None)),
+            )
+            try:
+                child.set_attribute("gen_ai.operation.name", "execute_tool")
+                child.set_attribute("gen_ai.tool.name", str(name))
+                cp = getattr(open_call, "payload", None) or {}
+                if cp.get("server"):
+                    child.set_attribute("gen_ai.tool.server", str(cp["server"]))
+                if payload.get("elapsed_ms") is not None:
+                    child.set_attribute("aitelier.tool.elapsed_ms", payload["elapsed_ms"])
+            finally:
+                child.end(end_time=_to_ns(getattr(ev, "ts", None)))
+            open_call = None
 
 
 def _emit_message_events(span: Any, request_body: dict | None,

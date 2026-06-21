@@ -323,7 +323,25 @@ async def chat_completion(
             _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
-    return resp.json()
+    return _with_litellm_cost(resp)
+
+
+def _with_litellm_cost(resp) -> dict:
+    """Parse a LiteLLM response and fold its own reported cost into
+    `cost_usd`. The proxy emits the per-call cost in the
+    `x-litellm-response-cost` header; we use that number rather than a
+    homemade pricing table so cost stays consistent with LiteLLM's
+    accounting. Absent header → no `cost_usd` (stays null = unknown).
+    Streaming has no usable cost header (sent before the stream computes
+    it), so streamed calls leave cost null."""
+    data = resp.json()
+    cost = resp.headers.get("x-litellm-response-cost")
+    if cost is not None:
+        try:
+            data["cost_usd"] = float(cost)
+        except (TypeError, ValueError):
+            pass
+    return data
 
 
 def _litellm_headers(cfg, body: dict) -> dict[str, str]:
@@ -474,7 +492,7 @@ async def embeddings(body: dict, *, timeout: int = 30) -> dict:
             _safe_upstream_message(resp.status_code, resp),
             status_code=resp.status_code,
         )
-    return resp.json()
+    return _with_litellm_cost(resp)
 
 
 # ---------------------------------------------------------------------------

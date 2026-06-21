@@ -1109,6 +1109,23 @@ def test_metrics_endpoint_shape(client):
     assert data["webhooks"]["pending"] == 0
 
 
+def test_run_to_dict_duration_ms():
+    """duration_ms is precomputed (ended − started) in ms, None until ended."""
+    from datetime import UTC, datetime, timedelta
+
+    from aitelier.server import _run_to_dict
+    from aitelier.storage.models import Run
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    done = Run(run_id="x", state="completed", kind="agent",
+               started_at=start, ended_at=start + timedelta(milliseconds=1500))
+    assert _run_to_dict(done)["duration_ms"] == 1500
+
+    running = Run(run_id="y", state="running", kind="agent",
+                  started_at=start, ended_at=None)
+    assert _run_to_dict(running)["duration_ms"] is None
+
+
 def test_run_not_found(client):
     resp = client.get("/v1/runs/nonexistent")
     assert resp.status_code == 404

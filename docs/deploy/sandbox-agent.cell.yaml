@@ -59,7 +59,13 @@ secrets:
   - claude-credentials         # → $HOME/.claude/.credentials.json
   - codex-credentials          # → $HOME/.codex/auth.json
 
-env: {}
+# Suppress the agent CLIs' phone-home telemetry. claude-code otherwise POSTs
+# api.anthropic.com/api/event_logging/v2/batch (rides the inference host, so the
+# network allow-list can't separate it from real LLM traffic). These leave
+# inference itself untouched.
+env:
+  DISABLE_TELEMETRY: "1"
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
 
 # --- Network policy ---
 # Warden enforces this; default deny + explicit allow.

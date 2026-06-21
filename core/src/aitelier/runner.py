@@ -8,13 +8,15 @@ multiple call sites share.
 from __future__ import annotations
 
 import secrets
-from datetime import UTC, datetime
 
 
-def make_run_id(task_name: str) -> str:
-    # Microsecond timestamp + 4 hex chars of entropy. Microseconds alone
-    # collide under tight async fan-outs (same wall-clock μs is plausible
-    # inside one event-loop tick); the suffix makes the PK collision-proof
-    # without giving up the chronological sort the timestamp provides.
-    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H-%M-%S-%f")
-    return f"{ts}_{task_name}_{secrets.token_hex(2)}"
+def make_run_id() -> str:
+    """A run id IS a trace id: 128 bits of entropy as 32 lowercase hex chars
+    — a valid W3C/OpenTelemetry trace id, so every run is directly
+    addressable in any OTLP backend and `trace_id == run_id` stays true.
+
+    No timestamp or task name is baked into the id; that's an anti-pattern
+    (ids carrying semantic payload). Chronology comes from `started_at`,
+    classification from `kind`/`agent_id`.
+    """
+    return secrets.token_hex(16)

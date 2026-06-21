@@ -868,7 +868,9 @@ def _aggregate_result(
     content = ""
     # Final stop_reason from the turn response if present
     finish_reason = "completed"
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    # None until the backend actually reports usage — some backends (codex)
+    # surface none, and a null run is honest where a fabricated 0/0/0 lies.
+    usage = None
     if isinstance(turn_result, dict):
         finish_reason = (
             turn_result.get("stopReason")

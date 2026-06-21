@@ -28,6 +28,7 @@ from aitelier.storage.models import (
     WebhookDelivery,
     can_transition,
     is_terminal,
+    usage_tokens,
 )
 
 logger = logging.getLogger("aitelier.storage")
@@ -164,11 +165,12 @@ class InMemoryStore:
             raise ValueError(f"Illegal state transition: {run.state} → {state}")
         run.state = state
         run.ended_at = datetime.now(UTC)
-        usage = result.get("usage") or {}
         run.result = result
-        run.input_tokens = usage.get("input_tokens", 0)
-        run.output_tokens = usage.get("output_tokens", 0)
-        run.total_tokens = usage.get("total_tokens", 0)
+        # None when the backend reported no usage — distinct from a real 0.
+        # Normalizes OpenAI (prompt/completion) + agent (input/output) shapes.
+        run.input_tokens, run.output_tokens, run.total_tokens = usage_tokens(
+            result.get("usage")
+        )
         run.cost_usd = result.get("cost_usd")
         run.finish_reason = result.get("finish_reason")
         run.tool_call_count = len(result.get("tool_calls") or [])

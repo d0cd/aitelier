@@ -153,6 +153,45 @@ async def test_finalize_run_sets_result_and_state(store):
     assert run.tool_call_count == 2
 
 
+def test_runspec_rejects_invalid_kind():
+    """kind is a closed set — a typo/fuzz value is rejected at the write
+    boundary so it can't pollute the grouping dimension (backed by a DB CHECK)."""
+    for good in ("complete", "embed", "agent"):
+        RunSpec(run_id="r", kind=good)  # no raise
+    with pytest.raises(ValueError, match="invalid run kind"):
+        RunSpec(run_id="r", kind="definitely-not-a-kind")
+
+
+@pytest.mark.asyncio
+async def test_finalize_run_normalizes_openai_usage_shape(store):
+    """The LLM/embed paths report OpenAI-shape usage (prompt_tokens/
+    completion_tokens); finalize must capture those into input/output_tokens,
+    not just total — they're a different convention than the agent path."""
+    await store.create_run(RunSpec(run_id="r-openai", kind="complete"))
+    await store.update_run_state("r-openai", "running")
+    await store.finalize_run("r-openai", {
+        "status": "ok",
+        "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20},
+    })
+    run = await store.get_run("r-openai")
+    assert run.input_tokens == 12
+    assert run.output_tokens == 8
+    assert run.total_tokens == 20
+
+
+@pytest.mark.asyncio
+async def test_finalize_run_null_tokens_when_no_usage(store):
+    """A result with no `usage` stores NULL tokens (unknown), not 0 — so a
+    dashboard distinguishes 'backend reported nothing' from a genuine 0."""
+    await store.create_run(RunSpec(run_id="r-nousage", kind="agent"))
+    await store.update_run_state("r-nousage", "running")
+    await store.finalize_run("r-nousage", {"status": "ok", "finish_reason": "completed"})
+    run = await store.get_run("r-nousage")
+    assert run.input_tokens is None
+    assert run.output_tokens is None
+    assert run.total_tokens is None
+
+
 @pytest.mark.asyncio
 async def test_record_run_stamps_status_ok_on_success(_fresh_store):
     """Successful runs land in the store with status='ok' even when the

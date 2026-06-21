@@ -275,7 +275,8 @@ guidance: [`docs/INTEGRATION.md`](docs/INTEGRATION.md) → "Error handling".
 ## Conventions
 
 - Generated types in `_generated/` dirs — never hand-edit
-- Run directories on disk: `runs/{ISO-timestamp}_{task}/` (prompt, manifest)
+- `run_id` is a 128-bit hex value (a W3C/OTel trace id); `trace_id == run_id`
+- Run directories on disk (when written): `runs/{run_id}/` (prompt, manifest)
 - Durable state in Postgres tables: `runs`, `run_events`, `run_scores`,
   `schedules`, `webhook_deliveries`, `idempotency_keys`, `schema_version`
 - API versioning: `/v1/` prefix

@@ -12,11 +12,12 @@
   ],
   "properties": {
     "run_id": {
-      "type": "string"
+      "type": "string",
+      "description": "128-bit id as 32 lowercase hex chars — a valid W3C/OpenTelemetry trace id, so the run is addressable by this id in any OTLP backend. (Pre-2026-06 runs carry a legacy timestamp-style id.)"
     },
     "trace_id": {
       "type": "string",
-      "description": "Alias for run_id; preserved for legacy callers."
+      "description": "Equals run_id — one canonical id. Since run_id is now a W3C trace id, this is the trace's id in any OTLP backend; one trace per run."
     },
     "state": {
       "type": "string",
@@ -64,6 +65,10 @@
         "null"
       ],
       "format": "date-time"
+    },
+    "duration_ms": {
+      "type": ["integer", "null"],
+      "description": "Wall-clock run duration in milliseconds (ended_at − started_at); null until the run ends. Maps to the OTel span duration."
     },
     "trace_tag": {
       "type": [
@@ -116,13 +121,14 @@
       "default": {}
     },
     "input_tokens": {
-      "type": "integer"
+      "type": ["integer", "null"],
+      "description": "Null when the backend reported no usage (some agent backends) or the run isn't finalized — distinct from a real 0."
     },
     "output_tokens": {
-      "type": "integer"
+      "type": ["integer", "null"]
     },
     "total_tokens": {
-      "type": "integer"
+      "type": ["integer", "null"]
     },
     "cost_usd": {
       "type": [

@@ -317,9 +317,17 @@ class Run(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    run_id: str
+    run_id: Annotated[
+        str,
+        Field(
+            description='128-bit id as 32 lowercase hex chars — a valid W3C/OpenTelemetry trace id, so the run is addressable by this id in any OTLP backend. (Pre-2026-06 runs carry a legacy timestamp-style id.)'
+        ),
+    ]
     trace_id: Annotated[
-        str | None, Field(description='Alias for run_id; preserved for legacy callers.')
+        str | None,
+        Field(
+            description="Equals run_id — one canonical id. Since run_id is now a W3C trace id, this is the trace's id in any OTLP backend; one trace per run."
+        ),
     ] = None
     state: Annotated[
         State,
@@ -335,6 +343,12 @@ class Run(BaseModel):
     model: str | None = None
     started_at: AwareDatetime | None = None
     ended_at: AwareDatetime | None = None
+    duration_ms: Annotated[
+        int | None,
+        Field(
+            description='Wall-clock run duration in milliseconds (ended_at − started_at); null until the run ends. Maps to the OTel span duration.'
+        ),
+    ] = None
     trace_tag: str | None = None
     correlation_id: str | None = None
     parent_run_id: Annotated[
@@ -361,7 +375,12 @@ class Run(BaseModel):
         dict[str, Any] | None,
         Field(description='Snapshot of mcp_servers + tool_allowlist at run time.'),
     ] = {}
-    input_tokens: int | None = None
+    input_tokens: Annotated[
+        int | None,
+        Field(
+            description="Null when the backend reported no usage (some agent backends) or the run isn't finalized — distinct from a real 0."
+        ),
+    ] = None
     output_tokens: int | None = None
     total_tokens: int | None = None
     cost_usd: float | None = None
@@ -536,13 +555,16 @@ class TraceRecord(BaseModel):
     trace_id: str
     started_at: str
     ended_at: str | None = None
+    duration_ms: Annotated[
+        int | None, Field(description='Wall-clock duration in ms; null until ended.')
+    ] = None
     model: str | None = None
     kind: str | None = None
     finish_reason: str | None = None
     tool_call_count: int | None = 0
-    input_tokens: int | None = 0
-    output_tokens: int | None = 0
-    total_tokens: int | None = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
     cost_usd: float | None = None
     system_prompt_hash: str | None = None
     trace_tag: str | None = None

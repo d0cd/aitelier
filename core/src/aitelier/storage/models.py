@@ -37,6 +37,10 @@ AGGREGATE_GROUP_KEYS = frozenset({
 RunKind = Literal["complete", "embed", "agent"]
 """Wire-format kinds for the three primitives."""
 
+_VALID_RUN_KINDS = frozenset({"complete", "embed", "agent"})
+"""Runtime mirror of RunKind for validation. The DB has a matching CHECK
+constraint (defense in depth); this is the single write-path guard."""
+
 RunEventKind = Literal[
     "start", "delta", "tool_call", "tool_result",
     "finish", "error", "cancelled", "orphaned",
@@ -54,6 +58,20 @@ _VALID_TRANSITIONS: dict[str, frozenset[str]] = {
     "cancelled": frozenset(),
     "orphaned":  frozenset(),
 }
+
+
+def usage_tokens(usage: dict | None) -> tuple[int | None, int | None, int | None]:
+    """Pull (input, output, total) token counts from a result's `usage`,
+    accepting BOTH the OpenAI convention (prompt_tokens/completion_tokens,
+    used by the LLM + embed paths) and aitelier's agent convention
+    (input_tokens/output_tokens). None for any count the backend didn't
+    report — never a fabricated 0."""
+    u = usage or {}
+    return (
+        u.get("input_tokens", u.get("prompt_tokens")),
+        u.get("output_tokens", u.get("completion_tokens")),
+        u.get("total_tokens"),
+    )
 
 
 def is_terminal(state: RunState) -> bool:
@@ -101,6 +119,14 @@ class RunSpec:
     """
 
     def __post_init__(self) -> None:
+        # kind is a closed set; reject anything else at the single write
+        # path so a typo or fuzz value can't pollute the grouping dimension
+        # (a DB CHECK backs this up).
+        if self.kind not in _VALID_RUN_KINDS:
+            raise ValueError(
+                f"invalid run kind {self.kind!r}; must be one of "
+                f"{sorted(_VALID_RUN_KINDS)}"
+            )
         # Defense against persisting unboundedly large metadata blobs.
         # JSON-encoded size is what hits Postgres; `default=str` lets
         # callers include datetimes/UUIDs without first serializing them.
@@ -155,9 +181,12 @@ class Run:
     workspace: str | None = None
     environment: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    """Usage counts. `None` = the backend reported no usage (some agent
+    backends) or the run isn't finalized — distinct from a real `0`. Kept
+    null-when-unknown so dashboards can tell "unknown" from "zero"."""
     cost_usd: float | None = None
     finish_reason: str | None = None
     tool_call_count: int = 0

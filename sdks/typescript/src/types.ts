@@ -105,6 +105,8 @@ export interface Run {
   model?: string | null;
   startedAt?: string | null;
   endedAt?: string | null;
+  /** Wall-clock run duration in ms (endedAt − startedAt); null until ended. */
+  durationMs?: number | null;
   traceTag?: string | null;
   correlationId?: string | null;
   parentRunId?: string | null;
@@ -113,9 +115,11 @@ export interface Run {
   sandboxServerId?: string | null;
   workspace?: string | null;
   environment?: Record<string, unknown>;
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
+  /** Null = backend reported no usage (some agent backends) or not yet
+   * finalized — distinct from a real 0. */
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
   costUsd?: number | null;
   finishReason?: string | null;
   toolCallCount?: number;
@@ -191,13 +195,14 @@ export interface TraceRecord {
   traceId: string;
   startedAt: string;
   endedAt?: string;
+  durationMs?: number | null;
   model?: string;
   kind?: string;
   finishReason?: string;
   toolCallCount: number;
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
   costUsd?: number;
   systemPromptHash?: string;
   traceTag?: string;

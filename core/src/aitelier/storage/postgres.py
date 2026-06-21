@@ -32,6 +32,7 @@ from aitelier.storage.models import (
     WebhookDelivery,
     can_transition,
     is_terminal,
+    usage_tokens,
 )
 
 logger = logging.getLogger("aitelier.storage")
@@ -241,7 +242,7 @@ class PostgresStore:
     async def finalize_run(self, run_id: str, result: dict[str, Any],
                             *, state: RunState = "completed") -> None:
         """Single transaction: update result columns + transition to terminal state."""
-        usage = result.get("usage") or {}
+        in_tok, out_tok, tot_tok = usage_tokens(result.get("usage"))
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -263,9 +264,7 @@ class PostgresStore:
                     WHERE run_id = $12
                     """,
                     state, json.dumps(result),
-                    usage.get("input_tokens", 0),
-                    usage.get("output_tokens", 0),
-                    usage.get("total_tokens", 0),
+                    in_tok, out_tok, tot_tok,
                     result.get("cost_usd"), result.get("finish_reason"),
                     len(result.get("tool_calls") or []),
                     result.get("status"), result.get("error_type"), result.get("error_msg"),
@@ -654,9 +653,9 @@ def _row_to_run(row: Any) -> Run:
         workspace=row["workspace"],
         environment=_as_dict(row["environment_json"]),
         result=_as_dict(row["result_json"]),
-        input_tokens=row["input_tokens"] or 0,
-        output_tokens=row["output_tokens"] or 0,
-        total_tokens=row["total_tokens"] or 0,
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        total_tokens=row["total_tokens"],
         cost_usd=row["cost_usd"],
         finish_reason=row["finish_reason"],
         tool_call_count=row["tool_call_count"] or 0,

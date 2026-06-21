@@ -169,9 +169,9 @@ class ScheduleRequest(BaseModel):
     completions request body and is validated when the schedule fires.
 
     `name` is charset-restricted because it flows into log lines and into
-    the inner agent's `<aitelier_context>` system-prompt block via
-    `make_run_id`; permitting arbitrary text would enable stored prompt-
-    injection across team users on the same aitelier."""
+    the run's metadata (`schedule_name`); permitting arbitrary text would
+    enable log-line injection / confusion across team users on the same
+    aitelier."""
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(

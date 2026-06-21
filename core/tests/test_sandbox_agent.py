@@ -213,6 +213,18 @@ def test_aggregate_result_extracts_usage_openai_flavored_keys():
     assert result["usage"]["total_tokens"] == 130  # auto-summed
 
 
+def test_aggregate_result_usage_none_when_backend_reports_none():
+    """Backends that surface no usage (e.g. codex) → usage None, not a
+    fabricated 0/0/0, so the run records 'unknown' honestly (→ NULL tokens)."""
+    result = _aggregate_result(
+        agent="codex", run_id="r1",
+        turn_result={"stopReason": "completed", "content": "hi"},  # no usage key
+        elapsed=0.1,
+        response_format=None,
+    )
+    assert result["usage"] is None
+
+
 def test_aggregate_result_falls_back_to_turn_result_content_list():
     """turn_result.content as list of text blocks → joined string."""
     result = _aggregate_result(

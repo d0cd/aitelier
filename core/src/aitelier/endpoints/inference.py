@@ -77,7 +77,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
             if cached.get("_aitelier_stream"):
                 return _replay_cached_stream(cached)
             return _render_chat_completion(cached)
-        run_id = make_run_id("chat_agent")
+        run_id = make_run_id()
         try:
             if req.stream:
                 # Stream path's record happens in _agent_chat_completion_stream;
@@ -102,7 +102,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
             raise
 
     # LLM path
-    run_id = make_run_id("chat_llm")
+    run_id = make_run_id()
     if req.stream:
         return await _llm_chat_completion_stream(req, request, run_id=run_id)
     result = await _llm_chat_completion(req, request, run_id=run_id)
@@ -121,7 +121,7 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
 
     _reject_if_saturated()
     cid = request.state.correlation_id
-    run_id = make_run_id("embed")
+    run_id = make_run_id()
 
     body: dict[str, Any] = {"model": req.model, "input": req.input}
     if req.encoding_format is not None:
@@ -159,8 +159,9 @@ async def embeddings_endpoint(req: EmbeddingsRequest, request: Request):
     with _track_inflight_run(run_id):
         result = await record_run(spec, _do())
     # OTel: emit a gen_ai.embeddings span. No-op when disabled.
-    from aitelier.otel import record_inference_span
-    record_inference_span(
+    from aitelier.otel import record_run_trace
+    await record_run_trace(
+        run_id=run_id,
         operation="embeddings",
         request_body=spec.request_body,
         result=result if result.get("status") != "error" else None,
