@@ -635,6 +635,23 @@ def test_build_ollama_request_translates_max_tokens_and_temperature():
     assert out["options"]["top_p"] == 0.9
 
 
+def test_build_ollama_request_sets_num_ctx_when_present():
+    """num_ctx sizes Ollama's context window so long inputs aren't silently
+    truncated; omitted → Ollama default."""
+    out = _build_ollama_request({
+        "model": "ollama/qwen3:8b",
+        "messages": [{"role": "user", "content": "hi"}],
+        "num_ctx": 32768,
+    }, stream=False)
+    assert out["options"]["num_ctx"] == 32768
+
+    out = _build_ollama_request({
+        "model": "ollama/qwen3:8b",
+        "messages": [{"role": "user", "content": "hi"}],
+    }, stream=False)
+    assert "num_ctx" not in out.get("options", {})
+
+
 def test_build_ollama_request_enables_think_when_reasoning_effort_set():
     """OpenAI's `reasoning_effort` is the standard signal that the caller
     wants thinking. Pass-through to Ollama's `think: True`."""

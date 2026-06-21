@@ -698,6 +698,25 @@ def test_chat_completions_accepts_reasoning_effort_field():
     assert body["max_completion_tokens"] == 500
 
 
+def test_num_ctx_only_on_ollama_routes():
+    """num_ctx is Ollama-specific — it reaches the body on `local`/`ollama/*`
+    routes but is withheld from LiteLLM routes (which would reject it)."""
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _llm_body_from_request
+
+    ollama = _llm_body_from_request(ChatCompletionRequest(
+        model="ollama/qwen3:8b", messages=[{"role": "user", "content": "hi"}],
+        num_ctx=16384,
+    ))
+    assert ollama["num_ctx"] == 16384
+
+    litellm = _llm_body_from_request(ChatCompletionRequest(
+        model="claude-sonnet", messages=[{"role": "user", "content": "hi"}],
+        num_ctx=16384,
+    ))
+    assert "num_ctx" not in litellm
+
+
 def test_health_includes_dependencies_when_discovery_cache_warm(client):
     """When /v1/discovery has populated the cache, /v1/health surfaces
     a deps summary and flips status to "degraded" if any dep is down."""

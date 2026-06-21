@@ -1495,6 +1495,13 @@ def _llm_body_from_request(req: ChatCompletionRequest) -> dict:
             body[field] = value
     if req.tools:
         body["tools"] = req.tools
+    # num_ctx is Ollama-specific — only attach it for Ollama routes so it
+    # never reaches LiteLLM (which would reject an unknown param). The
+    # Ollama adapter maps it to options.num_ctx.
+    if req.num_ctx is not None:
+        from aitelier.providers.ollama import routes_to_ollama
+        if routes_to_ollama(req.model):
+            body["num_ctx"] = req.num_ctx
     return body
 
 

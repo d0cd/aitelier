@@ -98,6 +98,14 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
         options["frequency_penalty"] = body["frequency_penalty"]
     if body.get("presence_penalty") is not None:
         options["presence_penalty"] = body["presence_penalty"]
+    # Context window. Ollama defaults num_ctx to a small value (model-
+    # dependent, often 2k-8k) and SILENTLY TRUNCATES inputs beyond it — so a
+    # long document loses its tail with no error. Callers that send large
+    # inputs set `num_ctx` to size the window to fit; omitting it keeps
+    # Ollama's default. (aitelier-extension field, honored only on this
+    # Ollama route; see _llm_body_from_request.)
+    if body.get("num_ctx") is not None:
+        options["num_ctx"] = int(body["num_ctx"])
     out: dict[str, Any] = {
         "model": _resolve_ollama_model(body["model"]),
         "messages": body["messages"],

@@ -152,6 +152,11 @@ class ChatCompletionRequest(BaseModel):
     stop: str | list[str] | None = None
     logprobs: bool | None = None
     top_logprobs: int | None = None
+    num_ctx: int | None = None
+    """aitelier extension — Ollama context-window size (tokens). Honored
+    only on Ollama routes (`local`, `ollama/*`); Ollama otherwise defaults
+    to a small window and silently truncates longer inputs. Ignored on
+    every other route. Not part of the OpenAI shape."""
 
     # aitelier extension — agent-specific options.
     aitelier: AitelierAgentOpts | None = None

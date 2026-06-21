@@ -238,6 +238,40 @@ reasoning enabled:
 2. **Set `max_tokens` generously** (e.g. 500+ for short responses).
    Below ~100, reasoning models often won't reach visible output.
 
+#### Large inputs to local models (`num_ctx`, `timeout`)
+
+Long documents to `local` / `ollama/*` routes have two failure modes,
+both consumer-controllable:
+
+- **Silent truncation.** Ollama defaults its context window (`num_ctx`)
+  to a small, model-dependent size (often 2k–8k tokens) and **silently
+  drops** input beyond it — a long document loses its tail with no error,
+  producing a summary of only the head. Set the aitelier-extension field
+  **`num_ctx`** to size the window to fit the input. It's honored only on
+  Ollama routes (ignored elsewhere) and is *not* part of the OpenAI shape,
+  so callers pass it as a body field (Python: `extra_body={"num_ctx": …}`;
+  JS: in the params object, cast in strict TS since it's not in OpenAI's
+  types):
+
+  ```ts
+  await openai.chat.completions.create({
+    model: "ollama/gemma3:12b",
+    messages: [{ role: "user", content: longDocument }],
+    response_format: { type: "json_schema", json_schema: {...} },
+    num_ctx: 32768,   // aitelier extension — Ollama context window
+    timeout: 240,     // seconds — raise for slow large-context generation
+  } as any);
+  ```
+
+- **Timeout on slow generation.** A large context on a local model can
+  take well over the default 60s, surfacing as a typed
+  **`Timeout` (HTTP 504)** — not a generic 500. Raise the per-request
+  **`timeout`** field (seconds) for big inputs.
+
+A bigger `num_ctx` costs proportionally more memory + time, and Ollama
+will reject a window past the model's trained maximum — size it to the
+input, not arbitrarily large.
+
 **Structured outputs work natively** on `local` / `ollama/*`:
 `response_format: { type: "json_object" }` maps to Ollama's `format:
 "json"`, and `response_format: { type: "json_schema", json_schema: {...} }`
