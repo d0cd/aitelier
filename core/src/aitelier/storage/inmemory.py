@@ -26,6 +26,7 @@ from aitelier.storage.models import (
     RunState,
     Schedule,
     WebhookDelivery,
+    cache_tokens,
     can_transition,
     is_terminal,
     usage_tokens,
@@ -169,6 +170,9 @@ class InMemoryStore:
         # None when the backend reported no usage — distinct from a real 0.
         # Normalizes OpenAI (prompt/completion) + agent (input/output) shapes.
         run.input_tokens, run.output_tokens, run.total_tokens = usage_tokens(
+            result.get("usage")
+        )
+        run.cached_read_tokens, run.cached_write_tokens = cache_tokens(
             result.get("usage")
         )
         run.cost_usd = result.get("cost_usd")

@@ -17,7 +17,8 @@ from aitelier import schedules as sch
 async def test_create_interval_schedule_computes_next_run():
     entry = await sch.create_schedule({
         "name": "every-hour",
-        "task": {"model": "agent:claude", "messages": [{"role": "user", "content": "audit"}]},
+        "task": {"model": "agent:claude/claude-sonnet-4-5",
+                 "messages": [{"role": "user", "content": "audit"}]},
         "interval_seconds": 3600,
     })
     assert entry["name"] == "every-hour"
@@ -201,7 +202,7 @@ async def test_schedule_handler_routes_agent_task_and_enqueues_webhook(monkeypat
         "id": "s-1",
         "name": "nightly",
         "task": {
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "scheduled task"}],
         },
         "webhook_url": "https://hooks.example.com/done",

@@ -4,7 +4,8 @@ aitelier's public inference contract is the OpenAI Chat Completions / Embeddings
 shape. Two execution paths:
 
   - `model = "<alias-or-passthrough>"` → LiteLLM proxy. Pure passthrough.
-  - `model = "agent:<backend>[/<inner-llm>]"` → Sandbox Agent. Translated.
+  - `model = "agent:<backend>/<inner-llm>"` → Sandbox Agent. Translated.
+    (The inner model is required — a bare `agent:<backend>` is rejected.)
 
 The `aitelier.*` namespace inside `extra_body` carries agent-specific options
 that OpenAI shape can't express (workspace, mcp_servers, prepare, artifacts,
@@ -228,19 +229,18 @@ def parse_model_route(model: str) -> tuple[str, str | None, str | None]:
     Returns `(route, agent_backend, inner_llm)`:
       - `("llm", None, None)` for any model that doesn't start with `agent:`.
         LiteLLM resolves the actual provider.
-      - `("agent", backend, inner)` for `agent:<backend>[/<inner>]`. `inner`
-        may be `None` when the consumer didn't specify one (the backend's
-        default applies).
+      - `("agent", backend, inner)` for `agent:<backend>/<inner>`. The inner
+        model is **required** — a bare `agent:<backend>` is rejected.
 
     Examples:
       `"claude-sonnet-4-6"`                 → ("llm", None, None)
       `"anthropic/claude-opus-4-7"`         → ("llm", None, None)
-      `"agent:claude"`                      → ("agent", "claude", None)
       `"agent:claude/claude-sonnet-4-5"`    → ("agent", "claude", "claude-sonnet-4-5")
 
-    Raises `ValueError` for `"agent:"` with an empty backend — callers
-    convert it to a 400 at the boundary rather than letting an empty
-    backend surface as a confusing Sandbox-Agent-side handshake error.
+    Raises `ValueError` (callers convert to a 400) for `"agent:"` with an empty
+    backend, and for a bare `agent:<backend>` with no inner model. The inner
+    model is mandatory so the run records the *exact* model it used — left to
+    the backend's silent default, the model (and thus its cost) is unknowable.
     """
     if not model.startswith("agent:"):
         return "llm", None, None
@@ -251,10 +251,17 @@ def parse_model_route(model: str) -> tuple[str, str | None, str | None]:
         backend, inner = tail, None
     if not backend:
         raise ValueError(
-            "agent model must name a backend: 'agent:<backend>[/<inner-llm>]' "
+            "agent model must name a backend: 'agent:<backend>/<inner-llm>' "
             "(got an empty backend)"
         )
-    return "agent", backend, inner or None
+    if not inner:
+        raise ValueError(
+            "agent model must name an inner model: "
+            "'agent:<backend>/<inner-llm>' (e.g. 'agent:claude/claude-sonnet-4-5'). "
+            "A bare 'agent:<backend>' is not accepted — pin the model so the run "
+            "records the exact model used and its cost can be computed."
+        )
+    return "agent", backend, inner
 
 
 # --- Result translation ----------------------------------------------------
@@ -315,8 +322,10 @@ def agent_usage_to_openai(usage: dict | None) -> dict | None:
     }
     if inner_overhead > 0:
         out["aitelier_inner_tokens"] = inner_overhead
-    cached = usage.get("cached_tokens") or usage.get("cache_read_input_tokens")
-    cache_creation = usage.get("cache_creation_input_tokens")
+    cached = (usage.get("cached_tokens") or usage.get("cache_read_input_tokens")
+              or usage.get("cached_read_tokens"))
+    cache_creation = (usage.get("cache_creation_input_tokens")
+                      or usage.get("cached_write_tokens"))
     if cached is not None or cache_creation is not None:
         details: dict[str, int] = {}
         if cached is not None:

@@ -80,7 +80,7 @@ def test_async_agent_rejects_loopback_webhook_by_default(client, hosted_mode):
     is set."""
     with _resolves_to("127.0.0.1"):
         resp = client.post("/v1/runs", headers=hosted_mode, json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "webhook_url": "http://localhost:9999/cb",
         })

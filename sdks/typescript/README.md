@@ -25,7 +25,7 @@ const ait = new Aitelier({ baseUrl: "http://localhost:7777", apiKey: "..." });
 // Inference — pass-through to the OpenAI SDK.
 const openai = await ait.openai();
 const resp = await openai.chat.completions.create({
-  model: "agent:claude",
+  model: "agent:claude/claude-sonnet-4-5",
   messages: [{ role: "user", content: "audit this repo" }],
   extra_body: { aitelier: { workspace: "/path/to/repo" } },
 } as any);
@@ -43,7 +43,7 @@ outputs, tool semantics — all OpenAI SDK territory.
 
 ```typescript
 const { run_id } = await ait.submitRun({
-  model: "agent:claude",
+  model: "agent:claude/claude-sonnet-4-5",
   messages: [{ role: "user", content: "audit /workspace" }],
   aitelier: { workspace: "/path/to/repo", trace_tag: "audit-2026" },
   webhookUrl: "https://my.app/webhooks/aitelier",

@@ -73,7 +73,10 @@ def create_server(client: Aitelier | None = None) -> FastMCP:
         the run finishes; consumers without a webhook can poll
         `get_run` / `wait_for_run` / `list_run_events`.
 
-        `model` must start with `agent:<backend>` (e.g. `agent:claude`).
+        `model` must name a backend AND an inner model:
+        `agent:<backend>/<inner-llm>` (e.g. `agent:claude/claude-sonnet-4-5`).
+        A bare `agent:<backend>` is rejected — pinning the model keeps the
+        run's exact model (and its cost) known.
         `parent_run_id` records this submission as a child of the
         provided run id — recover the subtree later via `list_runs`.
 

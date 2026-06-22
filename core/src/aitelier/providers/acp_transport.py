@@ -45,6 +45,26 @@ class AcpError(Exception):
         self.data = data
 
 
+def _select_permission_outcome(options: list, allow: bool) -> dict:
+    """Pick the ACP permission outcome for an allow/deny decision.
+
+    ACP outcome shape: `{outcome: {outcome: "selected"|"cancelled",
+    optionId: ...}}`. `allow` selects an allow-kind option; deny selects a
+    reject-kind one. Deny with no reject option offered → a *cancelled* outcome,
+    never a silent allow.
+    """
+    want = "allow" if allow else "reject"
+    for opt in options:
+        if isinstance(opt, dict):
+            kind = str(opt.get("kind") or opt.get("optionId") or "").lower()
+            if want in kind:
+                return {"outcome": {"outcome": "selected",
+                                    "optionId": opt.get("optionId", want)}}
+    if allow:
+        return {"outcome": {"outcome": "selected", "optionId": "allow"}}
+    return {"outcome": {"outcome": "cancelled"}}
+
+
 class AcpClient:
     """One ACP server-session bound to a single agent for the lifetime of a call.
 
@@ -59,7 +79,8 @@ class AcpClient:
     def __init__(self, base_url: str, agent: str, *,
                  token: str | None = None,
                  timeout: float = 600.0,
-                 http_client: httpx.AsyncClient | None = None):
+                 http_client: httpx.AsyncClient | None = None,
+                 permission_decider: Any = None):
         self.base_url = base_url.rstrip("/")
         self.agent = agent
         self.token = token
@@ -70,6 +91,11 @@ class AcpClient:
         self._sse_task: asyncio.Task | None = None
         self._http = http_client
         self._owns_http = http_client is None
+        # Optional async policy: (params) -> bool deciding a permission ask.
+        # None keeps the historical auto-allow. Owned by the orchestration
+        # layer (it carries the allowlist + run-event emitter); this wire layer
+        # just consults it so it stays free of policy/observability concerns.
+        self._permission_decider = permission_decider
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json"}
@@ -177,9 +203,10 @@ class AcpClient:
     async def _respond_to_agent_request(self, env: dict) -> None:
         """Build a JSON-RPC response for an agent → client request.
 
-        Auto-approves permission asks (allow), rejects fs/terminal/etc. with
-        method-not-found. Without responding, agents that advertise
-        `permissions: true` (claude, codex, ...) hang on the first tool call.
+        Resolves permission asks through the optional decider (default allow),
+        rejects fs/terminal/etc. with method-not-found. Without responding,
+        agents that advertise `permissions: true` (claude, codex, ...) hang on
+        the first tool call.
         """
         req_id = env.get("id")
         method = env.get("method", "")
@@ -189,17 +216,17 @@ class AcpClient:
         error: dict | None = None
 
         if method == "session/request_permission":
-            # ACP outcome shape: {outcome: {outcome: "selected"|"cancelled",
-            #                                optionId: "allow"|<denied-id>}}
-            options = params.get("options") or []
-            allow_id = "allow"
-            for opt in options:
-                if isinstance(opt, dict):
-                    kind = opt.get("kind") or opt.get("optionId") or ""
-                    if "allow" in str(kind).lower():
-                        allow_id = opt.get("optionId", "allow")
-                        break
-            result = {"outcome": {"outcome": "selected", "optionId": allow_id}}
+            allow = True
+            if self._permission_decider is not None:
+                try:
+                    allow = await self._permission_decider(params)
+                except Exception as exc:
+                    # A policy bug must never hang the agent: fail open, but
+                    # log at WARNING so a misbehaving policy is visible.
+                    logger.warning("permission decider errored (%s: %s); allowing",
+                                   type(exc).__name__, exc)
+                    allow = True
+            result = _select_permission_outcome(params.get("options") or [], allow)
         else:
             # Anything else (fs.*, terminal/*, session/*) — politely refuse.
             error = {

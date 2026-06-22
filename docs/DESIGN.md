@@ -259,12 +259,12 @@ which returns a preconfigured OpenAI client. Control plane methods live on
 ```python
 ait = Aitelier(api_key="...")
 openai = ait.openai()                          # AsyncOpenAI
-resp = await openai.chat.completions.create(model="agent:claude", messages=[...])
+resp = await openai.chat.completions.create(model="agent:claude/claude-sonnet-4-5", messages=[...])
 
 # Control plane:
 await ait.list_runs(trace_tag="audit")
 await ait.cancel_run(run_id)
-await ait.submit_run(model="agent:claude", messages=[...], webhook_url="...")
+await ait.submit_run(model="agent:claude/claude-sonnet-4-5", messages=[...], webhook_url="...")
 await ait.recent_traces(status="error")
 ```
 

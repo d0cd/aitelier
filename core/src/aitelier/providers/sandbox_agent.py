@@ -24,6 +24,7 @@ from typing import Any
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
+from aitelier.pricing import compute_cost
 from aitelier.providers.acp_transport import (
     ACP_PROTOCOL_VERSION as _ACP_PROTOCOL_VERSION,
 )
@@ -71,6 +72,49 @@ class _RunEventEmitter:
                 "event emit failed for run %s kind=%s: %s: %s",
                 self.run_id, kind, type(exc).__name__, exc,
             )
+
+
+def _permission_tool_name(params: dict) -> str | None:
+    """Extract the requested tool's name from a `session/request_permission`."""
+    tc = params.get("toolCall") or params.get("tool_call") or {}
+    if isinstance(tc, dict):
+        name = tc.get("title") or tc.get("name") or tc.get("toolName") or tc.get("kind")
+        if name:
+            return name
+    return params.get("tool") or params.get("name")
+
+
+def _tool_base_name(name: str) -> str:
+    """Strip claude's argument pattern so `Bash(git:*)` matches a `Bash` ask."""
+    return name.split("(", 1)[0].strip()
+
+
+def _make_permission_decider(tool_allowlist: list[str] | None, emitter):
+    """Async permission policy for the ACP hook.
+
+    Always emits a `permission_request` run-event for each ask (these are
+    invisible today — the hook silently auto-answered). When a `tool_allowlist`
+    is set, it's enforced by base tool name: an ask for a tool whose base name
+    isn't on the list is denied and a `tool_denied` event emitted. Matching is
+    deliberately coarse (base name, not claude's full arg patterns) — a
+    defense-in-depth gate complementing the backend's own enforcement, not a
+    re-implementation of its pattern syntax. A tool we can't name is allowed
+    (we won't block what we can't identify)."""
+    allowed = ({_tool_base_name(t) for t in tool_allowlist}
+               if tool_allowlist else None)
+
+    async def decide(params: dict) -> bool:
+        tool = _permission_tool_name(params)
+        await emitter.emit("permission_request", {"tool": tool})
+        if allowed is None or tool is None:
+            return True
+        if _tool_base_name(tool) in allowed:
+            return True
+        await emitter.emit("tool_denied",
+                           {"tool": tool, "reason": "not in tool_allowlist"})
+        return False
+
+    return decide
 
 
 def _build_session_new_meta(
@@ -589,7 +633,9 @@ async def call_via_sandbox_stream(
 
     try:
         async with AcpClient(cfg.base_url, name, token=cfg.token,
-                             timeout=timeout) as client:
+                             timeout=timeout,
+                             permission_decider=_make_permission_decider(
+                                 tool_allowlist, emitter)) as client:
             await _persist_sandbox_server_id(run_id, cfg.base_url, client.server_id)
             session_id: str | None = None
             try:
@@ -679,7 +725,7 @@ async def call_via_sandbox_stream(
                     client=client, run_id=run_id, start=start,
                     turn_result=turn_result, response_format=response_format,
                     text_chunks=text_chunks, tool_calls=tool_calls,
-                    emitter=emitter,
+                    emitter=emitter, agent_model=agent_model,
                 )
             finally:
                 # Race-window guard: if cancellation hit between
@@ -689,7 +735,11 @@ async def call_via_sandbox_stream(
                     await _close_acp_session(client, session_id)
 
     except asyncio.CancelledError:
-        await emitter.emit("cancelled", {})
+        # Bundle the work-so-far into the cancelled event so an interrupt →
+        # redirect flow can continue from what the agent had already produced
+        # (its partial answer + tool calls), recoverable via the run's events.
+        await emitter.emit("cancelled",
+                           _cancelled_event_payload(text_chunks, tool_calls))
         raise
     except Exception as exc:
         err = {
@@ -703,11 +753,21 @@ async def call_via_sandbox_stream(
         yield err
 
 
+def _cancelled_event_payload(text_chunks: list[str], tool_calls: list[dict]) -> dict:
+    """Partial work captured at cancel time for an interrupt → redirect flow.
+    `content` is None (not "") when nothing streamed yet, so "no partial work"
+    stays distinct from an empty string."""
+    return {
+        "content": "".join(text_chunks) if text_chunks else None,
+        "tool_calls": tool_calls,
+    }
+
+
 async def _build_done_event(
     *, client, run_id: str, start: float,
     turn_result: dict | None, response_format: dict | None,
     text_chunks: list[str], tool_calls: list[dict],
-    emitter: _RunEventEmitter,
+    emitter: _RunEventEmitter, agent_model: str | None = None,
 ) -> dict:
     """Assemble the terminal `done` event from turn_result + accumulators.
 
@@ -721,6 +781,7 @@ async def _build_done_event(
         turn_result=turn_result,
         elapsed=time.monotonic() - start,
         response_format=response_format,
+        agent_model=agent_model,
     )
     if text_chunks:
         done["content"] = "".join(text_chunks)
@@ -785,6 +846,10 @@ def _notification_to_event(note: dict) -> dict | None:
             "server": update.get("server") or update.get("serverName"),
             "tool":   update.get("name") or update.get("toolName") or update.get("title"),
             "input":  update.get("arguments") or update.get("input") or update.get("rawInput"),
+            # File-level observability: which paths the call touched and its
+            # category (edit/read/execute/…). None when the backend omits them.
+            "locations": update.get("locations"),
+            "tool_kind": update.get("kind"),
         }
 
     if kind in ("tool_call_update", "toolCallUpdate", "toolResult", "tool_result"):
@@ -805,6 +870,36 @@ def _notification_to_event(note: dict) -> dict | None:
             "tool":       update.get("name") or update.get("toolName"),
             "output":     output,
             "elapsed_ms": update.get("elapsed_ms") or update.get("elapsedMs"),
+        }
+
+    if kind in ("usage_update", "usageUpdate"):
+        # Live context-window telemetry SA streams during a run: `size` is the
+        # window, `used` the tokens consumed so far. A per-run context-fill
+        # timeline (how close a long run is to its window) — purely additive.
+        return {
+            "type": "context_usage",
+            "size": update.get("size"),
+            "used": update.get("used"),
+        }
+
+    if kind == "plan":
+        return {
+            "type": "plan",
+            "entries": update.get("entries") or update.get("plan"),
+        }
+
+    if kind in ("current_mode_update", "currentModeUpdate"):
+        return {
+            "type": "mode",
+            "mode": (update.get("currentModeId") or update.get("modeId")
+                     or update.get("mode")),
+        }
+
+    if kind in ("available_commands_update", "availableCommandsUpdate"):
+        return {
+            "type": "available_commands",
+            "commands": (update.get("availableCommands")
+                         or update.get("available_commands")),
         }
 
     return None
@@ -868,6 +963,7 @@ def _aggregate_result(
     turn_result: dict | None,
     elapsed: float,
     response_format: dict | None,
+    agent_model: str | None = None,
 ) -> dict:
     """Build the final aitelier result dict from an ACP turn response.
 
@@ -924,10 +1020,28 @@ def _aggregate_result(
                 or raw_usage.get("totalTokens")
                 or (in_tok + out_tok)
             )
+
+            # Prompt-cache read/write tokens, when the backend reports them
+            # (claude does). Kept None (not 0) when absent so "no cache info"
+            # stays distinguishable from "zero cache use" — and so cost
+            # estimation can tell whether it's pricing a warm or cold run.
+            def _opt(*keys: str) -> int | None:
+                for k in keys:
+                    v = raw_usage.get(k)
+                    if v is not None:
+                        return v
+                return None
+
+            cache_read = _opt("cached_read_tokens", "cachedReadTokens",
+                              "cache_read_input_tokens")
+            cache_write = _opt("cached_write_tokens", "cachedWriteTokens",
+                               "cache_creation_input_tokens")
             usage = {
                 "input_tokens": in_tok,
                 "output_tokens": out_tok,
                 "total_tokens": tot_tok,
+                "cached_read_tokens": cache_read,
+                "cached_write_tokens": cache_write,
             }
 
     parsed = None
@@ -949,7 +1063,10 @@ def _aggregate_result(
         "usage": usage,
         "finish_reason": finish_reason,
         "tool_calls": [],
-        "cost_usd": None,  # See docs/INTEGRATION.md → "Cost tracking" for why.
+        # Agent LLM calls bypass LiteLLM, so there's no cost header — estimate
+        # from tokens × the per-model rate table. None when the model is
+        # unknown (caller didn't pin one) or no usage was reported.
+        "cost_usd": compute_cost(agent_model, usage),
         "error_type": None,
         "error_msg": None,
     }

@@ -1755,6 +1755,8 @@ def _run_to_dict(run) -> dict:
         "input_tokens": run.input_tokens,
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
+        "cached_read_tokens": run.cached_read_tokens,
+        "cached_write_tokens": run.cached_write_tokens,
         "cost_usd": run.cost_usd,
         "finish_reason": run.finish_reason,
         "tool_call_count": run.tool_call_count,

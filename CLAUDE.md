@@ -20,8 +20,11 @@ Model routing is by the `model` field:
 |---|---|
 | `claude-sonnet`, `nomic-embed-text`, `local`, … | LiteLLM (curated alias) |
 | `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (passthrough wildcard) |
-| `agent:<backend>` | Sandbox Agent, backend's default LLM |
-| `agent:<backend>/<inner-llm>` | Sandbox Agent + explicit inner LLM |
+| `agent:<backend>/<inner-llm>` | Sandbox Agent + explicit inner LLM (inner model **required**) |
+
+A bare `agent:<backend>` (no inner model) is rejected with a 400 — the inner
+model must be named so the run records the exact model it used and its cost can
+be estimated.
 
 Agent-specific options ride in `extra_body.aitelier.*`:
 
@@ -45,7 +48,7 @@ Agent-specific options ride in `extra_body.aitelier.*`:
 
 (`prepare`/`artifacts` run only on the non-streaming path — with `stream: true`
 they're rejected; `tool_allowlist`/`max_turns` are claude-only. Streaming works
-for plain `agent:<backend>` requests.)
+for plain `agent:<backend>/<model>` requests without those options.)
 
 Inner-agent session config is driven by what each backend advertises at
 `session/new` (probed + surfaced in `/v1/models`): `agent:<backend>/<model>`
@@ -96,7 +99,7 @@ ait = Aitelier(base_url="http://localhost:7777", api_key="...")
 # Inference: pass-through to OpenAI SDK
 openai = ait.openai()
 resp = await openai.chat.completions.create(
-    model="agent:claude",
+    model="agent:claude/claude-sonnet-4-5",
     messages=[{"role": "user", "content": "audit this repo"}],
     extra_body={"aitelier": {"workspace": "/path/to/repo"}},
 )
@@ -113,7 +116,7 @@ const ait = new Aitelier({ baseUrl: "http://localhost:7777", apiKey: "..." });
 
 const openai = await ait.openai();
 const resp = await openai.chat.completions.create({
-  model: "agent:claude",
+  model: "agent:claude/claude-sonnet-4-5",
   messages: [{ role: "user", content: "audit this repo" }],
   extra_body: { aitelier: { workspace: "/path/to/repo" } },
 } as any);
@@ -268,9 +271,14 @@ guidance: [`docs/INTEGRATION.md`](docs/INTEGRATION.md) → "Error handling".
   HTTP call orchestrate install → commands → file seed → sidecars → agent → artifacts.
   Edge cases beyond this workflow hit Sandbox Agent directly via the URL in
   `/v1/discovery`.
-- Agent `cost_usd` is always `null` by design: agent LLM calls happen inside the
-  Sandbox Agent process and go directly to Anthropic/OpenAI, bypassing LiteLLM.
-  Token usage *is* captured when the backend surfaces it.
+- Agent LLM calls happen inside the Sandbox Agent process and go directly to
+  Anthropic/OpenAI, bypassing LiteLLM — so there's no cost header to read.
+  `cost_usd` is instead **estimated** from the reported token counts (incl.
+  prompt-cache read/write) × a per-model rate table (`pricing.py`), which is
+  drift-checked against LiteLLM's maintained map (`scripts/check-model-prices.py`).
+  It's `null` only when the model can't be priced — and since `agent:<backend>`
+  now **requires** an explicit inner model (`agent:<backend>/<model>`), the
+  model is always known. Token usage is captured whenever the backend surfaces it.
 
 ## Conventions
 

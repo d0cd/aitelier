@@ -23,8 +23,8 @@ async def fanout_and_summarize() -> str:
     # 1. Choose specialists. Each gets its own agent backend or model
     #    routing string. Mix and match LiteLLM models + agent backends.
     specs = [
-        ("security audit",   "agent:claude"),
-        ("dependency audit", "agent:codex"),
+        ("security audit",   "agent:claude/claude-sonnet-4-5"),
+        ("dependency audit", "agent:codex/gpt-5.5"),
         ("docstring audit",  "claude-haiku"),
     ]
     workflow_tag = f"fanout-{uuid.uuid4().hex[:8]}"

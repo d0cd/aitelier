@@ -30,7 +30,7 @@ over stdio.
 ```jsonc
 // Parent run submitted to aitelier:
 {
-  "model": "agent:claude",
+  "model": "agent:claude/claude-sonnet-4-5",
   "messages": [
     {"role": "user",
      "content": "Audit security + deps + docstrings in parallel; summarize."}

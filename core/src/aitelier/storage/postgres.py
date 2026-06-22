@@ -30,6 +30,7 @@ from aitelier.storage.models import (
     RunState,
     Schedule,
     WebhookDelivery,
+    cache_tokens,
     can_transition,
     is_terminal,
     usage_tokens,
@@ -243,6 +244,7 @@ class PostgresStore:
                             *, state: RunState = "completed") -> None:
         """Single transaction: update result columns + transition to terminal state."""
         in_tok, out_tok, tot_tok = usage_tokens(result.get("usage"))
+        cr_tok, cw_tok = cache_tokens(result.get("usage"))
         async with self._pool.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
@@ -260,14 +262,16 @@ class PostgresStore:
                         result_json = $2::jsonb,
                         input_tokens = $3, output_tokens = $4, total_tokens = $5,
                         cost_usd = $6, finish_reason = $7, tool_call_count = $8,
-                        status = $9, error_type = $10, error_msg = $11
-                    WHERE run_id = $12
+                        status = $9, error_type = $10, error_msg = $11,
+                        cached_read_tokens = $12, cached_write_tokens = $13
+                    WHERE run_id = $14
                     """,
                     state, json.dumps(result),
                     in_tok, out_tok, tot_tok,
                     result.get("cost_usd"), result.get("finish_reason"),
                     len(result.get("tool_calls") or []),
                     result.get("status"), result.get("error_type"), result.get("error_msg"),
+                    cr_tok, cw_tok,
                     run_id,
                 )
 
@@ -656,6 +660,8 @@ def _row_to_run(row: Any) -> Run:
         input_tokens=row["input_tokens"],
         output_tokens=row["output_tokens"],
         total_tokens=row["total_tokens"],
+        cached_read_tokens=row["cached_read_tokens"],
+        cached_write_tokens=row["cached_write_tokens"],
         cost_usd=row["cost_usd"],
         finish_reason=row["finish_reason"],
         tool_call_count=row["tool_call_count"] or 0,

@@ -24,10 +24,7 @@ from aitelier.openai_compat import (
     [
         ("claude-sonnet-4-6", ("llm", None, None)),
         ("anthropic/claude-opus-4-7", ("llm", None, None)),
-        ("agent:claude", ("agent", "claude", None)),
         ("agent:claude/claude-sonnet-4-5", ("agent", "claude", "claude-sonnet-4-5")),
-        # Trailing slash → no inner LLM.
-        ("agent:claude/", ("agent", "claude", None)),
         # Inner LLM may itself contain a slash (provider/model).
         ("agent:claude/anthropic/claude-sonnet-4-5",
          ("agent", "claude", "anthropic/claude-sonnet-4-5")),
@@ -42,6 +39,15 @@ def test_parse_model_route_rejects_empty_backend(model):
     """`agent:` with no backend is a client error — raise so the endpoint
     returns a 400 instead of letting an empty backend reach Sandbox Agent."""
     with pytest.raises(ValueError, match="backend"):
+        parse_model_route(model)
+
+
+@pytest.mark.parametrize("model", ["agent:claude", "agent:codex", "agent:claude/"])
+def test_parse_model_route_requires_inner_model(model):
+    """A bare `agent:<backend>` (no inner model) is rejected: the inner model
+    must be named so the run's exact model — and therefore its cost — is known
+    rather than left to the backend's silent default."""
+    with pytest.raises(ValueError, match="inner model"):
         parse_model_route(model)
 
 
@@ -73,6 +79,20 @@ def test_agent_usage_surfaces_cache_details():
     })
     assert out["prompt_tokens_details"] == {
         "cached_tokens": 3, "cache_creation_tokens": 2,
+    }
+
+
+def test_agent_usage_surfaces_native_cache_keys():
+    """The agent path normalizes cache counts to cached_read_tokens /
+    cached_write_tokens; the OpenAI usage must surface those too, not just the
+    LiteLLM-flavored keys — otherwise a client reading prompt_tokens_details
+    sees nothing for the agent path despite the data being captured."""
+    out = agent_usage_to_openai({
+        "input_tokens": 5, "output_tokens": 200, "total_tokens": 48266,
+        "cached_read_tokens": 47807, "cached_write_tokens": 254,
+    })
+    assert out["prompt_tokens_details"] == {
+        "cached_tokens": 47807, "cache_creation_tokens": 254,
     }
 
 

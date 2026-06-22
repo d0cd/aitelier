@@ -74,6 +74,19 @@ def usage_tokens(usage: dict | None) -> tuple[int | None, int | None, int | None
     )
 
 
+def cache_tokens(usage: dict | None) -> tuple[int | None, int | None]:
+    """Pull (cache_read, cache_write) prompt-cache token counts from a
+    result's `usage`. None when the backend doesn't report caching (most
+    do not) — distinct from a real 0. Normalized by `_aggregate_result` to
+    `cached_read_tokens`/`cached_write_tokens`; accept the OpenAI-flavored
+    `cached_tokens` (prompt_tokens_details) on the read side too."""
+    u = usage or {}
+    return (
+        u.get("cached_read_tokens", u.get("cached_tokens")),
+        u.get("cached_write_tokens"),
+    )
+
+
 def is_terminal(state: RunState) -> bool:
     return state in _TERMINAL_STATES
 
@@ -187,6 +200,12 @@ class Run:
     """Usage counts. `None` = the backend reported no usage (some agent
     backends) or the run isn't finalized — distinct from a real `0`. Kept
     null-when-unknown so dashboards can tell "unknown" from "zero"."""
+    cached_read_tokens: int | None = None
+    cached_write_tokens: int | None = None
+    """Prompt-cache token counts (claude surfaces these). `None` = no cache
+    info from the backend. Cache-read dominates warm-run cost and is priced
+    far below fresh input, so it's tracked first-class for cost + cache-hit
+    observability."""
     cost_usd: float | None = None
     finish_reason: str | None = None
     tool_call_count: int = 0

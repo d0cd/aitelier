@@ -120,6 +120,84 @@ async def test_notify_accepts_202():
     fake_http.post.assert_awaited_once()
 
 
+# --- Permission policy (Phase 5) --------------------------------------------
+
+
+def test_select_permission_outcome_allow_and_deny():
+    """allow → an allow-kind option; deny → a reject-kind option; deny with no
+    reject option offered → a cancelled outcome (never silently allows)."""
+    from aitelier.providers.acp_transport import _select_permission_outcome
+    opts = [{"optionId": "allow-1", "kind": "allow_once"},
+            {"optionId": "deny-1", "kind": "reject_once"}]
+    assert _select_permission_outcome(opts, True) == {
+        "outcome": {"outcome": "selected", "optionId": "allow-1"}}
+    assert _select_permission_outcome(opts, False) == {
+        "outcome": {"outcome": "selected", "optionId": "deny-1"}}
+    # deny but only an allow option exists → cancel rather than allow
+    assert _select_permission_outcome([{"optionId": "a", "kind": "allow_once"}],
+                                      False) == {"outcome": {"outcome": "cancelled"}}
+
+
+def test_permission_tool_name_extraction():
+    from aitelier.providers.sandbox_agent import _permission_tool_name, _tool_base_name
+    assert _permission_tool_name({"toolCall": {"title": "Bash"}}) == "Bash"
+    assert _permission_tool_name({"toolCall": {"name": "Read"}}) == "Read"
+    assert _permission_tool_name({"tool": "Write"}) == "Write"
+    assert _permission_tool_name({}) is None
+    # base name strips claude's argument patterns
+    assert _tool_base_name("Bash(git:*)") == "Bash"
+    assert _tool_base_name("Read") == "Read"
+
+
+@pytest.mark.asyncio
+async def test_permission_decider_enforces_allowlist_and_emits():
+    """With an allowlist: listed tools allowed, unlisted denied; every ask emits
+    a `permission_request` event and a denial emits `tool_denied`."""
+    from aitelier.providers.sandbox_agent import _make_permission_decider
+
+    class _Emitter:
+        def __init__(self): self.events = []
+        async def emit(self, kind, payload=None): self.events.append((kind, payload))
+
+    em = _Emitter()
+    decide = _make_permission_decider(["Read", "Bash(git:*)"], em)
+    assert await decide({"toolCall": {"title": "Read"}}) is True
+    assert await decide({"toolCall": {"title": "Bash"}}) is True   # base-name match
+    assert await decide({"toolCall": {"title": "WebFetch"}}) is False
+    kinds = [k for k, _ in em.events]
+    assert kinds.count("permission_request") == 3
+    assert ("tool_denied", {"tool": "WebFetch", "reason": "not in tool_allowlist"}) in em.events
+
+
+def test_cancelled_event_payload_bundles_partial_work():
+    """On cancel (interrupt), the `cancelled` event carries the agent's
+    work-so-far — partial text + tool calls — so a redirect turn can build on
+    what it had already produced. Nothing accumulated → content None, not ''."""
+    from aitelier.providers.sandbox_agent import _cancelled_event_payload
+    p = _cancelled_event_payload(["partial ", "answer"], [{"tool": "Read", "id": "1"}])
+    assert p["content"] == "partial answer"
+    assert p["tool_calls"] == [{"tool": "Read", "id": "1"}]
+    empty = _cancelled_event_payload([], [])
+    assert empty["content"] is None
+    assert empty["tool_calls"] == []
+
+
+@pytest.mark.asyncio
+async def test_permission_decider_observes_without_allowlist():
+    """No allowlist → allow everything but still emit the permission_request
+    event (the asks are invisible today)."""
+    from aitelier.providers.sandbox_agent import _make_permission_decider
+
+    class _Emitter:
+        def __init__(self): self.events = []
+        async def emit(self, kind, payload=None): self.events.append((kind, payload))
+
+    em = _Emitter()
+    decide = _make_permission_decider(None, em)
+    assert await decide({"toolCall": {"title": "Bash"}}) is True
+    assert em.events == [("permission_request", {"tool": "Bash"})]
+
+
 # --- Result aggregation ------------------------------------------------------
 
 
@@ -194,6 +272,52 @@ def test_notification_to_event_camelcase_toolcall():
     assert ev["input"] == {"path": "/tmp/foo"}
 
 
+def test_notification_to_event_usage_update():
+    """SA streams `usage_update` (context-window size + used) during a run —
+    live context-fill telemetry. Surface it so run_events carry the timeline."""
+    from aitelier.providers.sandbox_agent import _notification_to_event
+    ev = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "usage_update", "size": 200000, "used": 48266}}})
+    assert ev == {"type": "context_usage", "size": 200000, "used": 48266}
+
+
+def test_notification_to_event_plan():
+    """The agent's plan (task list w/ status) is observability; capture it."""
+    from aitelier.providers.sandbox_agent import _notification_to_event
+    entries = [{"content": "step 1", "status": "in_progress", "priority": "high"}]
+    ev = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "plan", "entries": entries}}})
+    assert ev["type"] == "plan"
+    assert ev["entries"] == entries
+
+
+def test_notification_to_event_mode_and_commands():
+    """Mode changes and available-commands updates are session-state signals."""
+    from aitelier.providers.sandbox_agent import _notification_to_event
+    mode = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "current_mode_update", "currentModeId": "acceptEdits"}}})
+    assert mode == {"type": "mode", "mode": "acceptEdits"}
+    cmds = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "available_commands_update",
+        "availableCommands": [{"name": "/cost"}]}}})
+    assert cmds["type"] == "available_commands"
+    assert cmds["commands"] == [{"name": "/cost"}]
+
+
+def test_notification_to_event_tool_call_captures_locations():
+    """tool_call carries `locations` (files the agent touched) + `kind`;
+    capture them for file-level observability of what the agent did."""
+    from aitelier.providers.sandbox_agent import _notification_to_event
+    ev = _notification_to_event({"params": {"update": {
+        "sessionUpdate": "tool_call", "toolCallId": "tc-1", "title": "Write",
+        "kind": "edit",
+        "locations": [{"path": "/workspace/foo.py"}],
+        "rawInput": {"file_path": "/workspace/foo.py"}}}})
+    assert ev["type"] == "tool_call"
+    assert ev["locations"] == [{"path": "/workspace/foo.py"}]
+    assert ev["tool_kind"] == "edit"
+
+
 def test_aggregate_result_extracts_usage_when_agent_surfaces_it():
     """Agent backends that surface token usage should populate result.usage."""
     result = _aggregate_result(
@@ -209,7 +333,58 @@ def test_aggregate_result_extracts_usage_when_agent_surfaces_it():
         "input_tokens": 120,
         "output_tokens": 45,
         "total_tokens": 165,
+        "cached_read_tokens": None,
+        "cached_write_tokens": None,
     }
+
+
+def test_aggregate_result_extracts_cache_tokens():
+    """claude surfaces prompt-cache read/write tokens (camelCase). These
+    dominate cost (cache-read is ~90% of a warm run) so they must survive
+    aggregation, normalized to snake_case, and stay None when absent."""
+    result = _aggregate_result(
+        agent="claude-code", run_id="r1",
+        turn_result={
+            "stopReason": "end_turn",
+            "content": "hi",
+            "usage": {
+                "inputTokens": 5, "outputTokens": 200, "totalTokens": 48266,
+                "cachedReadTokens": 47807, "cachedWriteTokens": 254,
+            },
+        },
+        elapsed=0.1,
+        response_format=None,
+    )
+    assert result["usage"]["input_tokens"] == 5
+    assert result["usage"]["output_tokens"] == 200
+    assert result["usage"]["cached_read_tokens"] == 47807
+    assert result["usage"]["cached_write_tokens"] == 254
+
+
+def test_aggregate_result_computes_cost_when_model_known():
+    """When the inner model is known, cost is estimated from tokens (incl.
+    cache) — agent calls bypass LiteLLM so this is the only cost signal."""
+    result = _aggregate_result(
+        agent="claude", agent_model="claude-sonnet-4-5", run_id="r1",
+        turn_result={
+            "stopReason": "end_turn", "content": "hi",
+            "usage": {"inputTokens": 5, "outputTokens": 200, "totalTokens": 48266,
+                      "cachedReadTokens": 47807, "cachedWriteTokens": 254},
+        },
+        elapsed=0.1, response_format=None,
+    )
+    assert result["cost_usd"] is not None and result["cost_usd"] > 0
+
+
+def test_aggregate_result_cost_none_when_model_unknown():
+    """No model id (backend default) → cost stays null, not a guess."""
+    result = _aggregate_result(
+        agent="claude", agent_model=None, run_id="r1",
+        turn_result={"stopReason": "end_turn", "content": "hi",
+                     "usage": {"inputTokens": 5, "outputTokens": 200}},
+        elapsed=0.1, response_format=None,
+    )
+    assert result["cost_usd"] is None
 
 
 def test_aggregate_result_extracts_usage_openai_flavored_keys():
@@ -1154,7 +1329,7 @@ def test_chat_completions_agent_route_calls_sandbox(monkeypatch):
 
     client = TestClient(app)
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude-code",
+        "model": "agent:claude-code/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "what is 2+2?"}],
         "timeout": 10,
     })

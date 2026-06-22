@@ -50,9 +50,9 @@ def test_system_maps_agent_models_to_aitelier_namespace():
     """`agent:<backend>` doesn't fit OTel's registered system list.
     Use a custom `aitelier.agent.<backend>` namespace so trace backends
     can still group / filter on it."""
-    assert gen_ai_system_for_model("agent:claude") == "aitelier.agent.claude"
+    assert gen_ai_system_for_model("agent:claude/claude-sonnet-4-5") == "aitelier.agent.claude"
     assert gen_ai_system_for_model("agent:codex/gpt-4o") == "aitelier.agent.codex"
-    assert gen_ai_system_for_model("agent:opencode") == "aitelier.agent.opencode"
+    assert gen_ai_system_for_model("agent:opencode/grok-code") == "aitelier.agent.opencode"
 
 
 def test_system_unknown_maps_to_other_placeholder():
@@ -753,7 +753,7 @@ def test_agent_chat_completions_endpoint_emits_span(monkeypatch):
 
     with _tracer_and_client() as (client, exporter):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "audit"}],
         })
         assert resp.status_code == 200, resp.text
@@ -761,7 +761,7 @@ def test_agent_chat_completions_endpoint_emits_span(monkeypatch):
     assert len(spans) == 1
     attrs = dict(spans[0].attributes)
     assert attrs["gen_ai.operation.name"] == "chat"
-    assert attrs["gen_ai.request.model"] == "agent:claude"
+    assert attrs["gen_ai.request.model"] == "agent:claude/claude-sonnet-4-5"
     assert attrs["gen_ai.system"] == "aitelier.agent.claude"
     assert attrs["gen_ai.usage.input_tokens"] == 11
     assert attrs["gen_ai.usage.output_tokens"] == 7
@@ -950,7 +950,7 @@ def test_agent_chat_completions_stream_endpoint_emits_span(monkeypatch):
 
     with _tracer_and_client() as (client, exporter):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "audit"}],
             "stream": True,
         })
@@ -975,7 +975,7 @@ def test_agent_chat_completions_stream_endpoint_emits_span(monkeypatch):
     )
     attrs = dict(spans[0].attributes)
     assert attrs["gen_ai.operation.name"] == "chat"
-    assert attrs["gen_ai.request.model"] == "agent:claude"
+    assert attrs["gen_ai.request.model"] == "agent:claude/claude-sonnet-4-5"
     assert attrs["gen_ai.system"] == "aitelier.agent.claude"
     assert attrs["gen_ai.response.finish_reasons"] == ("stop",)
     assert attrs["gen_ai.usage.input_tokens"] == 9

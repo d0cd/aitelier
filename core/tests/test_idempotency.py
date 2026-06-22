@@ -40,7 +40,7 @@ def _stub_agent(monkeypatch, side_effect=None, returns=None):
 
 def _chat_body(content: str = "hi") -> dict:
     return {
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": content}],
     }
 
@@ -205,7 +205,7 @@ def test_idempotent_replay_for_retry_scenario(client, monkeypatch):
 
     headers = {"Idempotency-Key": "retry-uuid-1"}
     body = {
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "do work"}],
         "aitelier": {
             "prepare": {"commands": [{"cmd": "echo", "args": ["x"]}]},

@@ -79,7 +79,7 @@ const ait = new Aitelier({ apiKey: "optional-bearer-key" });
 const openai = await ait.openai();
 
 const resp = await openai.chat.completions.create({
-  model: "agent:claude",
+  model: "agent:claude/claude-sonnet-4-5",
   messages: [{ role: "user", content: "Audit this repo." }],
   // Aitelier's TypeScript types don't extend OpenAI's, so cast extra_body.
   extra_body: { aitelier: { workspace: "/path/to/repo" } },
@@ -108,8 +108,7 @@ Routing decided by `model`:
 |---|---|---|
 | `claude-sonnet`, `nomic-embed-text`, `local`, … | LiteLLM (alias) | Curated short names from `docker/litellm/config.yaml` |
 | `anthropic/*`, `openai/*`, `ollama/*` | LiteLLM (wildcard) | Pass-through; LiteLLM resolves the provider |
-| `agent:<backend>` | Sandbox Agent | Backend's default inner LLM |
-| `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM (e.g. `agent:claude/claude-sonnet-4-5`) |
+| `agent:<backend>/<inner-llm>` | Sandbox Agent | Explicit inner LLM, **required** (e.g. `agent:claude/claude-sonnet-4-5`). A bare `agent:<backend>` → 400. |
 
 ### `POST /v1/embeddings`
 
@@ -324,7 +323,7 @@ option, and putting it there errors out under the strict schema.
 
 ```jsonc
 {
-  "model":    "agent:claude",
+  "model":    "agent:claude/claude-sonnet-4-5",
   "messages": [...],
   "timeout":  300,          // ← here
   "aitelier": {             // ← NOT in here
@@ -348,7 +347,7 @@ plan-before-acting and `bypassPermissions`/`acceptEdits` reduce prompts.
 
 ```jsonc
 {
-  "model": "agent:codex",
+  "model": "agent:codex/gpt-5.5",
   "messages": [...],
   "aitelier": { "approval_mode": "auto" }
 }
@@ -541,7 +540,7 @@ final ChatCompletion when the run finishes:
 curl -X POST http://localhost:7777/v1/runs \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "agent:claude",
+    "model": "agent:claude/claude-sonnet-4-5",
     "messages": [{"role": "user", "content": "Long task..."}],
     "webhook_url": "https://your.app/aitelier-callback"
   }'
@@ -593,6 +592,36 @@ webhook receiver.
 Cancel an in-flight run by ID. Returns `{run_id, cancelled: true}` on
 success, 404 if the run isn't in the active registry (already finished or
 never started here).
+
+On cancel, the run's `cancelled` event carries the agent's **work so far** —
+its partial answer (`content`) and the tool calls it had made (`tool_calls`) —
+so an interrupt-then-redirect (below) can continue from where it stopped. The
+agent can't be redirected *mid-generation*: a turn either completes or is
+cancelled, and you continue with a new turn on the prior context (this mirrors
+the underlying ACP protocol, which exposes only cancel during a turn).
+
+### Multi-turn, steering, and "send a message while it's working"
+
+Agent calls are multi-turn the same way Chat Completions is: **append your new
+message to `messages[]` and call again.** aitelier folds the whole history into
+the agent's context, so it continues the conversation; the cell's workspace
+files also persist across turns. Two patterns cover sending input around a turn:
+
+- **Queue (let it finish, then add).** Wait for the current turn's response,
+  then send your next message as the next turn. Nothing special — it's
+  sequential multi-turn.
+- **Interrupt + redirect (stop, do this instead).** Cancel the in-flight run
+  (`POST /v1/runs/{id}/cancel`, or just disconnect a stream), read the partial
+  work from the run's `cancelled` event, then send a **new** turn whose
+  `messages` include the history + that partial work + your redirect. The agent
+  picks up from what it had produced.
+
+**Steering between turns** rides on the same calls: change `model`
+(`agent:<backend>/<model>`), `aitelier.reasoning_effort`, or
+`aitelier.approval_mode` on the next turn to steer the agent's next move. There
+is no separate "session" to manage — each turn is independent and replays the
+context you send, which keeps runs durable and leak-free (no live sessions
+pinned between requests).
 
 ### `GET /v1/runs/active`
 
@@ -666,7 +695,7 @@ POST /v1/schedules
 {
   "name": "nightly-feed-curator",
   "task": {
-    "model": "agent:claude",
+    "model": "agent:claude/claude-sonnet-4-5",
     "messages": [{"role": "user", "content": "Curate today's feeds."}]
   },
   "interval_seconds": 86400,
@@ -788,8 +817,8 @@ covers everything else without aitelier needing config changes.
 | Anthropic wildcard | `anthropic/claude-opus-4-7`, `anthropic/claude-haiku-3.5` |
 | OpenAI wildcard | `openai/gpt-4o`, `openai/gpt-4-turbo` |
 | Ollama wildcard | `ollama/qwen2.5-coder`, `ollama/llama3.2:8b` |
-| Agent (Claude Code) | `agent:claude`, `agent:claude/claude-sonnet-4-5` |
-| Agent (Codex) | `agent:codex`, `agent:codex/gpt-5.4` |
+| Agent (Claude Code) | `agent:claude/claude-sonnet-4-5`, `agent:claude/claude-sonnet-4-5` |
+| Agent (Codex) | `agent:codex/gpt-5.5`, `agent:codex/gpt-5.4` |
 
 Capability discovery at runtime: `GET /v1/models` returns each model
 annotated with the `response_format` types it supports.
@@ -828,8 +857,9 @@ dependencies.sandbox_agent.agents`. Typical list:
 `claude` (Claude Code), `codex` (OpenAI Codex CLI), `opencode`, `cursor`,
 `amp`, `pi`.
 
-Use `model: "agent:<backend>"` to route to one. Omitting the inner LLM runs
-the backend's own default model.
+Route to one with `model: "agent:<backend>/<inner-llm>"`. The inner model is
+**required** — a bare `agent:<backend>` is rejected with a 400, so the run
+always records the exact model it ran (and its cost can be estimated).
 
 ### Selecting the inner model
 
@@ -845,7 +875,7 @@ lists each backend's real ids under `aitelier_inner_llms` (see below).
 | `opencode`, `cursor`, `amp`, `pi` | the backend's own ids | (see `/v1/models`) | `session/set_model` |
 
 > **codex + ChatGPT-account login:** always pass an explicit model
-> (`agent:codex/gpt-5.5`). Bare `agent:codex` lets codex-acp fall back to its
+> (`agent:codex/gpt-5.5`). Bare `agent:codex/gpt-5.5` lets codex-acp fall back to its
 > own default (`gpt-5.3-codex`), which a **ChatGPT-subscription** OAuth login
 > can't use — the turn fails. aitelier surfaces only codex-acp's wire-level
 > `ACP error -32603: Internal error` (the actionable detail —
@@ -943,7 +973,7 @@ record lineage via `parent_run_id`:
 curl -s -X POST http://localhost:7777/v1/runs \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "agent:codex",
+    "model": "agent:codex/gpt-5.5",
     "messages": [{"role": "user", "content": "Audit deps in /workspace/pkg.json"}],
     "aitelier": {
       "parent_run_id":  "<parent run_id from the context block>",
@@ -969,7 +999,7 @@ uses its MCP-tool channel (both `claude` and `codex` advertise
 
 ```jsonc
 {
-  "model": "agent:claude",
+  "model": "agent:claude/claude-sonnet-4-5",
   "messages": [{"role": "user", "content": "Run audit + lint in parallel; summarize."}],
   "aitelier": {
     "mcp_servers": [
@@ -1411,9 +1441,21 @@ persists the value on `runs.cost_usd` (using LiteLLM's own number, not a
 homemade pricing table). Streaming has no usable cost header, so streamed
 calls leave `cost_usd: null`.
 
-Agent-path runs always have `cost_usd: null` by design: agent LLM calls
-happen inside the Sandbox Agent process and go directly to Anthropic /
-OpenAI, bypassing LiteLLM.
+Agent-path calls happen inside the Sandbox Agent process and go straight to
+Anthropic / OpenAI, bypassing LiteLLM — so there's no cost header. aitelier
+instead **estimates** `cost_usd` from the token counts the backend reports —
+including prompt-cache **read** and **write** tokens (`cached_read_tokens` /
+`cached_write_tokens`), which dominate warm-run cost and are priced separately
+from fresh input — multiplied by a per-model rate table in
+`core/src/aitelier/pricing.py`. That table is **drift-checked** against
+LiteLLM's continuously-maintained price map by `scripts/check-model-prices.py`
+(wire it into CI), so a stale rate is caught rather than silently
+undercounting. `cost_usd` is `null` only when the model isn't in the table.
+
+Because the estimate needs the exact model, the agent route **requires** an
+explicit inner model — `agent:<backend>/<model>` (e.g.
+`agent:claude/claude-sonnet-4-5`); a bare `agent:<backend>` is rejected with a
+400. This keeps the run's model — and therefore its cost — always known.
 
 Token usage (`runs.input_tokens` / `output_tokens` / `total_tokens`) is
 captured per path and normalized — the LLM/embed paths report OpenAI-shape

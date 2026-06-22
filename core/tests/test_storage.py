@@ -180,6 +180,39 @@ async def test_finalize_run_normalizes_openai_usage_shape(store):
 
 
 @pytest.mark.asyncio
+async def test_finalize_run_persists_cache_tokens(store):
+    """Prompt-cache read/write counts (claude) persist first-class for cost +
+    cache-hit observability; absent → NULL, not 0."""
+    await store.create_run(RunSpec(run_id="r-cache", kind="agent"))
+    await store.update_run_state("r-cache", "running")
+    await store.finalize_run("r-cache", {
+        "status": "ok",
+        "usage": {
+            "input_tokens": 5, "output_tokens": 200, "total_tokens": 48266,
+            "cached_read_tokens": 47807, "cached_write_tokens": 254,
+        },
+    })
+    run = await store.get_run("r-cache")
+    assert run.cached_read_tokens == 47807
+    assert run.cached_write_tokens == 254
+
+
+@pytest.mark.asyncio
+async def test_finalize_run_null_cache_tokens_when_absent(store):
+    """No cache info from the backend → NULL cache columns (unknown), distinct
+    from a real 0, mirroring the input/output/total convention."""
+    await store.create_run(RunSpec(run_id="r-nocache", kind="agent"))
+    await store.update_run_state("r-nocache", "running")
+    await store.finalize_run("r-nocache", {
+        "status": "ok",
+        "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
+    })
+    run = await store.get_run("r-nocache")
+    assert run.cached_read_tokens is None
+    assert run.cached_write_tokens is None
+
+
+@pytest.mark.asyncio
 async def test_finalize_run_null_tokens_when_no_usage(store):
     """A result with no `usage` stores NULL tokens (unknown), not 0 — so a
     dashboard distinguishes 'backend reported nothing' from a genuine 0."""

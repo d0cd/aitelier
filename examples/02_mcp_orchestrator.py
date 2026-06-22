@@ -34,7 +34,7 @@ async def run_orchestrator() -> str:
         "Audit this repository three ways in parallel: security, "
         "dependencies, and docstrings.\n\n"
         "Step 1: call get_my_run_id once and remember the value.\n"
-        "Step 2: call submit_run three times with model=agent:claude, "
+        "Step 2: call submit_run three times with model=agent:claude/claude-sonnet-4-5, "
         f"trace_tag='{workflow_tag}', and parent_run_id set to the value "
         "from step 1.\n"
         "Step 3: poll list_runs(parent_run_id=...) until all three are "
@@ -42,7 +42,7 @@ async def run_orchestrator() -> str:
     )
 
     submission = await ait.submit_run(
-        model="agent:claude",
+        model="agent:claude/claude-sonnet-4-5",
         messages=[{"role": "user", "content": parent_prompt}],
         aitelier_opts={
             "trace_tag": workflow_tag,

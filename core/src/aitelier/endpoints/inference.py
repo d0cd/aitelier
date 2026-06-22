@@ -44,7 +44,7 @@ async def chat_completions_endpoint(req: ChatCompletionRequest, request: Request
     """OpenAI-shape chat completions.
 
     Routing:
-      - `model = "agent:<backend>[/<inner-llm>]"` → Sandbox Agent
+      - `model = "agent:<backend>/<inner-llm>"` → Sandbox Agent (inner required)
       - any other `model` → LiteLLM passthrough
 
     `aitelier.*` options on the agent path; not accepted on the LLM path.

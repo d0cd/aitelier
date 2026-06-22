@@ -22,7 +22,7 @@ ait = Aitelier(base_url="http://localhost:7777", api_key="...")
 # Inference — pass-through to the OpenAI SDK.
 openai = ait.openai()
 resp = await openai.chat.completions.create(
-    model="agent:claude",
+    model="agent:claude/claude-sonnet-4-5",
     messages=[{"role": "user", "content": "audit this repo"}],
     extra_body={"aitelier": {"workspace": "/path/to/repo"}},
 )
@@ -43,7 +43,7 @@ the control plane:
 
 ```python
 submission = await ait.submit_run(
-    model="agent:claude",
+    model="agent:claude/claude-sonnet-4-5",
     messages=[{"role": "user", "content": "audit /workspace"}],
     aitelier_opts={"workspace": "/path/to/repo", "trace_tag": "audit-2026"},
     webhook_url="https://my.app/webhooks/aitelier",

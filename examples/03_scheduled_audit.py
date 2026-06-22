@@ -29,7 +29,7 @@ async def register_audit() -> None:
     schedule = await ait.create_schedule(
         name="nightly-dependency-audit",
         task={
-            "model": "agent:codex",
+            "model": "agent:codex/gpt-5.5",
             "messages": [{
                 "role": "user",
                 "content": (

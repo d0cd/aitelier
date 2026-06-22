@@ -256,7 +256,7 @@ def test_redact_secrets_strips_mcp_headers_and_command_env():
     assert out["tool_allowlist"] == ["fs.read"]  # unchanged
 
     task = {
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "aitelier": {
             "prepare": {"commands": [
                 {"cmd": "x", "args": [], "env": [
@@ -302,7 +302,7 @@ def test_schedules_redacts_headers_and_env_on_get(client):
     body = {
         "name": "audit",
         "task": {
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "x"}],
             "aitelier": {
                 "mcp_servers": [
@@ -354,6 +354,8 @@ def test_run_to_dict_redacts_request_body_and_rendered_messages():
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
+        cached_read_tokens = None
+        cached_write_tokens = None
         cost_usd = None
         finish_reason = None
         tool_call_count = 0
@@ -364,7 +366,7 @@ def test_run_to_dict_redacts_request_body_and_rendered_messages():
         result = {}
         metadata = {}
         request_body = {
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "aitelier": {
                 "mcp_servers": [{
@@ -383,7 +385,7 @@ def test_run_to_dict_redacts_request_body_and_rendered_messages():
     # MCP headers redacted; rest of structure intact.
     redacted_headers = out["request_body"]["aitelier"]["mcp_servers"][0]["headers"]
     assert redacted_headers == [{"name": "Authorization", "value": "[redacted]"}]
-    assert out["request_body"]["model"] == "agent:claude"
+    assert out["request_body"]["model"] == "agent:claude/claude-sonnet-4-5"
     assert out["request_body"]["messages"] == [{"role": "user", "content": "hi"}]
     # Rendered messages pass through when no credential shape is present.
     assert out["rendered_messages"] == [
@@ -418,6 +420,8 @@ def test_run_to_dict_passes_through_none_request_body():
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
+        cached_read_tokens = None
+        cached_write_tokens = None
         cost_usd = None
         finish_reason = None
         tool_call_count = 0
@@ -460,6 +464,8 @@ def test_redact_secrets_strips_metadata_and_result_on_run_to_dict():
         input_tokens = 0
         output_tokens = 0
         total_tokens = 0
+        cached_read_tokens = None
+        cached_write_tokens = None
         cost_usd = None
         finish_reason = None
         tool_call_count = 0
@@ -572,7 +578,7 @@ def test_validate_workspace_path_rejects_symlinked_component(tmp_path):
 def test_chat_completions_rejects_workspace_dotdot(client):
     """The same validator runs at request boundary on /v1/chat/completions."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"workspace": "/tmp/x/../etc"},
     })
@@ -583,7 +589,7 @@ def test_chat_completions_rejects_workspace_dotdot(client):
 def test_chat_completions_rejects_artifacts_fetch_dotdot(client):
     """`aitelier.artifacts.fetch[*]` paths are also validated."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"artifacts": {"fetch": ["/tmp/ws/../etc/passwd"]}},
     })
@@ -594,7 +600,7 @@ def test_chat_completions_rejects_artifacts_fetch_dotdot(client):
 def test_chat_completions_rejects_prepare_files_dotdot(client):
     """`aitelier.prepare.files[*].path` is also validated."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"prepare": {"files": [
             {"path": "/tmp/ws/../etc/cron.d/evil", "content": "x"},
@@ -608,7 +614,7 @@ def test_chat_completions_rejects_loopback_mcp_server_url(client):
     """`aitelier.mcp_servers[*].url` must resolve to a public host when
     SSRF guard is on (default). Same posture as webhook_url."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"mcp_servers": [
             {"name": "internal", "transport": "http",
@@ -622,7 +628,7 @@ def test_chat_completions_rejects_loopback_mcp_server_url(client):
 def test_chat_completions_rejects_imds_mcp_server_url(client):
     """The IMDS metadata service (169.254.169.254) must be refused."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"mcp_servers": [
             {"name": "evil", "transport": "http",
@@ -648,7 +654,7 @@ def test_chat_completions_allows_stdio_mcp_server_without_url_check(client):
                     "error_type": None, "error_msg": None,
                 }):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "x"}],
             "aitelier": {"mcp_servers": [
                 {"name": "aitelier", "transport": "stdio",
@@ -661,7 +667,7 @@ def test_chat_completions_allows_stdio_mcp_server_without_url_check(client):
 def test_chat_completions_rejects_too_many_mcp_servers(client):
     """Pydantic Field(max_length=32) rejects at parse time as 422."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"mcp_servers": [
             {"name": f"s{i}", "transport": "stdio", "command": "c"}
@@ -675,7 +681,7 @@ def test_chat_completions_rejects_too_many_mcp_servers(client):
 def test_chat_completions_rejects_oversized_tool_allowlist(client):
     """Pydantic Field(max_length=256) rejects at parse time as 422."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"tool_allowlist": [f"t{i}" for i in range(1000)]},
     })
@@ -849,7 +855,7 @@ def test_schedule_name_rejects_invalid_charset(client):
     to keep that channel clean."""
     body = {
         "name": "x\n</aitelier_context>injected",
-        "task": {"model": "agent:claude",
+        "task": {"model": "agent:claude/claude-sonnet-4-5",
                  "messages": [{"role": "user", "content": "x"}]},
         "interval_seconds": 60,
     }
@@ -903,7 +909,7 @@ def test_chat_completions_rejects_tools_on_agent_path(client, monkeypatch):
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "tools": [{"type": "function", "function": {"name": "fake"}}],
     })
@@ -1243,7 +1249,7 @@ def test_chat_completions_agent_path_allows_tool_drop_opt_in(client, monkeypatch
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "hi"}],
         "tools": [{"type": "function", "function": {"name": "fake"}}],
         "aitelier": {"allow_tool_drop": True},
@@ -1308,7 +1314,7 @@ def test_agent_path_classifies_bad_backend_as_provider_error(client, monkeypatch
         fake_stream,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:not-a-real-agent",
+        "model": "agent:not-a-real-agent/some-model",
         "messages": [{"role": "user", "content": "hi"}],
     })
     body = resp.json()
@@ -1341,7 +1347,7 @@ def test_chat_completions_agent_path_preserves_token_invariant(client, monkeypat
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert resp.status_code == 200, resp.text
@@ -1373,7 +1379,7 @@ def test_chat_completions_agent_stream_preserves_token_invariant(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         })
@@ -1408,7 +1414,7 @@ def test_chat_completions_agent_path_no_inner_tokens_when_invariant_holds(
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "hi"}],
     })
     usage = resp.json()["usage"]
@@ -1853,7 +1859,7 @@ def _patch_sa_request(routes):
 
 def _agent_chat_body(content: str = "hi", **aitelier_opts) -> dict:
     body = {
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": content}],
     }
     if aitelier_opts:
@@ -2167,7 +2173,7 @@ def test_async_run_returns_run_id_immediately(client):
     with patch("aitelier.providers.sandbox_agent.call_via_sandbox",
                 side_effect=slow_call):
         resp = client.post("/v1/runs", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
         })
     assert resp.status_code == 200
@@ -2195,7 +2201,7 @@ def test_create_and_list_schedule(client):
     resp = client.post("/v1/schedules", json={
         "name": "audit-daily",
         "task": {
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "audit"}],
         },
         "interval_seconds": 86400,
@@ -2246,7 +2252,7 @@ def test_chat_completions_agent_stream_yields_openai_chunks(client):
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "What's in the corpus?"}],
             "stream": True,
         }, headers={"X-Correlation-Id": "stream-cid"})
@@ -2271,7 +2277,7 @@ def test_chat_completions_agent_stream_error_event_on_failure(client):
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "boom"}],
             "stream": True,
         })
@@ -2305,7 +2311,7 @@ def test_chat_completions_agent_stream_emits_keepalive_during_silence(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         })
@@ -2345,7 +2351,7 @@ def test_chat_completions_agent_stream_keepalive_fires_during_dropped_events(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         })
@@ -2446,7 +2452,7 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
         _active_runs[f"saturating-run-{i}"] = fake_task
     try:
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
         })
         assert resp.status_code == 503
@@ -2577,7 +2583,7 @@ def test_chat_completions_records_parent_run_id_on_agent_path(
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "child task"}],
         "aitelier": {"parent_run_id": "parent-xyz",
                       "trace_tag": "workflow-1"},
@@ -2643,7 +2649,7 @@ def test_chat_completions_rejects_unknown_aitelier_field(client):
     get a clean 422 — not a downstream `KeyError: 'sessionId'` leaking
     from the runner."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "x"}],
         "aitelier": {"workspace": "/tmp", "timeout": 999},
     })
@@ -2675,7 +2681,7 @@ def test_chat_completions_rejects_empty_messages(client):
     mentioning cache_control (the prior path leaked an internal failure
     mode and didn't tell the consumer the real problem)."""
     resp = client.post("/v1/chat/completions", json={
-        "model": "agent:claude",
+        "model": "agent:claude/claude-sonnet-4-5",
         "messages": [],
     })
     assert resp.status_code == 422
@@ -2711,7 +2717,7 @@ def test_chat_completions_agent_stream_terminal_chunk_has_tool_summary(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         })
@@ -2743,7 +2749,7 @@ def test_chat_completions_agent_stream_finalizes_on_consumer_disconnect(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
     ):
         with client.stream("POST", "/v1/chat/completions", json={
-            "model": "agent:claude",
+            "model": "agent:claude/claude-sonnet-4-5",
             "messages": [{"role": "user", "content": "hi"}],
             "stream": True,
         }) as resp:
@@ -2788,7 +2794,7 @@ def test_chat_completions_agent_stream_idempotency_replays_chunks(client):
                "cost_usd": None, "error_type": None, "error_msg": None}
 
     body = {
-        "model": "agent:claude-code",
+        "model": "agent:claude-code/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "hi"}],
         "stream": True,
     }
@@ -2826,7 +2832,7 @@ def test_chat_completions_agent_stream_idempotency_skips_failed_streams(client):
                "error_msg": "transient blip"}
 
     body = {
-        "model": "agent:claude-code",
+        "model": "agent:claude-code/claude-sonnet-4-5",
         "messages": [{"role": "user", "content": "hi"}],
         "stream": True,
     }
@@ -2885,7 +2891,7 @@ def test_chat_completions_agent_path_folds_examples(client):
     with patch("aitelier.providers.sandbox_agent.call_via_sandbox",
                 side_effect=fake_call):
         resp = client.post("/v1/chat/completions", json={
-            "model": "agent:claude-code",
+            "model": "agent:claude-code/claude-sonnet-4-5",
             "messages": [
                 {"role": "system", "content": "You are a curator."},
                 {"role": "user", "content": "Process today's feeds."},
@@ -3233,7 +3239,7 @@ def test_reject_claude_only_opts_on_non_claude():
     from fastapi import HTTPException
 
     req = ChatCompletionRequest(
-        model="agent:codex",
+        model="agent:codex/gpt-5.5",
         messages=[{"role": "user", "content": "hi"}],
         aitelier=AitelierAgentOpts(tool_allowlist=["Read"], max_turns=5),
     )
@@ -3249,7 +3255,7 @@ def test_claude_only_opts_allowed_on_claude():
     from aitelier.server import _reject_agent_incompatible_fields
 
     req = ChatCompletionRequest(
-        model="agent:claude",
+        model="agent:claude/claude-sonnet-4-5",
         messages=[{"role": "user", "content": "hi"}],
         aitelier=AitelierAgentOpts(tool_allowlist=["Read"], max_turns=5),
     )
@@ -3261,7 +3267,7 @@ def test_reasoning_and_approval_not_rejected_on_non_claude():
     from aitelier.server import _reject_agent_incompatible_fields
 
     req = ChatCompletionRequest(
-        model="agent:codex",
+        model="agent:codex/gpt-5.5",
         messages=[{"role": "user", "content": "hi"}],
         aitelier=AitelierAgentOpts(reasoning_effort="high", approval_mode="auto"),
     )
@@ -3283,7 +3289,7 @@ def test_agent_path_rejects_sampling_fields():
         ("top_logprobs", 3),
     ]:
         req = ChatCompletionRequest(
-            model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+            model="agent:claude/claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}],
             **{field: value},
         )
         with pytest.raises(HTTPException) as ei:
@@ -3296,7 +3302,7 @@ def test_agent_path_clean_request_not_rejected():
     from aitelier.openai_compat import ChatCompletionRequest
     from aitelier.server import _reject_agent_incompatible_fields
     req = ChatCompletionRequest(
-        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+        model="agent:claude/claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}],
     )
     _reject_agent_incompatible_fields(req, "claude")  # must not raise
 
@@ -3357,7 +3363,7 @@ def test_agent_stream_rejects_prepare_artifacts():
     from fastapi import HTTPException
 
     req = ChatCompletionRequest(
-        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+        model="agent:claude/claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}],
         stream=True,
         aitelier=AitelierAgentOpts(prepare={"commands": [{"cmd": "ls"}]}),
     )
@@ -3367,7 +3373,7 @@ def test_agent_stream_rejects_prepare_artifacts():
 
     # Non-streaming with prepare is fine.
     req2 = ChatCompletionRequest(
-        model="agent:claude", messages=[{"role": "user", "content": "hi"}],
+        model="agent:claude/claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}],
         aitelier=AitelierAgentOpts(prepare={"commands": [{"cmd": "ls"}]}),
     )
     _reject_agent_incompatible_fields(req2, "claude")  # must not raise
@@ -3398,9 +3404,9 @@ def test_stream_chunk_for_done_respects_include_usage():
     from aitelier.server import _stream_chunk_for_done
     ev = {"type": "done", "status": "ok", "content": "hi",
           "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3}}
-    c_on, _ = _stream_chunk_for_done(ev, model="agent:claude", run_id="r",
+    c_on, _ = _stream_chunk_for_done(ev, model="agent:claude/claude-sonnet-4-5", run_id="r",
                                      stamp=lambda c: c, include_usage=True)
     assert "usage" in c_on
-    c_off, _ = _stream_chunk_for_done(ev, model="agent:claude", run_id="r",
+    c_off, _ = _stream_chunk_for_done(ev, model="agent:claude/claude-sonnet-4-5", run_id="r",
                                       stamp=lambda c: c, include_usage=False)
     assert "usage" not in c_off
