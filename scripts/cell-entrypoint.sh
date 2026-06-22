@@ -17,7 +17,16 @@ mkdir -p "$HOME/.claude" "$HOME/.codex"
 # Brig mounts secrets read-only at /run/secrets/<name>. Symlink (don't
 # copy) so credential rotation via `brig secrets add` takes effect at
 # the next cell restart without rebuilding the image.
-if [ -f /run/secrets/claude-credentials ]; then
+#
+# Claude auth, preferred path: a long-lived OAuth token from
+# `claude setup-token` (valid ~1 year, no refresh-token rotation). claude-code
+# reads it from CLAUDE_CODE_OAUTH_TOKEN, so there's no credentials file to mount
+# and nothing goes stale between restarts. Falls back to the rotating
+# .credentials.json snapshot when the token secret isn't registered.
+if [ -f /run/secrets/claude-oauth-token ]; then
+    CLAUDE_CODE_OAUTH_TOKEN="$(cat /run/secrets/claude-oauth-token)"
+    export CLAUDE_CODE_OAUTH_TOKEN
+elif [ -f /run/secrets/claude-credentials ]; then
     ln -sf /run/secrets/claude-credentials "$HOME/.claude/.credentials.json"
 fi
 if [ -f /run/secrets/codex-credentials ]; then

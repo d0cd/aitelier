@@ -26,7 +26,7 @@
 #   - VM running:
 #         brig system up
 #   - Brig secrets registered:
-#         brig secrets add claude-credentials < ~/.claude/.credentials.json
+#         security find-generic-password -s claude-oauth -w | brig secrets add claude-oauth-token
 #         brig secrets add codex-credentials < ~/.codex/auth.json
 #         brig secrets add warden-ca-cert < <warden ca pem; see brig-feedback.md>
 #         python3 -c 'import secrets;print(secrets.token_urlsafe(32))' \
@@ -124,7 +124,7 @@ brig cell rm "$CELL_NAME" >/dev/null 2>&1 || true
 echo "=== Launching cell from $CELL_YAML ==="
 if ! brig run --file "$CELL_YAML" -d; then
     echo "  ✗ \`brig run\` failed. Check:"
-    echo "      brig secrets list   # claude-credentials, warden-ca-cert, etc."
+    echo "      brig secrets list   # claude-oauth-token, codex-credentials, etc."
     echo "      brig policy show $CELL_NAME"
     exit 1
 fi

@@ -48,6 +48,12 @@ workspace_quota: "20g"
 # Aitelier never enters this cell — its config lives wherever aitelier
 # itself runs, not here.
 #
+# Claude auth uses a long-lived OAuth token (`claude setup-token`, ~1yr,
+# no rotation), registered once from the Keychain:
+#   security find-generic-password -s claude-oauth -w | brig secrets add claude-oauth-token
+# The entrypoint exports it as CLAUDE_CODE_OAUTH_TOKEN — no credentials file
+# to mount and nothing to re-register as the short-lived access token rotates.
+#
 # Warden's MITM CA is auto-mounted by brig at /run/brig/ca-bundle.crt
 # via `trust_warden_ca: true` (default since brig 0.3.0). All four
 # common SSL_CERT_FILE / REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE /
@@ -56,7 +62,7 @@ workspace_quota: "20g"
 # and competing with brig's auto-mount caused CA mismatches when
 # warden rotated its cert across brig restarts.
 secrets:
-  - claude-credentials         # → $HOME/.claude/.credentials.json
+  - claude-oauth-token         # → CLAUDE_CODE_OAUTH_TOKEN (long-lived setup-token)
   - codex-credentials          # → $HOME/.codex/auth.json
 
 # Suppress the agent CLIs' phone-home telemetry. claude-code otherwise POSTs
