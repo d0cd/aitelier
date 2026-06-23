@@ -7,6 +7,12 @@ relevant section.
 
 ## Unreleased
 
+_Nothing yet._
+
+## 0.1.0 — 2026-06-23
+
+First public release.
+
 ### Added — Phase L (eval framework substrate: scoring sink + bulk export)
 
 Two small additions that turn aitelier into the runtime substrate any
