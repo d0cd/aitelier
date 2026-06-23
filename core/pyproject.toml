@@ -1,7 +1,7 @@
 [project]
 name = "aitelier"
 version = "0.1.0"
-description = "AI task toolkit — fan-out dispatch across LLM and coding agent providers"
+description = "Self-hosted, OpenAI-compatible gateway and control plane for LLM and coding-agent calls"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.111.0",

@@ -1,7 +1,7 @@
 [project]
 name = "aitelier-client"
 version = "0.1.0"
-description = "Python SDK for the aitelier service"
+description = "Python SDK for aitelier — an OpenAI-compatible gateway and control plane for LLM and coding-agent calls"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27.0",

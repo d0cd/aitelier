@@ -42,7 +42,7 @@ The name is a portmanteau of "AI" and "atelier" (a craftsperson's workshop).
 - **Not a full agent orchestrator.** Plain `asyncio.gather` for concurrency.
   Convergent loops live in ralphx, not here.
 - **Not an authoritative web service.** The HTTP server is for localhost
-  invocation by personal tools, not internet exposure.
+  invocation by local tools, not internet exposure.
 
 ## Background
 
@@ -83,9 +83,9 @@ aitelier is a multi-package, multi-language project. The split:
 
 - **Core (Python).** The actual aitelier — task runner, fan-out, provider
   adapters, CLI, HTTP server. Where the logic lives.
-- **Python SDK.** Personal-use client wrapping the HTTP service. Used from
+- **Python SDK.** Thin client wrapping the HTTP service. Used from
   scripts and notebooks. Same operations as the TS SDK, idiomatic Python.
-- **TypeScript SDK.** Personal-use client wrapping the HTTP service. Used
+- **TypeScript SDK.** Thin client wrapping the HTTP service. Used
   from ralphx and any future TS tooling. Same operations as the Python SDK,
   idiomatic TS.
 - **Shared schemas.** JSON Schema documents defining the wire format. Both
@@ -109,7 +109,7 @@ aitelier from scripts and notebooks, it should feel native.
                        └────────────────────────┘   │
                                                     │
                        ┌────────────────────────┐   │
-                       │ Personal Python scripts│ ──┤ HTTP
+                       │ Your Python scripts    │ ──┤ HTTP
                        │ Jupyter notebooks      │   │
                        └────────────────────────┘   │
                                                     ▼
@@ -314,7 +314,7 @@ Out of scope for `aitelier` itself. The service assumes one of:
 
 ## Versioning
 
-Personal-use versioning, kept lightweight but real:
+Single-user versioning, kept lightweight but real:
 
 - **Semantic versioning** for the project as a whole: major.minor.patch.
   Bumped on tagged releases. No external users to break, but the version
@@ -436,7 +436,7 @@ day-to-day work.
 ## Tradeoffs and rationale
 
 **Two SDKs over a single language.** ralphx is TypeScript and earns the
-TS SDK; personal scripts are Python and benefit from the Python SDK.
+TS SDK; ad-hoc scripts are often Python and benefit from the Python SDK.
 Symmetry helps future-you maintain a single mental model across both.
 Cost: two implementations, kept in sync via shared schemas and contract
 tests.
@@ -497,7 +497,7 @@ that Sandbox Agent specifics don't leak into application code.
 **Closed laptop on local agent runs.** No fix; tasks die. Mitigation:
 short tasks local, long tasks remote.
 
-**Two SDKs drift.** Real risk for personal projects without external
+**Two SDKs drift.** Real risk for a solo project without external
 pressure. Mitigation: schema-driven types, contract test corpus,
 "never add a feature to one SDK without the other" discipline.
 
@@ -535,7 +535,7 @@ the TS SDK for specific patterns, but is not the architectural foundation.
 scraping. Sandbox Agent chosen for proper event model and
 remote-sandbox-first design.
 
-**TypeScript SDK only.** Rejected — personal Python scripting is a real
+**TypeScript SDK only.** Rejected — Python scripting is a real
 use case; ad-hoc httpx inconsistent with how other code calls the service.
 
 **LangGraph as the agent framework.** Rejected. Heavy abstractions for
@@ -548,5 +548,5 @@ existing GET endpoints (`/v1/runs`, run events, `/v1/traces/aggregates`).
 A read/write dashboard (run replay, behavior graphs) remains future work
 (see PLAN.md Tier 1).
 
-**Monorepo tooling (Nx, Turborepo).** Rejected as overkill for a personal
+**Monorepo tooling (Nx, Turborepo).** Rejected as overkill for a small
 project; plain pnpm + uv coexisting is simpler.

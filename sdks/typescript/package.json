@@ -1,7 +1,7 @@
 {
   "name": "aitelier",
   "version": "0.1.0",
-  "description": "TypeScript SDK for the aitelier service",
+  "description": "TypeScript SDK for aitelier — an OpenAI-compatible gateway and control plane for LLM and coding-agent calls",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

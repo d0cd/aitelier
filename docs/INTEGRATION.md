@@ -1376,7 +1376,7 @@ mode = "host"    # bare host install; no isolation. Default. Dev only.
 
 - **`mode = "host"`** — `scripts/start.sh` installs the SA binary
   with `curl ... install.sh | sh` and runs it as your user. The agent
-  inherits your user's full host permissions. Fine for personal dev,
+  inherits your user's full host permissions. Fine for local dev,
   unsafe for any deployment that exposes /v1/* to untrusted callers.
 
 - **`mode = "docker"`** — `start.sh` flips on the compose `sa` profile

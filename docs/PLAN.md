@@ -114,7 +114,7 @@ architectural decision; they require a release cadence.
   one reference compose stack (Postgres + LiteLLM + aitelier + optional
   Ollama) under `docs/deploy/` lets a consumer run aitelier in 5
   minutes without reverse-engineering the Makefile. K8s is not required
-  for the personal-scale ceiling; compose is enough.
+  for the single-user-scale ceiling; compose is enough.
 
 - **Backup / restore runbook.** Postgres holds every run, event,
   schedule, webhook, and idempotency key. A 1-page doc under
@@ -134,7 +134,7 @@ architectural decision; they require a release cadence.
 Not commitments — forward-looking notes on where aitelier can compound
 its existing investment. Ranked by alignment with the unique position
 aitelier holds (OpenAI-shape inference + durable Postgres runs + ACP
-agent dispatch + multi-agent via `parent_run_id` + personal-scale).
+agent dispatch + multi-agent via `parent_run_id` + single-user scale).
 
 ### Tier 1 — leans into aitelier's unique position
 
@@ -225,8 +225,8 @@ agent dispatch + multi-agent via `parent_run_id` + personal-scale).
 
 - **Provider key rotation + multi-key brokering.** Multiple keys per
   provider in `[litellm]` config, hot-rotate without restart,
-  round-robin (or quota-aware) selection per request. Lets a personal-
-  scale operator multiplex across two free-tier keys without writing a
+  round-robin (or quota-aware) selection per request. Lets a single-
+  user operator multiplex across two free-tier keys without writing a
   separate proxy. Anthropic / OpenAI both punish per-key rate limits;
   this is the cheapest evasion that doesn't violate ToS.
 
