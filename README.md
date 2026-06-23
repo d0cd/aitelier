@@ -110,4 +110,4 @@ runs/                   gitignored — per-run agent artifacts + logs
 
 ## License
 
-Personal use. No published SDK, no API stability guarantees for outside consumers.
+Released under the [MIT License](LICENSE).

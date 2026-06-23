@@ -32,10 +32,9 @@ The name is a portmanteau of "AI" and "atelier" (a craftsperson's workshop).
 
 ## Non-goals
 
-- **Not a published SDK or product.** Personal use, no API stability
-  guarantees for external consumers, no migration paths owed to anyone.
-  Version discipline exists for self-protection (see "Versioning"), not
-  contract.
+- **Not a commercial or supported product.** Maintained as an open-source
+  project — no SLAs or dedicated support. Version discipline exists to
+  track what changed (see "Versioning").
 - **Not a multi-tenant or multi-user system.** Single developer, single
   laptop primarily, occasionally remote sandboxes.
 - **Not a replacement for any underlying tool.** Composes LiteLLM and
@@ -326,7 +325,7 @@ Personal-use versioning, kept lightweight but real:
   confusion.
 - **API path versioning**: `/v1/` from day one. New incompatible endpoints
   go to `/v2/`. Old paths can stay until all callers migrate, then
-  removed. For personal use, "all callers migrate" is "I update the two
+  removed. In a small project, "all callers migrate" is "I update the few
   places I call from" — fast.
 - **Schema versioning by directory**: when a breaking schema change
   happens, schemas live at `schemas/v2/` alongside `schemas/v1/`. Both
@@ -444,9 +443,9 @@ tests.
 
 **Schema-driven type generation.** Both SDKs generate types from JSON
 Schema rather than hand-writing. Removes a class of drift bugs. Mandatory
-discipline for personal use where no external pressure catches divergence.
+discipline for a small project where no external pressure catches divergence.
 
-**Versioning even for personal use.** Version numbers anchor "what was
+**Versioning even for a small project.** Version numbers anchor "what was
 working when" and protect future-you from archaeology. Lockstep across
 packages avoids per-component version-matrix confusion.
 

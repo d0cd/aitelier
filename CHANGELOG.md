@@ -335,7 +335,7 @@ preserved; tests grew from 325 → 363.
   Brig stages a combined system+warden CA bundle and auto-exports
   `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `CURL_CA_BUNDLE` /
   `NODE_EXTRA_CA_CERTS`. Three implementation bugs we caught and
-  brig fixed mid-session are documented in `brig-feedback.md`.
+  brig fixed mid-session.
 - **`tls_passthrough`** for `chatgpt.com` + `auth.openai.com` — brig
   shipped exactly the principled fix we sketched, unblocking codex
   agent runs through brig (Cloudflare-fronted strict TLS that
