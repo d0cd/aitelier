@@ -73,6 +73,14 @@ env:
   DISABLE_TELEMETRY: "1"
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
 
+# --- Shared editable workspace ---
+# Same host dirs mounted into the cell, so the delegated agent
+# edits the same files (confined to these subtrees) and changes land on
+# the host. Requires `brig config set mount_roots /Users/<you>/myrepo`.
+mounts:
+  - {name: work,   host_path: /Users/<you>/myrepo/work,   mount_point: /workspace, mode: rw}
+  - {name: source, host_path: /Users/<you>/myrepo/source, mount_point: /src,       mode: rw}
+
 # --- Network policy ---
 # Warden enforces this; default deny + explicit allow.
 policy:

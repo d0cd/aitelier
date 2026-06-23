@@ -61,7 +61,7 @@ max_in_flight_runs = 32          # 503 when exceeded; 0 disables the cap
 allow_loopback_webhooks = false  # opt-in for dev when webhook target is on localhost
 max_request_body_bytes = 4194304 # 4 MiB; 413 above this. 0 disables (only safe behind a proxy)
 rate_limit_per_minute = 0        # 0 = disabled. Set to e.g. 600 for hosted mode
-# allowed_workspace_roots = ["/Users/d0c/.brig/state"]
+# allowed_workspace_roots = ["/Users/<you>/.brig/state"]
 #   Allowlist for `aitelier.workspace`, `aitelier.artifacts.fetch[*]`,
 #   and `aitelier.prepare.files[*].path`. Empty (default) = no allowlist.
 #   For brig-cell deployments, set to the cell's workspace mount root.
