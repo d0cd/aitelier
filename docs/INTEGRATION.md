@@ -447,7 +447,7 @@ contract.
 
 **Escape hatch for `tools` / `tool_choice` only**: consumers whose transport
 sends `tools` per a global toolset config and can't suppress it per-profile
-(Hermes) can set `aitelier.allow_tool_drop: true`. With that flag, `tools`
+can set `aitelier.allow_tool_drop: true`. With that flag, `tools`
 and `tool_choice` are silently dropped on the agent path. The opt-in is
 explicit so consumers can't accidentally lose tools without knowing.
 
@@ -1426,12 +1426,13 @@ Three tiers, ordered by cost:
    the original config + restarts in the original mode on exit.
    Requires Docker + real LLM credentials. Not in CI.
 
-**Brig-mode e2e is intentionally not in this repo's CI.** Brig
-isn't on PyPI / homebrew / a CI-installable artifact registry; setting
-it up in GitHub Actions is impractical. The user-side integration
-testing (your hermes-in-brig and dispatcher-in-brig deployments
-talking to an aitelier cell) IS the brig e2e suite — that signal
-lives in those projects' CI, not here.
+**Brig-mode e2e is intentionally not in this repo's CI.** Brig is one
+optional remote-sandbox target (see the sandbox modes above), not a
+required part of running aitelier; it isn't on PyPI / homebrew / a
+CI-installable artifact registry, so wiring it into GitHub Actions is
+impractical. If you deploy aitelier onto a brig cell, that integration
+signal lives in your own deployment's CI — your consumer talking to an
+aitelier cell — not here.
 
 ## Cost tracking
 
