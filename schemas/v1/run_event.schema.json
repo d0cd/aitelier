@@ -18,12 +18,12 @@
     },
     "kind": {
       "type": "string",
-      "description": "Event family. Common: start, delta, tool_call, tool_result, finish, error, cancelled. Open-ended; new kinds may appear without a schema bump."
+      "description": "Event family. Common: start, delta, thought, tool_call, tool_result, finish, error, cancelled, plus agent-path observability — context_usage, plan, mode, available_commands, permission_request, tool_denied. Open-ended; new kinds may appear without a schema bump."
     },
     "ts": { "type": ["string", "null"], "format": "date-time" },
     "payload": {
       "type": "object",
-      "description": "Event-specific fields. delta: {content}. tool_call: {server, tool, input}. tool_result: {tool, output, elapsed_ms}. start: {agent, sandbox, workspace} where sandbox is the symbolic 'local'|'remote' rather than an internal URL."
+      "description": "Event-specific fields. delta/thought: {content}. tool_call: {server, tool, input, locations, tool_kind}. tool_result: {tool, output, elapsed_ms}. start: {agent, sandbox, workspace} (sandbox is the symbolic 'local'|'remote', not an internal URL). context_usage: {size, used}. permission_request: {tool}. tool_denied: {tool, reason}. cancelled: {content, tool_calls} — partial work captured at cancel time."
     }
   }
 }

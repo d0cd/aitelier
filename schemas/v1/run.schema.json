@@ -130,6 +130,14 @@
     "total_tokens": {
       "type": ["integer", "null"]
     },
+    "cached_read_tokens": {
+      "type": ["integer", "null"],
+      "description": "Prompt-cache read tokens (e.g. claude). Null when the backend reports no cache info — distinct from a real 0. Cache-read dominates warm-run volume and is priced far below fresh input."
+    },
+    "cached_write_tokens": {
+      "type": ["integer", "null"],
+      "description": "Prompt-cache write/creation tokens. Null when the backend reports no cache info."
+    },
     "cost_usd": {
       "type": [
         "number",

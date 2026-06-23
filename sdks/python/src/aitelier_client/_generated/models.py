@@ -383,6 +383,18 @@ class Run(BaseModel):
     ] = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cached_read_tokens: Annotated[
+        int | None,
+        Field(
+            description='Prompt-cache read tokens (e.g. claude). Null when the backend reports no cache info — distinct from a real 0. Cache-read dominates warm-run volume and is priced far below fresh input.'
+        ),
+    ] = None
+    cached_write_tokens: Annotated[
+        int | None,
+        Field(
+            description='Prompt-cache write/creation tokens. Null when the backend reports no cache info.'
+        ),
+    ] = None
     cost_usd: float | None = None
     finish_reason: str | None = None
     tool_call_count: int | None = None
@@ -448,14 +460,14 @@ class RunEvent(BaseModel):
     kind: Annotated[
         str,
         Field(
-            description='Event family. Common: start, delta, tool_call, tool_result, finish, error, cancelled. Open-ended; new kinds may appear without a schema bump.'
+            description='Event family. Common: start, delta, thought, tool_call, tool_result, finish, error, cancelled, plus agent-path observability — context_usage, plan, mode, available_commands, permission_request, tool_denied. Open-ended; new kinds may appear without a schema bump.'
         ),
     ]
     ts: AwareDatetime | None = None
     payload: Annotated[
         dict[str, Any] | None,
         Field(
-            description="Event-specific fields. delta: {content}. tool_call: {server, tool, input}. tool_result: {tool, output, elapsed_ms}. start: {agent, sandbox, workspace} where sandbox is the symbolic 'local'|'remote' rather than an internal URL."
+            description="Event-specific fields. delta/thought: {content}. tool_call: {server, tool, input, locations, tool_kind}. tool_result: {tool, output, elapsed_ms}. start: {agent, sandbox, workspace} (sandbox is the symbolic 'local'|'remote', not an internal URL). context_usage: {size, used}. permission_request: {tool}. tool_denied: {tool, reason}. cancelled: {content, tool_calls} — partial work captured at cancel time."
         ),
     ] = None
 
