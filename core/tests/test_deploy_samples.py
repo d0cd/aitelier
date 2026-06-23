@@ -46,7 +46,7 @@ def test_brig_cell_yaml_parses():
 
 def test_brig_cell_yaml_declares_minimum_keys():
     """Keys brig expects on every cell definition (cross-checked against
-    hermes-agent's cells/hermes/hermes.yaml)."""
+    a consumer's brig cell definition)."""
     data = yaml.safe_load(_CELL_YAML.read_text())
     required = {"name", "image", "command", "network",
                 "policy", "ingress", "labels"}

@@ -120,7 +120,7 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
     # Hybrid-reasoning models (qwen3 family) default to thinking ON and
     # will silently burn the `num_predict` budget on hidden reasoning under
     # tight max_tokens, returning `content=""` with `finish_reason=length`
-    # — deepread hit this in production for 8 days on qwen3:8b summarize.
+    # — a consumer hit this in production for 8 days on qwen3:8b summarize.
     #
     # OpenAI's canonical ReasoningEffort enum is `minimal | low | medium |
     # high | null`. We map `minimal` → `think: false` (Ollama's binary

@@ -274,8 +274,8 @@ preserved; tests grew from 325 → 363.
 - **Ollama `reasoning_effort` → `think` mapping.** OpenAI's canonical
   enum (`minimal | low | medium | high`) maps to Ollama's binary
   `think` toggle. `minimal` disables thinking; `low|medium|high`
-  enable it; omitted leaves the model default. Fixes deepread's
-  production incident where `qwen3:8b` returned `content=""` with
+  enable it; omitted leaves the model default. Fixes a downstream
+  consumer's production incident where `qwen3:8b` returned `content=""` with
   `finish_reason=length` because thinking consumed the full
   `num_predict` budget.
 - **`POST /v1/runs/{id}/wait`** — block until a run reaches a terminal

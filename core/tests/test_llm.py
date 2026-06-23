@@ -208,8 +208,8 @@ async def test_chat_completion_omits_beta_header_without_cache_control(monkeypat
 @pytest.mark.asyncio
 async def test_list_models_attaches_request_caps(monkeypatch):
     """LLM-routed entries declare the full OpenAI request surface so
-    consumer pickers can pre-strip fields based on the catalog (hermes
-    feedback #2). response_format reflects the per-model registry."""
+    consumer pickers can pre-strip fields based on the catalog (consumer
+    feedback). response_format reflects the per-model registry."""
     fake_client = MagicMock()
     fake_resp = MagicMock()
     fake_resp.status_code = 200
@@ -680,7 +680,7 @@ def test_build_ollama_request_disables_think_for_minimal_effort():
     reasoning. Hybrid-reasoning Ollama models (qwen3) default to thinking
     ON; we map `minimal` to `think: False` so callers running structured-
     output tasks can suppress reasoning and avoid silent empty-content
-    failures under `finish_reason=length`. Deepread filed this after
+    failures under `finish_reason=length`. A consumer reported this after
     qwen3:8b returned empty content on 8 days of summarize calls."""
     out = _build_ollama_request({
         "model": "ollama/qwen3:8b",

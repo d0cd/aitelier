@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: aitelier_local
       POSTGRES_DB: aitelier
     # Host port 5433 (not 5432) so aitelier coexists with other local
-    # Postgres instances (e.g. deepread). Container-internal port is still
+    # Postgres instances. Container-internal port is still
     # 5432. Override DATABASE_URL if you change this.
     ports:
       - "5433:5432"
@@ -23,7 +23,7 @@ services:
     # Pin to an explicit release tag. `main-latest` lags PyPI by weeks; we
     # need at least v1.84.0 for Ollama's `message.thinking` to round-trip
     # to `message.reasoning_content` in OpenAI shape (older builds dropped
-    # it, breaking deepread's `local`-model smoke). Bump deliberately and
+    # it, breaking a consumer's `local`-model smoke). Bump deliberately and
     # re-verify against the live test suite.
     image: ghcr.io/berriai/litellm:v1.84.0
     ports:

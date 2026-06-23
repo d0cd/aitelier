@@ -88,7 +88,7 @@ def test_rate_limit_pattern_does_not_overmatch():
     assert classify_error(RuntimeError("token rate calculation failed")) != "RateLimited"
 
 
-# --- ACP-boundary classification (consumer convergence: dispatcher #1, deepread #9) ---
+# --- ACP-boundary classification (consumer convergence) ---
 
 
 def test_read_timeout_classifies_as_timeout():
