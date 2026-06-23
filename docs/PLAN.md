@@ -251,7 +251,7 @@ accepting them would change *what aitelier is*:
 - Memory / threads / prompt registry / scoring DSL. Consumer concerns;
   refusing keeps the surface honest.
 - Enterprise auth (RBAC, SSO, per-org budgets, audit retention).
-  Personal-runtime positioning means the team-scale ceiling is the
+  Single-user positioning means the team-scale ceiling is the
   feature, not the bug.
 
 ### Structural defensibility

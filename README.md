@@ -1,8 +1,8 @@
 # aitelier
 
-Personal AI runtime. One local HTTP service that's **OpenAI-compatible for
-inference** and exposes an **aitelier-native control plane** for durable run
-state, traces, schedules, async agent submissions, and observability.
+A self-hosted, **OpenAI-compatible gateway** for LLM and coding-agent calls,
+plus an **aitelier-native control plane** for durable run state, traces,
+schedules, async agent submissions, and observability. One local HTTP service.
 
 Backed by LiteLLM (LLM routing), Rivet's Sandbox Agent (isolated coding agents
 behind ACP), and Postgres (durable run/event/schedule/webhook state).

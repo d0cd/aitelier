@@ -1,9 +1,9 @@
 # aitelier (TypeScript)
 
 TypeScript SDK for [aitelier](https://github.com/d0cd/aitelier) — a
-personal AI runtime that speaks **OpenAI shape for inference** and an
-**aitelier-native control plane** for durable runs, traces, schedules,
-and webhook delivery.
+self-hosted, OpenAI-compatible **gateway and control plane** for LLM and
+coding-agent calls: durable runs, traces, schedules, and webhook
+delivery.
 
 ## Install
 

@@ -6,7 +6,7 @@ the system see [PLAN.md](./PLAN.md); for the consumer-facing surface see
 
 ## Summary
 
-`aitelier` is a personal runtime for LLM inference and coding-agent delegation,
+`aitelier` is a self-hosted gateway and control plane for LLM inference and coding-agent delegation,
 exposed as a local HTTP service plus thin SDKs (Python + TypeScript). The
 public contract is OpenAI shape (chat completions, embeddings, models) with
 an aitelier-native control plane for durable run state, traces, schedules,

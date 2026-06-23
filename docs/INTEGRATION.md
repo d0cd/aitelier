@@ -11,7 +11,7 @@ correlation-IDed traces.
 
 ## What aitelier is
 
-A personal AI runtime that puts:
+A self-hosted, OpenAI-compatible gateway and control plane that puts:
 
 - Any LLM behind LiteLLM (Anthropic, OpenAI, Ollama, …) and
 - Any coding agent behind Rivet's Sandbox Agent (Claude Code, Codex, OpenCode, …)

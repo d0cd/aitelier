@@ -1,7 +1,7 @@
 # aitelier
 
-Personal AI runtime — an OpenAI-compatible HTTP service plus an aitelier-native
-control plane for durable run state, traces, schedules, and async agent runs.
+A self-hosted, OpenAI-compatible gateway for LLM and coding-agent calls, plus an
+aitelier-native control plane for durable run state, traces, schedules, and async agent runs.
 
 ## API surface
 
