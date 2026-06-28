@@ -563,18 +563,25 @@ class PostgresStore:
     # Run scores --------------------------------------------------------------
 
     async def add_run_score(self, score: RunScore) -> RunScore:
+        import asyncpg
         async with self._pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO run_scores
-                    (run_id, name, value, evaluator, comment, metadata)
-                VALUES ($1, $2, $3, $4, $5, $6::jsonb)
-                RETURNING id, created_at
-                """,
-                score.run_id, score.name, float(score.value),
-                score.evaluator, score.comment,
-                json.dumps(score.metadata) if score.metadata is not None else None,
-            )
+            try:
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO run_scores
+                        (run_id, name, value, evaluator, comment, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    RETURNING id, created_at
+                    """,
+                    score.run_id, score.name, float(score.value),
+                    score.evaluator, score.comment,
+                    json.dumps(score.metadata) if score.metadata is not None else None,
+                )
+            except asyncpg.ForeignKeyViolationError as exc:
+                # Match InMemoryStore: a score against a non-existent run raises
+                # KeyError on both backends. The endpoint guards with a 404, but
+                # a direct store caller must see identical behavior.
+                raise KeyError(f"run not found: {score.run_id}") from exc
         return RunScore(
             run_id=score.run_id, name=score.name, value=float(score.value),
             evaluator=score.evaluator, comment=score.comment,

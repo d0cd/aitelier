@@ -1144,6 +1144,17 @@ def _stream_error_payload(
     return frame, final
 
 
+def _terminal_state_from_final(final: dict) -> str:
+    """Map a captured `final` dict to a run terminal state. Shared by the agent
+    and LLM streaming finalizers so the state taxonomy can't drift between the
+    two paths."""
+    if final.get("error_type") == "Cancelled":
+        return "cancelled"
+    if final.get("status") == "error":
+        return "failed"
+    return "completed"
+
+
 def _stream_terminal_state(final: dict | None, *, agent_backend: str) -> tuple[dict, str]:
     """Decide the run's terminal state from the captured `final` dict.
 
@@ -1159,12 +1170,7 @@ def _stream_terminal_state(final: dict | None, *, agent_backend: str) -> tuple[d
             "error_msg": "consumer disconnected mid-stream",
             "finish_reason": "cancelled",
         }
-    state = (
-        "cancelled" if final.get("error_type") == "Cancelled"
-        else "failed" if final.get("status") == "error"
-        else "completed"
-    )
-    return final, state
+    return final, _terminal_state_from_final(final)
 
 
 async def _agent_chat_completion_stream(
@@ -1643,11 +1649,7 @@ async def _llm_chat_completion_stream(
                     "error_msg": "consumer disconnected mid-stream",
                     "finish_reason": "cancelled",
                 }
-            state = (
-                "cancelled" if final.get("error_type") == "Cancelled"
-                else "failed" if final.get("status") == "error"
-                else "completed"
-            )
+            state = _terminal_state_from_final(final)
             store = await get_store()
             try:
                 await store.finalize_run(run_id, final, state=state)
@@ -1692,6 +1694,14 @@ def _synth_otel_result(final: dict, model: str) -> dict | None:
 
 _REDACTED = "[redacted]"
 
+# Dict keys whose value is a credential and must be redacted from the wire
+# projection. Matched case-insensitively so `Authorization` redacts the same
+# as `authorization`.
+_SECRET_KEYS = frozenset({
+    "api_key", "apikey", "token", "access_token", "refresh_token",
+    "secret", "client_secret", "password", "passwd", "authorization",
+})
+
 
 def _redact_secrets(value):
     """Strip secret-bearing fields from any dict/list before it crosses the
@@ -1706,19 +1716,22 @@ def _redact_secrets(value):
     if isinstance(value, dict):
         out: dict = {}
         for k, v in value.items():
-            if k in ("headers", "env") and isinstance(v, dict):
+            kl = k.lower() if isinstance(k, str) else k
+            if kl in ("headers", "env") and isinstance(v, dict):
                 # Schema shape for `env` / map-style headers: {name: value}.
                 # Redact values, keep keys for debuggability.
                 out[k] = {k2: _REDACTED for k2 in v}
-            elif k in ("headers", "env") and isinstance(v, list):
+            elif kl in ("headers", "env") and isinstance(v, list):
                 # ACP `[{name, value}]` header shape: keep the name, redact the
-                # value (preserving the documented shape, matching the map case).
+                # value. Non-dict items (e.g. a list of header/env *names*) are
+                # not credentials in this shape — recurse so nested dicts are
+                # still redacted while bare scalars pass through unchanged.
                 out[k] = [
                     {**i, "value": _REDACTED} if isinstance(i, dict) and "value" in i
-                    else (_redact_secrets(i) if isinstance(i, dict) else _REDACTED)
+                    else _redact_secrets(i)
                     for i in v
                 ]
-            elif k in ("api_key", "token", "secret", "authorization"):
+            elif kl in _SECRET_KEYS:
                 out[k] = _REDACTED
             else:
                 out[k] = _redact_secrets(v)

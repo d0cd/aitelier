@@ -764,7 +764,7 @@ def _cancelled_event_payload(text_chunks: list[str], tool_calls: list[dict]) -> 
 
 
 async def _build_done_event(
-    *, client, run_id: str, start: float,
+    *, client: AcpClient, run_id: str, start: float,
     turn_result: dict | None, response_format: dict | None,
     text_chunks: list[str], tool_calls: list[dict],
     emitter: _RunEventEmitter, agent_model: str | None = None,
@@ -985,16 +985,17 @@ def _aggregate_result(
             or turn_result.get("finish_reason")
             or finish_reason
         )
-        # Some agents return the full text in turn_result.content; prefer it if chunks were empty.
-        if not content:
-            tr_content = turn_result.get("content")
-            if isinstance(tr_content, str):
-                content = tr_content
-            elif isinstance(tr_content, list):
-                content = "".join(
-                    c.get("text", "") for c in tr_content
-                    if isinstance(c, dict) and c.get("type") == "text"
-                )
+        # Extract content from turn_result. The streaming caller
+        # (_build_done_event) overrides this with the joined text chunks when
+        # any were emitted; this value is what's used when chunks were empty.
+        tr_content = turn_result.get("content")
+        if isinstance(tr_content, str):
+            content = tr_content
+        elif isinstance(tr_content, list):
+            content = "".join(
+                c.get("text", "") for c in tr_content
+                if isinstance(c, dict) and c.get("type") == "text"
+            )
         # Best-effort usage extraction. Different agent backends surface
         # tokens under different keys; we accept either snake or camel case
         # and the OpenAI-flavored {prompt,completion} or our own
