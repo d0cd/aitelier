@@ -2440,7 +2440,7 @@ def test_chat_completions_503s_when_saturated(client, monkeypatch):
     fake_task.done = MagicMock(return_value=False)
     cap = 4
     monkeypatch.setattr(
-        "aitelier.server.get_config",
+        "aitelier.runtime.get_config",
         lambda: MagicMock(service=MagicMock(
             max_in_flight_runs=cap,
             rate_limit_per_minute=0,
@@ -2472,7 +2472,7 @@ def test_embeddings_503s_when_saturated(client, monkeypatch):
     fake_task.done = MagicMock(return_value=False)
     cap = 3
     monkeypatch.setattr(
-        "aitelier.server.get_config",
+        "aitelier.runtime.get_config",
         lambda: MagicMock(service=MagicMock(
             max_in_flight_runs=cap,
             rate_limit_per_minute=0,
