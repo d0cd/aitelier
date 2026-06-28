@@ -136,6 +136,39 @@ its existing investment. Ranked by alignment with the unique position
 aitelier holds (OpenAI-shape inference + durable Postgres runs + ACP
 agent dispatch + multi-agent via `parent_run_id` + single-user scale).
 
+### Lock-in reduction (low-regret adoption)
+
+aitelier is already "standards-front, native-back": the inference path is the
+OpenAI shape (swap in/out via `base_url`) and traces export over OpenTelemetry
+GenAI — so the only real lock-in is the aitelier-native control plane
+(`/v1/runs`, schedules, scores, webhooks). The directions below push the
+standards line further back, so a project can adopt aitelier and back out of
+nearly all of it cheaply. Deliberately deferred — build the first one when a
+real consumer needs it, not speculatively.
+
+- **OpenAI Responses-API shape for stateful/async runs** (#1 lever). A
+  `/v1/responses`-style surface (with background mode) would extend `base_url`
+  portability up into the run layer — a consumer who outgrows aitelier could
+  migrate to OpenAI's hosted Responses (or any Responses-compatible backend)
+  without rewriting against `/v1/runs`. (Simple message I/O ports directly
+  between Chat Completions and Responses; tool/function schemas would still need
+  mapping — but the common path becomes a `base_url` swap.) Keep `/v1/runs` as
+  the richer native view.
+- **One-command, re-importable full export.** Extend `/v1/runs/export` to a
+  complete open-format dump (runs + events + scores + schedules) that loads
+  elsewhere. "Your data is yours" is the highest-leverage anti-lock-in feature.
+- **Export scores + events over OTel** (not just spans), so leaving = repoint
+  the collector, keep the data.
+- **Standard Webhooks envelope** (standardwebhooks.com) over the existing Bearer
+  auth, for two-way receiver interop.
+- **Graceful degradation of `extra_body.aitelier.*`** as a documented guarantee,
+  so an aitelier-written app still runs against a plain OpenAI endpoint.
+- **Exit map doc** — each endpoint → its point-tool equivalent + the export to
+  carry. Lowers *perceived* lock-in, a real adoption blocker.
+- **Zero-infra "try it" mode** — boot with InMemoryStore + direct provider calls
+  (LiteLLM and Sandbox Agent optional) so evaluation doesn't require standing up
+  the full stack.
+
 ### Tier 1 — leans into aitelier's unique position
 
 - **Agent trace observability + replay** (the "Phase H" idea, now

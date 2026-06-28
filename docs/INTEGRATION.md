@@ -1590,6 +1590,69 @@ tool semantics, embeddings, model listing.
 | `health` | `GET /v1/health` |
 | `get_schema` / `getSchema` | `GET /v1/schemas/{name}` |
 
+## Integrating without lock-in
+
+aitelier is standards-front: the inference surface is the OpenAI shape, traces
+export over OpenTelemetry, and only the control plane (`/v1/runs`, schedules,
+scores) is aitelier-native. So integrate it **asymmetrically** — lean directly
+on the standard parts, and isolate only the native parts. Then adoption is cheap
+and so is exit. These are recognized patterns (hexagonal / ports-and-adapters,
+anti-corruption layer, strangler-fig), applied where they actually pay off.
+
+**Inference path — depend on the standard, don't wrap it.** Point an OpenAI
+client at aitelier; the standard *is* your adapter. Keep aitelier-specific bits
+(`extra_body.aitelier.*`, the `agent:` model prefix) in one request-builder so
+removing them is a single local edit:
+
+```python
+def build_request(prompt, *, agent=False):
+    req = {
+        "model": "agent:claude/claude-sonnet-4-5" if agent else "claude-sonnet",
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if agent:  # the only aitelier-specific surface on this path
+        req["extra_body"] = {"aitelier": {"workspace": "/repo"}}
+    return req
+```
+
+Swapping aitelier → OpenAI / LiteLLM / OpenRouter is then mostly a `base_url`
+change — the common chat path ports cleanly, though advanced surfaces
+(tool/function-calling shapes, provider-specific params) can still need
+per-target adjustment.
+
+**Control plane — put a thin port in front of it.** The runs/scores/schedules
+calls are where lock-in lives, so wrap them behind a small interface with an
+anti-corruption layer, so aitelier's `Run`/`RunScore` shapes never leak into
+your domain:
+
+```python
+class RunStore(Protocol):
+    async def submit(self, spec) -> str: ...
+    async def get(self, run_id: str) -> MyRun: ...      # MyRun is YOUR type
+
+class AitelierRunStore:                                 # one adapter
+    async def submit(self, spec): ...                   # POST /v1/runs
+    async def get(self, run_id):
+        return _to_my_run(await self._client.get_run(run_id))   # ACL maps the shape
+```
+
+Migrating to Temporal / a hosted platform / a Responses-API backend later means
+reimplementing the adapter, not the app — and you can strangler-fig the cutover
+behind the port.
+
+**Observability — consume the standard.** Prefer the OpenTelemetry export plus
+your own correlation IDs (`X-Correlation-Id`) over querying `/v1/traces`
+directly, so your dashboards point at an OTel backend and aitelier is a
+swappable emitter.
+
+**Keep your own system-of-record.** Treat aitelier's `runs`/`scores` as a
+derived, operational store you can rebuild or abandon — never the only place a
+business-critical fact lives.
+
+Net: use aitelier as a standard OpenAI endpoint directly, and port-isolate only
+its native control plane. Both adoption and exit stay cheap — which is the point
+of a self-hosted tool you might outgrow.
+
 ## What aitelier does NOT do
 
 - **Multi-tenancy** — single-developer use; in-process active-run registry is fine.
