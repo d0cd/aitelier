@@ -1520,8 +1520,6 @@ def _http_status_for_agent_error(result: dict) -> int:
         return 429
     if error_type == "AuthError":
         return 401
-    if error_type in ("SchemaViolation", "UnsupportedResponseFormat"):
-        return 400
     return 502
 
 

@@ -16,7 +16,9 @@ def test_agent_error_status_mapping():
     assert _http_status_for_agent_error({"error_type": "ProviderUnavailable"}) == 503
     assert _http_status_for_agent_error({"error_type": "RateLimited"}) == 429
     assert _http_status_for_agent_error({"error_type": "AuthError"}) == 401
-    assert _http_status_for_agent_error({"error_type": "SchemaViolation"}) == 400
+    # Anything else (incl. SchemaViolation/ProviderError) → 502, exactly like
+    # the LLM path's else branch — same error class, same status on both routes.
+    assert _http_status_for_agent_error({"error_type": "SchemaViolation"}) == 502
     assert _http_status_for_agent_error({"error_type": "ProviderError"}) == 502
     # The whole point of the fix: an opaque agent error is 502, never 500.
     assert _http_status_for_agent_error({"error_type": None}) == 502
