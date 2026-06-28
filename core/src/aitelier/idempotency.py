@@ -239,4 +239,3 @@ def release_idempotency_ctx(ctx: IdempotencyContext | None) -> None:
         return
     _release_idempotency_lock(ctx.key, ctx._lock)
     ctx._lock = None
-    ctx._lock = None
