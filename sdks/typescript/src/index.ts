@@ -4,7 +4,7 @@
 
 export { Aitelier } from "./client.js";
 export type { AitelierOptions, SubmitRunOpts } from "./client.js";
-export { verifyWebhookSignature } from "./webhooks.js";
+export { verifyWebhookBearer } from "./webhooks.js";
 export type {
   HealthResponse,
   // Discovery

@@ -552,9 +552,9 @@ preserved; tests grew from 325 → 363.
   the terminal Run on 200; 408 when the timeout elapses with the run
   still pending/running. SDK methods `wait_for_run` (Python) and
   `waitForRun` (TypeScript).
-- **Webhook receiver helpers.** `verify_webhook_signature` (Python)
-  and `verifyWebhookSignature` (TypeScript) implement constant-time
-  HMAC-SHA256 verification so consumers don't roll their own.
+- **Webhook receiver helpers.** `verify_webhook_bearer` (Python)
+  and `verifyWebhookBearer` (TypeScript) implement constant-time
+  Bearer-token verification so consumers don't roll their own.
 - **`examples/` directory** with four runnable recipes: fan-out + merge,
   MCP orchestrator, scheduled audit, webhook receiver.
 - **SDK READMEs** for `aitelier-client`, `aitelier-mcp`, and the

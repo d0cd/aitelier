@@ -159,3 +159,84 @@ async def test_claim_does_not_burn_attempt_then_record_counts_it():
     )
     assert store._webhooks[wid].attempts == 1
     assert store._webhooks[wid].state == "pending"
+
+
+@pytest.mark.asyncio
+async def test_worker_attaches_bearer_header_the_sdk_verifier_accepts(monkeypatch):
+    """Cross-layer contract: the Authorization header the worker emits must be
+    exactly what the shipped SDK `verify_webhook_bearer` accepts. Binds the
+    producer (server) and the verifier (SDK) so they can't silently drift."""
+    from types import SimpleNamespace
+
+    from aitelier_client import verify_webhook_bearer
+
+    secret = "s3cr3t-token"
+    monkeypatch.setattr(
+        "aitelier.config.get_config",
+        lambda: SimpleNamespace(service=SimpleNamespace(
+            webhook_secret=secret, allow_loopback_webhooks=True)),
+    )
+
+    store = await get_store()
+    url = "https://example/bearer-xlayer"
+    await store.enqueue_webhook(url, {"hello": "world"})
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=_mock_http_response(200))
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+        await wh._worker_tick()
+
+    posted = [c for c in fake_client.post.await_args_list if c.args and c.args[0] == url]
+    assert len(posted) == 1
+    sent_auth = posted[0].kwargs["headers"]["Authorization"]
+    assert sent_auth == f"Bearer {secret}"
+    # The exact header the worker sent must verify against the SDK helper the
+    # docs/example tell consumers to use — and fail for the wrong secret.
+    assert verify_webhook_bearer(sent_auth, secret) is True
+    assert verify_webhook_bearer(sent_auth, "wrong-secret") is False
+
+
+@pytest.mark.asyncio
+async def test_delivery_time_ssrf_rejection_marks_failed(monkeypatch):
+    """If the URL no longer resolves public at delivery time (DNS rebinding, or
+    the operator flipped allow_loopback_webhooks off after enqueue), the
+    delivery is marked failed with no retry and no POST fires."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "aitelier.config.get_config",
+        lambda: SimpleNamespace(service=SimpleNamespace(
+            webhook_secret=None, allow_loopback_webhooks=False)),
+    )
+
+    async def _not_public(_url):
+        return False
+
+    # Override the autouse bypass for this test only.
+    monkeypatch.setattr("aitelier.security.is_public_url", _not_public)
+
+    store = await get_store()
+    url = "https://internal-after-rebind/hook"
+    wid = await store.enqueue_webhook(url, {"x": 1})
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=_mock_http_response(200))
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+        await wh._worker_tick()
+
+    # No request fired for this URL, delivery terminally failed (no retry).
+    assert not any(
+        c.args and c.args[0] == url for c in fake_client.post.await_args_list
+    )
+    d = store._webhooks[wid]
+    assert d.state == "failed"
+    assert d.next_attempt_at is None
+    assert "SSRF" in (d.last_error or "")

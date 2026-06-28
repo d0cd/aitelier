@@ -59,13 +59,12 @@ lands on `webhook_url` automatically.
 ## Webhook verification
 
 ```python
-from aitelier_client import verify_webhook_signature
+from aitelier_client import verify_webhook_bearer
 
 @app.post("/webhooks/aitelier")
 async def receive(request: Request):
-    body = await request.body()   # raw bytes — not re-serialized JSON
-    sig = request.headers.get("X-Aitelier-Signature")
-    if not verify_webhook_signature(body, sig, MY_SECRET):
+    auth = request.headers.get("Authorization")
+    if not verify_webhook_bearer(auth, MY_SECRET):
         raise HTTPException(401)
     ...
 ```

@@ -303,8 +303,8 @@ class _WebhookReceiver:
 
     Tests fire an aitelier run with `webhook_url=<receiver.url>`, then call
     `receiver.wait_for(run_id=...)` to block until the matching delivery
-    lands. Headers are preserved (so signature-verification tests can
-    pluck `X-Aitelier-Signature` etc.).
+    lands. Headers are preserved (so auth-verification tests can
+    pluck the `Authorization` bearer header).
 
     Listens on 127.0.0.1:<random-free-port>. Compatible with aitelier
     deployments that can reach the host loopback (host + brig with

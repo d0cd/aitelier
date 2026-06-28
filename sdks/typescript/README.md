@@ -53,32 +53,27 @@ console.log(run.result.content);
 ```
 
 `waitForRun` polls server-side. With a `webhookUrl`, the terminal
-payload (signed) lands at your endpoint automatically.
+payload lands at your endpoint automatically (authenticated with a Bearer token).
 
 ## Webhook verification
 
 ```typescript
 import express from "express";
-import { verifyWebhookSignature } from "aitelier";
+import { verifyWebhookBearer } from "aitelier";
 
 const app = express();
 
-app.post(
-  "/webhooks/aitelier",
-  express.raw({ type: "application/json" }),  // raw bytes — NOT json()
-  (req, res) => {
-    const sig = req.header("X-Aitelier-Signature");
-    if (!verifyWebhookSignature(req.body, sig, process.env.WEBHOOK_SECRET!)) {
-      return res.status(401).send("bad signature");
-    }
-    const payload = JSON.parse(req.body.toString("utf8"));
-    // …handle payload, return 2xx fast.
-    res.json({ ok: true });
+app.post("/webhooks/aitelier", express.json(), (req, res) => {
+  const auth = req.header("Authorization");
+  if (!verifyWebhookBearer(auth, process.env.WEBHOOK_SECRET!)) {
+    return res.status(401).send("unauthorized");
   }
-);
+  // …handle req.body, return 2xx fast.
+  res.json({ ok: true });
+});
 ```
 
-`verifyWebhookSignature` uses `crypto.timingSafeEqual` — constant-time
+`verifyWebhookBearer` uses `crypto.timingSafeEqual` — constant-time
 by construction.
 
 ## Configuration
