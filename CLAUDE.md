@@ -41,7 +41,9 @@ Agent-specific options ride in `extra_body.aitelier.*`:
     "approval_mode": "auto",
     "prepare":  { "commands": [...], "files": [...], "sidecars": [...] },
     "artifacts": { "fetch": ["/workspace/out.json"] },
-    "trace_tag": "audit-run-2026-05"
+    "trace_tag": "audit-run-2026-05",
+    "parent_run_id": "<dispatching agent's run id, for multi-agent linking>",
+    "examples": [{"input": "...", "output": "..."}]
   }
 }
 ```
@@ -78,6 +80,7 @@ transports that emit a global toolset they can't suppress per-request.
 - `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
 - `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
 - `GET  /v1/health`, `GET /v1/discovery`, `GET /v1/metrics` — liveness + endpoint inventory + dependency probes + runtime counters
+- `GET  /v1/schemas/{name}` — fetch a control-plane JSON Schema by name (also surfaced in `/v1/discovery`)
 - `GET  /ui` (+ `/` redirect) — read-only static dashboard over `/v1/runs*` + `/v1/traces/aggregates` (no build step; public path, data calls still gated)
 
 All requests accept `X-Correlation-Id` (generated if absent), echoed in

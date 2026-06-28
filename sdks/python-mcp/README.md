@@ -3,13 +3,18 @@
 A small [Model Context Protocol](https://modelcontextprotocol.io/) server
 that exposes [aitelier](https://github.com/d0cd/aitelier)'s control plane
 as MCP tools. Load it into an agent's `mcp_servers` block and the
-agent's tool-use loop gains five new tools:
+agent's tool-use loop gains these tools:
 
-- `submit_run` — dispatch a child agent run
-- `get_run` — fetch a single run's state
-- `list_runs` — filter by `parent_run_id`, `trace_tag`, `state`
-- `list_run_events` — full durable event timeline
-- `cancel_run` — cancel an in-flight run
+*Runs* — `submit_run` (dispatch a child agent run), `get_run` (fetch one
+run's state), `wait_for_run` (block until terminal), `list_runs` (filter by
+`parent_run_id` / `trace_tag` / `state`), `list_run_events` (durable event
+timeline), `list_active_runs` (in-flight runs), `cancel_run`, and
+`get_my_run_id` (the calling agent's own run id, for parent/child linking).
+
+*Scores & traces* — `add_run_score` / `list_run_scores` (eval write-back +
+history), `recent_traces` / `aggregate_traces` (trace queries + aggregates).
+
+*Discovery* — `discovery` (live endpoint + dependency inventory).
 
 Aitelier becomes the substrate; the **parent agent** is the conductor.
 Whatever orchestration shape it picks turn-by-turn — fan-out, sequential

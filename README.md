@@ -43,6 +43,8 @@ resp = await openai.chat.completions.create(
         "workspace": "/path/to/repo",
         "reasoning_effort": "high",   # mapped to the backend's advertised levels
         "approval_mode": "auto",      # sandbox/approval preset
+        # full option set (mcp_servers, prepare, artifacts, parent_run_id,
+        # examples, …) at GET /v1/schemas/aitelier_request
     }},
 )
 ```

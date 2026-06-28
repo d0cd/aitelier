@@ -1279,8 +1279,11 @@ aitelier supports two modes:
 - **Localhost-trust** (default) — `127.0.0.1` bind, no auth required. Any
   process on the host can call. SSRF guards are off for ergonomic dev.
 - **Hosted mode** — set `[service] api_key`. Every `/v1/*` except
-  `/v1/health` requires `Authorization: Bearer <key>`. SSRF guard activates
-  on webhook URLs (no loopback / private ranges / metadata services).
+  `/v1/health` requires `Authorization: Bearer <key>`. The unauthenticated
+  paths are `/v1/health`, `/`, and `/ui` — the dashboard HTML shell is public,
+  but its underlying `/v1/runs*` + `/v1/traces/aggregates` data calls are still
+  gated. SSRF guard activates on webhook URLs (no loopback / private ranges /
+  metadata services).
 
 Always combine hosted mode with TLS termination upstream. Bearer over
 plain HTTP is unsafe.
