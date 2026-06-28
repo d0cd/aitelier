@@ -23,6 +23,8 @@ Robustness:
 """
 from __future__ import annotations
 
+import re
+
 # Validated against LiteLLM's model_prices map on this date — bump when the
 # drift check flags a change (see scripts/check-model-prices.py).
 PRICES_AS_OF = "2026-06-10"
@@ -45,16 +47,28 @@ _PRICES: dict[str, dict[str, float]] = {
 }
 
 
+# A trailing release-date suffix like `-20250929` (the only fuzzy match we
+# allow). A new *version* suffix that isn't a date is NOT stripped.
+_DATE_SUFFIX = re.compile(r"-20\d{6}$")
+
+
 def _resolve(model: str) -> dict[str, float] | None:
-    """Map a possibly-decorated model id to its rate row. Strips a provider
-    prefix (`anthropic/…`) and matches the longest table key that prefixes the
-    id, so date-suffixed ids (`…-4-5-20250929`) and family ids both resolve."""
+    """Map a possibly-decorated model id to its rate row, or None.
+
+    Strips a provider prefix (`anthropic/…`) and a trailing release-date suffix
+    (`…-4-5-20250929`), then matches the table exactly. A genuinely new version
+    whose suffix is NOT a date (e.g. a future `claude-opus-4-5` vs the existing
+    `claude-opus-4` family key) is deliberately NOT prefix-matched: it resolves
+    to None (honest null) rather than silently inheriting an older model's rate,
+    which would emit a wrong cost and slip past the drift check (which only
+    compares exact table keys).
+    """
     m = model.split("/")[-1].strip().lower()
     if m in _PRICES:
         return _PRICES[m]
-    for key in sorted(_PRICES, key=len, reverse=True):
-        if m.startswith(key):
-            return _PRICES[key]
+    stripped = _DATE_SUFFIX.sub("", m)
+    if stripped != m and stripped in _PRICES:
+        return _PRICES[stripped]
     return None
 
 

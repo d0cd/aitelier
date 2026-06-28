@@ -1999,8 +1999,9 @@ def test_agent_sidecars_stopped_even_after_agent_error(client):
                               "args": ["x.py"]}],
             },
         ))
-    # Agent errored → 500 from chat/completions; sidecars stopped anyway.
-    assert resp.status_code == 500
+    # Agent errored → 502 (bad gateway) from chat/completions, not a
+    # misleading 500; sidecars stopped anyway.
+    assert resp.status_code == 502
     assert len(started_ids) == 1
     assert len(stop_calls) == 1
 

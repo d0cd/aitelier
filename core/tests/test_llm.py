@@ -715,6 +715,19 @@ def test_build_ollama_request_prefers_max_completion_tokens():
     assert out["options"]["num_predict"] == 500
 
 
+def test_build_ollama_request_preserves_explicit_zero_max_tokens():
+    """An explicit max_completion_tokens=0 must be honored, not silently
+    replaced by max_tokens via a lossy `or` (it's a real, if degenerate,
+    caller value)."""
+    out = _build_ollama_request({
+        "model": "local",
+        "messages": [],
+        "max_completion_tokens": 0,
+        "max_tokens": 100,
+    }, stream=False)
+    assert out["options"]["num_predict"] == 0
+
+
 def test_build_ollama_request_response_format_json_object():
     out = _build_ollama_request({
         "model": "local",

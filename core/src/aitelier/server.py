@@ -1001,10 +1001,12 @@ async def _agent_chat_completion(
     )
 
     if result.get("status") == "error":
-        status, body = agent_error_to_chat_completion_error(result)
-        body["aitelier_status_code"] = status
-        body["correlation_id"] = cid
-        return body
+        result.setdefault(
+            "_aitelier_http_status", _http_status_for_agent_error(result)
+        )
+        return chat_completion_error_envelope(
+            result, run_id=run_id, correlation_id=cid,
+        )
 
     response = agent_result_to_chat_completion(
         result, request_model=req.model, run_id=run_id,
@@ -1478,6 +1480,26 @@ def _http_status_for_llm_error(exc: LLMError) -> int:
         return 504
     if exc.error_type == "ProviderUnavailable":
         return 503
+    return 502
+
+
+def _http_status_for_agent_error(result: dict) -> int:
+    """Map an agent-path error result onto an HTTP status, mirroring
+    `_http_status_for_llm_error` so the same failure class returns the same
+    status regardless of route (LLM vs agent). Agent errors carry the same
+    `error_type` taxonomy (`classify_error`); 502 is the catch-all for opaque
+    upstream/agent failures — never a misleading 500."""
+    error_type = result.get("error_type")
+    if error_type == "Timeout":
+        return 504
+    if error_type == "ProviderUnavailable":
+        return 503
+    if error_type == "RateLimited":
+        return 429
+    if error_type == "AuthError":
+        return 401
+    if error_type in ("SchemaViolation", "UnsupportedResponseFormat"):
+        return 400
     return 502
 
 

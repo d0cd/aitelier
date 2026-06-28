@@ -137,9 +137,18 @@ async def _run_tick(now: datetime,
         if not s.next_run_at or s.next_run_at > now:
             continue
         # Per-schedule isolation: a dispatch or run-time-update failure on one
-        # schedule must not abort the remaining due schedules in this tick. A
-        # schedule whose `update_schedule_run_times` failed keeps its old
-        # next_run_at and simply re-fires next tick (at-least-once).
+        # schedule must not abort the remaining due schedules in this tick.
+        #
+        # Delivery is AT-MOST-ONCE: next_run_at is advanced as soon as the
+        # handler is *dispatched* (below), not after it completes. A process
+        # crash between dispatch and completion drops that one interval's run —
+        # the schedule simply fires again at its next interval. Advancing
+        # immediately is deliberate: it stops a long-running handler from being
+        # re-fired on every tick while it's still in flight. (A claim-and-
+        # complete protocol for at-least-once is deferred under the same
+        # single-process rationale as the list-then-update note above.)
+        # Handler failures are still surfaced — the handler records a failed
+        # run + error webhook; only a hard crash mid-handler loses the run.
         try:
             logger.info("Firing schedule %s (%s)", s.id, s.name)
             # Hand the handler the unredacted task — it needs real

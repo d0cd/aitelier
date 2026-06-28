@@ -79,7 +79,9 @@ def _build_ollama_request(body: dict, *, stream: bool) -> dict:
     # to `max_tokens` for legacy/non-reasoning calls. Either maps to Ollama's
     # `num_predict` (total output budget; Ollama doesn't split visible vs
     # reasoning the way OpenAI does).
-    mct = body.get("max_completion_tokens") or body.get("max_tokens")
+    mct = body.get("max_completion_tokens")
+    if mct is None:
+        mct = body.get("max_tokens")
     if mct is not None:
         options["num_predict"] = int(mct)
     if body.get("temperature") is not None:

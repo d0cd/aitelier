@@ -77,3 +77,18 @@ def test_find_price_drift_detects_changed_rate():
 def test_find_price_drift_ignores_models_not_in_map():
     """Models LiteLLM doesn't list are skipped (can't compare) — not drift."""
     assert find_price_drift({}) == []
+
+
+def test_compute_cost_new_version_suffix_resolves_to_none():
+    """A genuinely new same-family version (a non-date suffix) must NOT inherit
+    an older family's rate by prefix match — it returns None (honest null) so
+    both the fail-safe and the drift check hold. Only a release-date suffix of a
+    known model resolves."""
+    usage = {"input_tokens": 1000, "output_tokens": 0}
+    # `claude-opus-4` is a family key; a future `claude-opus-4-5`/`-4-1` priced
+    # differently must not silently inherit the opus-4 rate.
+    assert compute_cost("claude-opus-4-5", usage) is None
+    assert compute_cost("claude-opus-4-1", usage) is None
+    # A release-date-suffixed id of a known model still resolves (date stamp).
+    assert (compute_cost("claude-opus-4-20250514", usage)
+            == compute_cost("claude-opus-4", usage))
