@@ -22,7 +22,7 @@ use a CLI flag or write to one of the overlays.
 from __future__ import annotations
 
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 _DEFAULT_SEARCH_PATHS = [
@@ -270,6 +270,15 @@ def _read_toml(path: Path) -> dict:
         raise RuntimeError(f"failed to parse {path}: {e}") from e
 
 
+def _build_section(cls, data: dict):
+    """Instantiate a config dataclass from the TOML keys that match its fields;
+    dataclass defaults fill the rest. Iterating `fields(cls)` means a newly
+    added field is wired automatically — there's no separate `.get()` line to
+    forget, which would otherwise silently drop the operator's TOML value."""
+    names = {f.name for f in fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in names})
+
+
 def load_config(path: Path | None = None) -> Config:
     """Load layered config. See module docstring for layer order."""
     # Layer 2: base config
@@ -307,75 +316,14 @@ def load_config(path: Path | None = None) -> Config:
     storage = _section("storage")
 
     return Config(
-        litellm=LiteLLMConfig(
-            base_url=litellm.get("base_url", LiteLLMConfig.base_url),
-            api_key=litellm.get("api_key", LiteLLMConfig.api_key),
-        ),
-        sandbox_agent=SandboxAgentConfig(
-            mode=sandbox_agent.get("mode", SandboxAgentConfig.mode),
-            base_url=sandbox_agent.get("base_url", SandboxAgentConfig.base_url),
-            token=sandbox_agent.get("token", SandboxAgentConfig.token),
-        ),
-        service=ServiceConfig(
-            host=service.get("host", ServiceConfig.host),
-            port=service.get("port", ServiceConfig.port),
-            api_key=service.get("api_key", ServiceConfig.api_key),
-            webhook_secret=service.get("webhook_secret", ServiceConfig.webhook_secret),
-            log_format=service.get("log_format", ServiceConfig.log_format),
-            max_in_flight_runs=service.get(
-                "max_in_flight_runs", ServiceConfig.max_in_flight_runs,
-            ),
-            allow_loopback_webhooks=service.get(
-                "allow_loopback_webhooks",
-                ServiceConfig.allow_loopback_webhooks,
-            ),
-            max_request_body_bytes=service.get(
-                "max_request_body_bytes", ServiceConfig.max_request_body_bytes,
-            ),
-            rate_limit_per_minute=service.get(
-                "rate_limit_per_minute", ServiceConfig.rate_limit_per_minute,
-            ),
-            allowed_workspace_roots=list(service.get(
-                "allowed_workspace_roots", [],
-            ) or []),
-        ),
-        ollama=OllamaConfig(
-            mode=ollama.get("mode", OllamaConfig.mode),
-            base_url=ollama.get("base_url", OllamaConfig.base_url),
-            default_model=ollama.get("default_model", OllamaConfig.default_model),
-        ),
-        database=DatabaseConfig(
-            url=database.get("url", DatabaseConfig.url),
-        ),
-        storage=StorageConfig(
-            max_metadata_bytes=storage.get("max_metadata_bytes", StorageConfig.max_metadata_bytes),
-        ),
-        purge=PurgeConfig(
-            interval_seconds=_section("purge").get(
-                "interval_seconds", PurgeConfig.interval_seconds,
-            ),
-            webhook_retention_days=_section("purge").get(
-                "webhook_retention_days", PurgeConfig.webhook_retention_days,
-            ),
-            event_retention_days=_section("purge").get(
-                "event_retention_days", PurgeConfig.event_retention_days,
-            ),
-            run_retention_days=_section("purge").get(
-                "run_retention_days", PurgeConfig.run_retention_days,
-            ),
-        ),
-        otel=OtelConfig(
-            enabled=_section("otel").get("enabled", OtelConfig.enabled),
-            endpoint=_section("otel").get("endpoint", OtelConfig.endpoint),
-            protocol=_section("otel").get("protocol", OtelConfig.protocol),
-            insecure=_section("otel").get("insecure", OtelConfig.insecure),
-            service_name=_section("otel").get(
-                "service_name", OtelConfig.service_name,
-            ),
-            capture_content=_section("otel").get(
-                "capture_content", OtelConfig.capture_content,
-            ),
-        ),
+        litellm=_build_section(LiteLLMConfig, litellm),
+        sandbox_agent=_build_section(SandboxAgentConfig, sandbox_agent),
+        service=_build_section(ServiceConfig, service),
+        ollama=_build_section(OllamaConfig, ollama),
+        database=_build_section(DatabaseConfig, database),
+        storage=_build_section(StorageConfig, storage),
+        purge=_build_section(PurgeConfig, _section("purge")),
+        otel=_build_section(OtelConfig, _section("otel")),
         runs_dir=raw.get("runs_dir", "runs"),
     )
 

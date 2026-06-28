@@ -29,6 +29,9 @@ dev = [
     # input to require modular/package output and breaks our
     # `--input schemas/v1 --output _generated/models.py` single-file flow
     # ("Modular references require an output directory"); 0.60 didn't fix it.
-    # Pin below 0.57 until the directory→single-file path is restored upstream.
+    # Pin below 0.57 until upstream restores directory→single-file output.
+    # To lift the pin: bump the ceiling, run scripts/generate-types.sh, and
+    # confirm it produces an identical models.py; track upstream at
+    # https://github.com/koxudaxi/datamodel-code-generator/issues
     "datamodel-code-generator>=0.25,<0.57",
 ]
