@@ -684,7 +684,7 @@ def test_llm_chat_completions_endpoint_emits_span():
     invoke `record_inference_span` after the run is recorded. Proves the
     call site at the end of `_llm_chat_completion` is wired."""
     with _tracer_and_client() as (client, exporter):
-        with patch("aitelier.server.chat_completion",
+        with patch("aitelier.inference_exec.chat_completion",
                     new_callable=AsyncMock,
                     return_value=_openai_chat_response()):
             resp = client.post("/v1/chat/completions", json={
@@ -746,7 +746,7 @@ def test_agent_chat_completions_endpoint_emits_span(monkeypatch):
             "error_type": None, "error_msg": None,
         }
 
-    monkeypatch.setattr("aitelier.server._run_prepare", fake_prepare)
+    monkeypatch.setattr("aitelier.inference_exec._run_prepare", fake_prepare)
     monkeypatch.setattr(
         "aitelier.providers.sandbox_agent.call_via_sandbox", fake_call,
     )
@@ -781,7 +781,7 @@ def test_llm_chat_completions_stream_endpoint_emits_span():
         }
 
     with _tracer_and_client() as (client, exporter):
-        with patch("aitelier.server.chat_completion_stream", fake_stream):
+        with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
             resp = client.post("/v1/chat/completions", json={
                 "model": "claude-sonnet",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -939,9 +939,9 @@ def test_agent_chat_completions_stream_endpoint_emits_span(monkeypatch):
         from aitelier.server import _STREAM_QUEUE_SENTINEL
         await queue.put(_STREAM_QUEUE_SENTINEL)
 
-    monkeypatch.setattr("aitelier.server._run_prepare", fake_prepare)
+    monkeypatch.setattr("aitelier.inference_exec._run_prepare", fake_prepare)
     monkeypatch.setattr(
-        "aitelier.server._producer_for_acp_stream", fake_producer,
+        "aitelier.inference_exec._producer_for_acp_stream", fake_producer,
     )
 
     import time as _time

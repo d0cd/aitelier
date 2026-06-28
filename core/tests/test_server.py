@@ -838,7 +838,7 @@ def test_fold_response_format_no_op_for_other_types():
 def test_chat_completions_does_not_emit_aitelier_trace_id(client):
     """aitelier_trace_id was always identical to aitelier_run_id and is
     now removed. Regression guard so it doesn't sneak back."""
-    with patch("aitelier.server.chat_completion",
+    with patch("aitelier.inference_exec.chat_completion",
                 new_callable=AsyncMock, return_value=_openai_chat_response()):
         resp = client.post("/v1/chat/completions", json={
             "model": "claude-sonnet",
@@ -879,7 +879,7 @@ def _openai_chat_response(content: str = "Hello!") -> dict:
 
 
 def test_chat_completions_llm_path(client):
-    with patch("aitelier.server.chat_completion",
+    with patch("aitelier.inference_exec.chat_completion",
                 new_callable=AsyncMock, return_value=_openai_chat_response()):
         resp = client.post("/v1/chat/completions", json={
             "model": "claude-sonnet",
@@ -1162,7 +1162,7 @@ def test_run_not_found(client):
 def test_chat_completions_surfaces_aitelier_parsed_for_json_response_format(client):
     fenced = "```json\n{\"answer\": 42}\n```"
     upstream = _openai_chat_response(content=fenced)
-    with patch("aitelier.server.chat_completion",
+    with patch("aitelier.inference_exec.chat_completion",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/chat/completions", json={
             "model": "claude-sonnet",
@@ -1189,7 +1189,7 @@ def test_chat_completions_stamps_aitelier_exit_empty(client):
         }],
         "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35},
     }
-    with patch("aitelier.server.chat_completion",
+    with patch("aitelier.inference_exec.chat_completion",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/chat/completions", json={
             "model": "local",
@@ -1215,7 +1215,7 @@ def test_chat_completions_no_empty_signal_when_reasoning_present(client):
         }],
         "usage": {"prompt_tokens": 5, "completion_tokens": 30, "total_tokens": 35},
     }
-    with patch("aitelier.server.chat_completion",
+    with patch("aitelier.inference_exec.chat_completion",
                 new_callable=AsyncMock, return_value=upstream):
         resp = client.post("/v1/chat/completions", json={
             "model": "local",
@@ -1617,7 +1617,7 @@ def test_schema_path_traversal(client):
 
 
 def test_correlation_id_echoed(client):
-    with patch("aitelier.server.chat_completion", new_callable=AsyncMock,
+    with patch("aitelier.inference_exec.chat_completion", new_callable=AsyncMock,
                return_value=_openai_chat_response()):
         resp = client.post(
             "/v1/chat/completions",
@@ -1631,7 +1631,7 @@ def test_correlation_id_echoed(client):
 
 
 def test_correlation_id_generated_when_absent(client):
-    with patch("aitelier.server.chat_completion", new_callable=AsyncMock,
+    with patch("aitelier.inference_exec.chat_completion", new_callable=AsyncMock,
                return_value=_openai_chat_response()):
         resp = client.post(
             "/v1/chat/completions",
@@ -1645,7 +1645,7 @@ def test_correlation_id_generated_when_absent(client):
 
 def test_correlation_id_persisted_in_trace_metadata(client):
     """Correlation ID should land on the durable run record."""
-    with patch("aitelier.server.chat_completion", new_callable=AsyncMock,
+    with patch("aitelier.inference_exec.chat_completion", new_callable=AsyncMock,
                 return_value=_openai_chat_response()):
         resp = client.post(
             "/v1/chat/completions",
@@ -1685,7 +1685,7 @@ def test_chat_completions_stream_yields_openai_chunks(client):
             "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
         }
 
-    with patch("aitelier.server.chat_completion_stream", fake_stream):
+    with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
         resp = client.post(
             "/v1/chat/completions",
             json={"model": "claude-sonnet",
@@ -1709,7 +1709,7 @@ def test_chat_completions_stream_error_event_on_failure(client):
         from aitelier.providers.llm import LLMError
         raise LLMError("ProviderError", "boom")
 
-    with patch("aitelier.server.chat_completion_stream", fake_stream):
+    with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
         resp = client.post(
             "/v1/chat/completions",
             json={"model": "claude-sonnet",
@@ -1740,7 +1740,7 @@ def _runs_from_store():
 
 
 def test_chat_completions_records_trace(client):
-    with patch("aitelier.server.chat_completion", new_callable=AsyncMock,
+    with patch("aitelier.inference_exec.chat_completion", new_callable=AsyncMock,
                 return_value=_openai_chat_response()):
         resp = client.post(
             "/v1/chat/completions",
@@ -1781,7 +1781,7 @@ def test_chat_completions_stream_records_trace_at_done(client):
                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                           "total_tokens": 2}}
 
-    with patch("aitelier.server.chat_completion_stream", fake_stream):
+    with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
         resp = client.post(
             "/v1/chat/completions",
             json={"model": "claude-sonnet",
@@ -2294,7 +2294,7 @@ def test_chat_completions_agent_stream_emits_keepalive_during_silence(
     """A long silent planning phase from the inner agent emits an SSE
     comment frame, keeping reverse proxies and consumer read timeouts
     from tearing down the connection mid-run."""
-    monkeypatch.setattr("aitelier.server._SSE_KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr("aitelier.inference_exec._SSE_KEEPALIVE_SECONDS", 0.05)
 
     async def fake_stream(name, prompt, **kwargs):
         import asyncio
@@ -2329,7 +2329,7 @@ def test_chat_completions_agent_stream_keepalive_fires_during_dropped_events(
     events feed the queue but produce no visible chunks, so the
     consumer sees a silent stream without compensating keepalive frames.
     Track time-since-last-yield, not queue-get timeouts."""
-    monkeypatch.setattr("aitelier.server._SSE_KEEPALIVE_SECONDS", 0.05)
+    monkeypatch.setattr("aitelier.inference_exec._SSE_KEEPALIVE_SECONDS", 0.05)
 
     async def fake_stream(name, prompt, **kwargs):
         import asyncio
@@ -2989,7 +2989,7 @@ def test_correlation_id_propagates_to_log_records(client, caplog):
         return _openai_chat_response()
 
     with caplog.at_level(logging.INFO, logger="aitelier"):
-        with patch("aitelier.server.chat_completion",
+        with patch("aitelier.inference_exec.chat_completion",
                    new_callable=AsyncMock, side_effect=emit_and_complete):
             resp = client.post(
                 "/v1/chat/completions",
@@ -3035,7 +3035,7 @@ def test_correlation_id_in_sse_events(client):
                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                           "total_tokens": 2}}
 
-    with patch("aitelier.server.chat_completion_stream", fake_stream):
+    with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
         resp = client.post(
             "/v1/chat/completions",
             json={"model": "claude-sonnet",
@@ -3325,7 +3325,7 @@ def test_chat_completions_stream_finalizes_when_aborted_midstream(client):
                             "finish_reason": None}]}
         raise RuntimeError("abort mid-stream")  # not LLMError → final stays None
 
-    with patch("aitelier.server.chat_completion_stream", fake_stream):
+    with patch("aitelier.inference_exec.chat_completion_stream", fake_stream):
         try:
             client.post(
                 "/v1/chat/completions",

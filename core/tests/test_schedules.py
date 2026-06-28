@@ -237,7 +237,7 @@ async def test_schedule_handler_routes_llm_task(monkeypatch):
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }
 
-    monkeypatch.setattr("aitelier.server.chat_completion", fake_chat_completion)
+    monkeypatch.setattr("aitelier.inference_exec.chat_completion", fake_chat_completion)
     monkeypatch.setattr(
         "aitelier.server._enqueue_webhook",
         AsyncMock(),
