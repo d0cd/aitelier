@@ -22,6 +22,7 @@ from aitelier.schedules import (
     get_schedule,
     list_schedules,
 )
+from aitelier.security import validate_path_component
 
 router = APIRouter()
 
@@ -47,9 +48,8 @@ async def create_schedule_endpoint(req: ScheduleRequest) -> dict:
 
 @router.get("/v1/schedules/{schedule_id}")
 async def get_schedule_endpoint(schedule_id: str) -> dict:
-    from aitelier.server import _validate_path_component
 
-    _validate_path_component(schedule_id, "schedule_id")
+    validate_path_component(schedule_id, "schedule_id")
     entry = await get_schedule(schedule_id)
     if not entry:
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
@@ -58,9 +58,8 @@ async def get_schedule_endpoint(schedule_id: str) -> dict:
 
 @router.delete("/v1/schedules/{schedule_id}")
 async def delete_schedule_endpoint(schedule_id: str) -> dict:
-    from aitelier.server import _validate_path_component
 
-    _validate_path_component(schedule_id, "schedule_id")
+    validate_path_component(schedule_id, "schedule_id")
     if not await delete_schedule(schedule_id):
         raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
     return {"id": schedule_id, "deleted": True}

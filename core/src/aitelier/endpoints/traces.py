@@ -2,7 +2,8 @@
 
 Routes registered on this module's `router` and included into the main
 app in `server.py`. Same lazy-import pattern as `endpoints/runs.py` for
-server-side helpers (_run_to_trace_dict, _validate_path_component).
+server-side projection helpers (_run_to_trace_dict); path components are
+validated via aitelier.security.validate_path_component.
 
 Endpoints surfaced here:
 - GET    /v1/traces                   — list runs as TraceRecord summaries
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
+from aitelier.security import validate_path_component
 from aitelier.storage import RunFilter, get_store
 
 router = APIRouter()
@@ -76,9 +78,9 @@ async def traces_aggregates_endpoint(
 @router.get("/v1/traces/{trace_id}")
 async def get_trace_endpoint(trace_id: str) -> dict:
     """Get a single trace by ID. Same data as /v1/runs/{id} in TraceRecord shape."""
-    from aitelier.server import _run_to_trace_dict, _validate_path_component
+    from aitelier.server import _run_to_trace_dict
 
-    _validate_path_component(trace_id, "trace_id")
+    validate_path_component(trace_id, "trace_id")
     store = await get_store()
     run = await store.get_run(trace_id)
     if not run:

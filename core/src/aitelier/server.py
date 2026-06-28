@@ -37,6 +37,13 @@ from aitelier.openai_compat import (
     stream_final_extras,
     summarize_tool_calls,
 )
+from aitelier.probes import (  # noqa: F401  (re-exported for endpoints)
+    _normalize_agents_payload,
+    _probe_litellm,
+    _probe_sandbox_agent,
+    _probe_traces,
+    _sandbox_agents_request,
+)
 from aitelier.providers.llm import (
     LLMError,
     UnsupportedResponseFormat,
@@ -58,9 +65,18 @@ from aitelier.sandbox_proxy import (
 from aitelier.sandbox_proxy import (
     stop_sidecars as _stop_sidecars,
 )
-from aitelier.security import is_public_url
-from aitelier.security import validate_path_component as _validate_path_component
-from aitelier.storage import RunFilter, RunSpec, get_store
+from aitelier.security import is_public_url, validate_path_component
+from aitelier.serializers import (  # noqa: F401  (re-exported for endpoints/tests)
+    _REDACTED,
+    _SECRET_KEYS,
+    _TRACE_RECORD_KEYS,
+    _duration_ms,
+    _event_to_dict,
+    _redact_secrets,
+    _run_to_dict,
+    _run_to_trace_dict,
+)
+from aitelier.storage import RunSpec, get_store
 
 logger = logging.getLogger("aitelier")
 
@@ -1692,159 +1708,6 @@ def _synth_otel_result(final: dict, model: str) -> dict | None:
     }
 
 
-_REDACTED = "[redacted]"
-
-# Dict keys whose value is a credential and must be redacted from the wire
-# projection. Matched case-insensitively so `Authorization` redacts the same
-# as `authorization`.
-_SECRET_KEYS = frozenset({
-    "api_key", "apikey", "token", "access_token", "refresh_token",
-    "secret", "client_secret", "password", "passwd", "authorization",
-})
-
-
-def _redact_secrets(value):
-    """Strip secret-bearing fields from any dict/list before it crosses the
-    HTTP boundary.
-
-    Authenticated callers reading `/v1/runs/{id}` or `/v1/schedules*` get
-    `environment.mcp_servers[*].headers` (Bearer tokens for third-party MCP
-    servers) and `prepare.commands[*].env` (DB DSNs, registry creds) back
-    verbatim otherwise. Stored runs / schedules keep the original values —
-    only the wire projection is redacted. The Sandbox Agent still receives
-    real values at dispatch time."""
-    if isinstance(value, dict):
-        out: dict = {}
-        for k, v in value.items():
-            kl = k.lower() if isinstance(k, str) else k
-            if kl in ("headers", "env") and isinstance(v, dict):
-                # Schema shape for `env` / map-style headers: {name: value}.
-                # Redact values, keep keys for debuggability.
-                out[k] = {k2: _REDACTED for k2 in v}
-            elif kl in ("headers", "env") and isinstance(v, list):
-                # ACP `[{name, value}]` header shape: keep the name, redact the
-                # value. Non-dict items (e.g. a list of header/env *names*) are
-                # not credentials in this shape — recurse so nested dicts are
-                # still redacted while bare scalars pass through unchanged.
-                out[k] = [
-                    {**i, "value": _REDACTED} if isinstance(i, dict) and "value" in i
-                    else _redact_secrets(i)
-                    for i in v
-                ]
-            elif kl in _SECRET_KEYS:
-                out[k] = _REDACTED
-            else:
-                out[k] = _redact_secrets(v)
-        return out
-    if isinstance(value, list):
-        return [_redact_secrets(item) for item in value]
-    return value
-
-
-# Field set for the TraceRecord shape on /v1/traces — a strict subset of the
-# Run dict. Kept narrower than _run_to_dict so /v1/traces stays focused on
-# the observability summary while /v1/runs surfaces operational fields
-# (state, sandbox info, environment).
-_TRACE_RECORD_KEYS = frozenset({
-    "trace_id", "started_at", "ended_at", "duration_ms", "model", "kind",
-    "finish_reason", "tool_call_count", "input_tokens", "output_tokens",
-    "total_tokens", "cost_usd", "system_prompt_hash", "trace_tag",
-    "parent_run_id", "status", "error_type", "error_msg", "metadata",
-})
-
-
-def _duration_ms(run) -> int | None:
-    """Wall-clock run duration in milliseconds (ended − started), or None
-    when the run hasn't ended. Precomputed so dashboards don't re-derive it;
-    maps to the OTel span duration."""
-    if run.started_at and run.ended_at:
-        return round((run.ended_at - run.started_at).total_seconds() * 1000)
-    return None
-
-
-def _run_to_dict(run) -> dict:
-    """Canonical Run → dict converter used by /v1/runs*.
-
-    Includes every operational field: state, sandbox info, environment,
-    error info, tokens, cost. The narrower TraceRecord projection for
-    /v1/traces is derived from this via `_run_to_trace_dict`.
-    """
-    return {
-        "run_id": run.run_id,
-        "trace_id": run.run_id,
-        "state": run.state,
-        "kind": run.kind,
-        "agent_id": run.agent_id,
-        "model": run.model,
-        "started_at": run.started_at.isoformat() if run.started_at else None,
-        "ended_at": run.ended_at.isoformat() if run.ended_at else None,
-        "duration_ms": _duration_ms(run),
-        "trace_tag": run.trace_tag,
-        "correlation_id": run.correlation_id,
-        "parent_run_id": run.parent_run_id,
-        "sandbox_backend": run.sandbox_backend,
-        "sandbox_url": run.sandbox_url,
-        "sandbox_server_id": run.sandbox_server_id,
-        "workspace": run.workspace,
-        "environment": _redact_secrets(run.environment),
-        "input_tokens": run.input_tokens,
-        "output_tokens": run.output_tokens,
-        "total_tokens": run.total_tokens,
-        "cached_read_tokens": run.cached_read_tokens,
-        "cached_write_tokens": run.cached_write_tokens,
-        "cost_usd": run.cost_usd,
-        "finish_reason": run.finish_reason,
-        "tool_call_count": run.tool_call_count,
-        "system_prompt_hash": run.system_prompt_hash,
-        "status": run.status,
-        "error_type": run.error_type,
-        "error_msg": run.error_msg,
-        "result": _redact_secrets(run.result),
-        "metadata": _redact_secrets(run.metadata),
-        # Same projection-boundary redaction as `environment` / `result` /
-        # `metadata` — stored row keeps the originals; HTTP projection scrubs
-        # `tools[*].function.parameters.api_key`-shaped fields and any
-        # caller-supplied Authorization headers folded into the request.
-        # `None` (no body captured — older run or schedule-side synthetic
-        # failure) passes through unchanged so consumers can distinguish
-        # "no record" from "empty body."
-        "request_body": (
-            _redact_secrets(run.request_body)
-            if run.request_body is not None else None
-        ),
-        "rendered_messages": (
-            _redact_secrets(run.rendered_messages)
-            if run.rendered_messages is not None else None
-        ),
-    }
-
-
-def _run_to_trace_dict(run) -> dict:
-    """TraceRecord shape returned by /v1/traces.
-
-    A narrower projection of `_run_to_dict` focused on observability fields
-    (counts, tokens, cost, status). For full operational detail (state,
-    sandbox info, environment), use /v1/runs.
-    """
-    full = _run_to_dict(run)
-    return {k: full[k] for k in _TRACE_RECORD_KEYS if k in full}
-
-
-def _event_to_dict(event) -> dict:
-    """tool_call/tool_result payloads carry raw user arguments + tool
-    outputs — both can contain credentials (a `bash` tool call's argv,
-    or a `read_file` result returning a .env). Redact at the projection
-    boundary; the durable row keeps the original for operator debugging."""
-    return {
-        "event_id": event.event_id,
-        "run_id": event.run_id,
-        "seq": event.seq,
-        "kind": event.kind,
-        "ts": event.ts.isoformat() if event.ts else None,
-        "payload": _redact_secrets(event.payload),
-    }
-
-
 _KNOWN_LIMITATIONS = [
     "agent cost_usd is always null — only complete/embed track cost",
     "runs are purged on startup per [purge] run_retention_days "
@@ -2024,104 +1887,6 @@ def _list_schemas() -> dict[str, str]:
     return out
 
 
-async def _probe_litellm(cfg) -> dict:
-    """Live probe: LiteLLM /v1/models. Returns reachability + model list."""
-    try:
-        from aitelier.providers.llm import get_shared_client
-        client = await get_shared_client()
-        resp = await client.get(
-            f"{cfg.litellm.base_url}/v1/models",
-            headers={"Authorization": f"Bearer {cfg.litellm.api_key}"},
-            timeout=3,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            models = sorted(
-                m["id"] for m in data.get("data", []) if isinstance(m, dict) and m.get("id")
-            )
-            return {"reachable": True, "base_url": cfg.litellm.base_url, "models": models}
-        return {
-            "reachable": False,
-            "base_url": cfg.litellm.base_url,
-            "reason": f"HTTP {resp.status_code}",
-        }
-    except Exception as exc:
-        return {
-            "reachable": False,
-            "base_url": cfg.litellm.base_url,
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-
-
-async def _probe_traces() -> dict:
-    """Live probe: durable store queryable."""
-    try:
-        store = await get_store()
-        await store.list_runs(RunFilter(limit=1))
-        return {"available": True}
-    except Exception as exc:
-        return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
-
-
-async def _sandbox_agents_request(cfg):
-    """GET Sandbox Agent's /v1/agents. Returns the httpx response so callers
-    apply their own status/error handling. Raises on transport failure."""
-    from aitelier.providers.llm import get_shared_client
-    headers = {}
-    if cfg.sandbox_agent.token:
-        headers["Authorization"] = f"Bearer {cfg.sandbox_agent.token}"
-    client = await get_shared_client()
-    return await client.get(
-        f"{cfg.sandbox_agent.base_url}/v1/agents",
-        headers=headers,
-        timeout=3,
-    )
-
-
-def _normalize_agents_payload(data) -> list:
-    """/v1/agents returns either a list or {"agents": [...]} — accept both."""
-    return data if isinstance(data, list) else data.get("agents") or []
-
-
-async def _probe_sandbox_agent(cfg) -> dict:
-    """Live probe: Sandbox Agent reachability + available agent backends.
-
-    Hits GET /v1/agents on the sandbox-agent server (Rivet). Returns the list
-    of agent IDs the sandbox advertises (claude-code, codex, opencode, ...).
-    """
-    try:
-        resp = await _sandbox_agents_request(cfg)
-        if resp.status_code == 200:
-            raw = _normalize_agents_payload(resp.json())
-            # `mock` is filtered: the SA mock backend doesn't return a
-            # sessionId on session/new, so any consumer who picks it up
-            # as a test target gets a confusing handshake error. The
-            # backend is still reachable via direct SA URL for SA-level
-            # tests; aitelier just doesn't advertise it.
-            agents = sorted(
-                a["id"] if isinstance(a, dict) else a
-                for a in raw
-                if ((isinstance(a, dict) and a.get("id") and a["id"] != "mock")
-                    or (isinstance(a, str) and a != "mock"))
-            )
-            return {
-                "reachable": True,
-                "base_url": cfg.sandbox_agent.base_url,
-                "agents": agents,
-            }
-        return {
-            "reachable": False,
-            "base_url": cfg.sandbox_agent.base_url,
-            "reason": f"HTTP {resp.status_code}",
-        }
-    except Exception as exc:
-        return {
-            "reachable": False,
-            "base_url": cfg.sandbox_agent.base_url,
-            "reason": f"{type(exc).__name__}: {exc}",
-        }
-
-
 _DISCOVERY_TTL_SECONDS = 5.0
 _discovery_cache: dict[str, Any] = {"at": 0.0, "value": None}
 _discovery_lock = asyncio.Lock()
@@ -2226,7 +1991,7 @@ async def discovery() -> dict:
 @app.get("/v1/schemas/{name}")
 async def get_schema(name: str) -> dict:
     """Fetch a JSON Schema by name (without the `.schema.json` suffix)."""
-    _validate_path_component(name, "schema name")
+    validate_path_component(name, "schema name")
     d = _schemas_dir().resolve()
     f = (d / f"{name}.schema.json").resolve()
     # Defense in depth: ensure resolved path stays inside schemas dir

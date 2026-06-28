@@ -33,6 +33,7 @@ from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
 from aitelier.openai_compat import AsyncRunRequest, ScoreRequest, parse_model_route
 from aitelier.runner import make_run_id
+from aitelier.security import validate_path_component
 from aitelier.storage import RunFilter, RunScore, get_store
 
 router = APIRouter()
@@ -175,9 +176,9 @@ async def list_run_events_endpoint(
     limit: int = Query(1000, ge=1, le=5000),
 ) -> list[dict]:
     """Paginated event timeline for a single run."""
-    from aitelier.server import _event_to_dict, _validate_path_component
+    from aitelier.server import _event_to_dict
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     store = await get_store()
     events = await store.list_events(run_id, since_seq=since_seq, limit=limit)
     return [_event_to_dict(e) for e in events]
@@ -195,10 +196,9 @@ async def stream_run_events_endpoint(run_id: str, request: Request):
         _event_to_dict,
         _sse_event,
         _sse_response,
-        _validate_path_component,
     )
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     store = await get_store()
     run = await store.get_run(run_id)
     if not run:
@@ -307,9 +307,9 @@ async def wait_for_run(
     shape as `GET /v1/runs/{id}` (no on-disk artifacts folded in;
     fetch separately if needed).
     """
-    from aitelier.server import _run_to_dict, _validate_path_component
+    from aitelier.server import _run_to_dict
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     if timeout <= 0 or timeout > 600:
         raise HTTPException(
             status_code=400,
@@ -348,9 +348,9 @@ async def cancel_run(run_id: str) -> dict:
     never existed). The owning request will receive a result with
     `status: "error"`, `error_type: "Cancelled"`.
     """
-    from aitelier.server import _active_runs, _validate_path_component
+    from aitelier.server import _active_runs
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     task = _active_runs.get(run_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Run not active: {run_id}")
@@ -364,9 +364,9 @@ async def get_run(run_id: str) -> dict:
     entries, plus on-disk artifacts (prompt, manifest) folded in when the
     run dir exists (agent runs with prepare/artifacts).
     """
-    from aitelier.server import _run_to_dict, _validate_path_component
+    from aitelier.server import _run_to_dict
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     store = await get_store()
     run = await store.get_run(run_id)
     if run is None:
@@ -412,9 +412,8 @@ async def add_run_score_endpoint(run_id: str, req: ScoreRequest) -> dict:
     new row. Consumers reading via `GET /v1/runs/{id}/scores` get all
     rows ordered by `created_at`; latest-wins is `[-1]`.
     """
-    from aitelier.server import _validate_path_component
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     store = await get_store()
     run = await store.get_run(run_id)
     if run is None:
@@ -431,9 +430,8 @@ async def add_run_score_endpoint(run_id: str, req: ScoreRequest) -> dict:
 async def list_run_scores_endpoint(run_id: str) -> dict:
     """All scores written against `run_id`, oldest first. Empty `data`
     when no grader has scored this run yet."""
-    from aitelier.server import _validate_path_component
 
-    _validate_path_component(run_id, "run_id")
+    validate_path_component(run_id, "run_id")
     store = await get_store()
     run = await store.get_run(run_id)
     if run is None:
