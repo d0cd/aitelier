@@ -2148,6 +2148,72 @@ def test_cancel_running_task(client):
         _active_runs.pop("cancel-me", None)
 
 
+def test_shared_runtime_state_is_one_object_across_modules():
+    """The saturation cap, /v1/runs/active, and cancellation all assume the
+    importers share ONE `_active_runs` dict (and one `_pending_finalize_tasks`
+    set). A stray `= {}` rebind in any module would silently desync them with
+    no import/type error — pin object identity so that can't regress."""
+    import aitelier.inference_exec as ie
+    import aitelier.runtime as rt
+    import aitelier.server as srv
+
+    assert srv._active_runs is rt._active_runs is ie._active_runs
+    assert (
+        srv._pending_finalize_tasks
+        is rt._pending_finalize_tasks
+        is ie._pending_finalize_tasks
+    )
+
+
+async def test_agent_nonstream_cancel_yields_cancelled_envelope(client):
+    """Cancelling a non-streaming agent run mid-flight maps the run_task's
+    CancelledError to a `Cancelled` result envelope and finalizes the run row
+    to state=cancelled. test_cancel_running_task only checks `.cancel()` was
+    called on the registry entry; this drives the real orchestrator's
+    `except asyncio.CancelledError -> _cancelled_result` branch end-to-end."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from aitelier.inference_exec import _agent_chat_completion
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _active_runs
+    from aitelier.storage import get_store
+
+    async def slow_call(name, prompt, **kwargs):
+        await asyncio.sleep(5)
+        raise AssertionError("should have been cancelled before returning")
+
+    req = ChatCompletionRequest(
+        model="agent:claude/claude-sonnet-4-5",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    fake_request = SimpleNamespace(
+        state=SimpleNamespace(correlation_id="cid-cancel"),
+    )
+    run_id = "agent-nonstream-cancel-1"
+
+    with patch("aitelier.providers.sandbox_agent.call_via_sandbox", slow_call):
+        outer = asyncio.create_task(_agent_chat_completion(
+            req, fake_request,
+            agent_backend="claude", inner_llm="claude-sonnet-4-5", run_id=run_id,
+        ))
+        for _ in range(200):
+            if run_id in _active_runs:
+                break
+            await asyncio.sleep(0.01)
+        assert run_id in _active_runs, "run_task never registered"
+        _active_runs[run_id].cancel()
+        result = await outer
+
+    # `_agent_chat_completion` renders the cancelled run into the canonical
+    # error envelope (status=="error" path).
+    assert result["error"]["type"] == "Cancelled"
+    assert result["aitelier_run_id"] == run_id
+    store = await get_store()
+    run = await store.get_run(run_id)
+    assert run.state == "cancelled"
+
+
 def test_cancel_path_traversal_rejected(client):
     resp = client.post("/v1/runs/..%2F..%2Fetc/cancel")
     assert resp.status_code in (400, 404)
@@ -2192,6 +2258,31 @@ def test_async_run_rejects_non_agent_model(client):
     })
     assert resp.status_code == 400
     assert "agent" in resp.json()["detail"].lower()
+
+
+def test_async_run_pops_active_registry_when_inner_raises(client):
+    """If the background agent call raises before `_agent_chat_completion`
+    installs its own registry entry, the pre-registered placeholder must not
+    leak into /v1/runs/active (and the saturation cap) for the process
+    lifetime — `_run_and_callback`'s finally is the idempotent backstop."""
+    import time as _t
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("inner exploded before registering")
+
+    with patch("aitelier.server._agent_chat_completion", boom):
+        resp = client.post("/v1/runs", json={
+            "model": "agent:claude/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        run_id = resp.json()["run_id"]
+        # The background task runs on the app loop; poll active until it drains.
+        for _ in range(25):
+            if run_id not in client.get("/v1/runs/active").json()["active"]:
+                break
+            _t.sleep(0.02)
+    assert run_id not in client.get("/v1/runs/active").json()["active"]
 
 
 # --- /v1/schedules ---
@@ -2492,6 +2583,44 @@ def test_embeddings_503s_when_saturated(client, monkeypatch):
     finally:
         for i in range(cap):
             _active_runs.pop(f"sat-embed-{i}", None)
+
+
+def test_llm_stream_registers_run_synchronously(client):
+    """A stream:true LLM request must occupy its concurrency slot the moment
+    the StreamingResponse is returned — not deferred until the consumer first
+    iterates the body. Otherwise a burst of concurrent streams all clear
+    `_reject_if_saturated` before any registers, overshooting
+    `max_in_flight_runs` and going invisible to /v1/runs/active. The agent
+    stream path registers synchronously; this pins LLM parity."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from aitelier.inference_exec import _llm_chat_completion_stream
+    from aitelier.openai_compat import ChatCompletionRequest
+    from aitelier.server import _active_runs
+
+    req = ChatCompletionRequest(
+        model="local", messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+    fake_request = SimpleNamespace(
+        state=SimpleNamespace(correlation_id="cid-sync"),
+    )
+    run_id = "llm-stream-sync-1"
+
+    async def _go():
+        resp = await _llm_chat_completion_stream(
+            req, fake_request, run_id=run_id,
+        )
+        # Registered BEFORE the body iterator is ever stepped.
+        assert run_id in _active_runs
+        # Close the unconsumed generator so we don't leak the run.
+        await resp.body_iterator.aclose()
+
+    try:
+        asyncio.new_event_loop().run_until_complete(_go())
+    finally:
+        _active_runs.pop(run_id, None)
 
 
 def test_wait_for_run_returns_terminal_run(client):

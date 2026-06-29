@@ -1,12 +1,14 @@
 """`/v1/runs/*` endpoints — durable run state + lifecycle.
 
 Routes registered on this module's `router` and included into the main
-app in `server.py`. The handlers depend on helpers defined in
-`server.py` (`_active_runs`, `_check_idempotency`, projection helpers,
-…) which are imported lazily inside each function to avoid the
-circular import that would result from a top-level
-`from aitelier.server import …` (server.py registers this router; the
-router can't import from a half-loaded server.py at module-init time).
+app in `server.py`. The handlers depend on shared helpers that live in
+leaf modules — `_active_runs` in `runtime.py`, `_check_idempotency` in
+`idempotency.py`, projection helpers in `serializers.py` — and are
+re-exported through `server.py`. Each function imports them lazily from
+`aitelier.server` to avoid the circular import that a top-level
+`from aitelier.server import …` would cause (server.py registers this
+router; the router can't import from a half-loaded server.py at
+module-init time).
 
 Endpoints surfaced here:
 - POST   /v1/runs                            — submit async agent run
@@ -109,6 +111,13 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
                     },
                     "aitelier_run_id": run_id,
                 }
+            finally:
+                # `_agent_chat_completion` swaps in its own registry entry once
+                # it starts and pops it on completion, but if it raises before
+                # then (e.g. an incompatible-field rejection) the pre-registered
+                # placeholder below would leak into /v1/runs/active and the
+                # saturation cap forever. Popping here is an idempotent backstop.
+                _active_runs.pop(run_id, None)
             # Strip the rendering hint before persistence/delivery — it's only
             # meaningful to a synchronous HTTP responder, not to webhook consumers.
             result.pop("aitelier_status_code", None)

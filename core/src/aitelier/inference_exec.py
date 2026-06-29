@@ -1,9 +1,12 @@
-"""Request preparation + validation for /v1/chat/completions.
+"""Inference execution layer for /v1/chat/completions + /v1/embeddings.
 
-Pure functions: OpenAI messages -> (system_prompt, prompt) translation, few-shot
-+ response-format folding into the system prompt, and the agent-path field
-rejections / aitelier.* option validation. Extracted from server.py; the
-orchestration functions there and endpoints/inference.py import from here.
+Two concerns live here. First, request prep/validation: OpenAI messages ->
+(system_prompt, prompt) translation, few-shot + response-format folding into
+the system prompt, and the agent-path field rejections / aitelier.* option
+validation. Second, the orchestration core: the agent + LLM chat-completion
+runners and their streaming variants, the ACP stream producer, run finalize,
+and the status mappers. server.py re-exports everything here so the lazy
+`from aitelier.server import ...` in endpoints/inference.py keeps resolving.
 """
 
 from __future__ import annotations
@@ -664,6 +667,18 @@ async def _agent_chat_completion_stream(
     re-running the inner agent (re-executing side effects, double-billing
     the subscription). Failed or cancelled streams are NOT cached — the
     consumer's retry should get a fresh attempt at success.
+
+    Idempotency-lock release rides on `event_generator`'s finally (which
+    spawns `_finalize_stream_run`). That finally runs whenever the generator
+    is iterated at least once — including the disconnect-mid-stream case,
+    where the ASGI server calls `aclose()`. The one uncovered window is a
+    disconnect *before the very first iteration*, possible only on ASGI
+    servers below spec 2.4 (newer servers, including the supported stack,
+    start the body iterator before yielding to disconnect handling). Closing
+    it from the producer's done-callback was rejected: it races the normal
+    fast path (producer settles before the cache row is recorded), so an
+    early release would let a concurrent retry re-run the agent — worse than
+    the bounded lock-hold it would prevent.
     """
     cid = request.state.correlation_id
     _reject_agent_incompatible_fields(req, agent_backend)
@@ -1027,6 +1042,17 @@ async def _llm_chat_completion_stream(
         rendered_messages=body.get("messages") if isinstance(body, dict) else None,
     ))
 
+    # Reserve the concurrency slot synchronously — before returning the
+    # StreamingResponse — so a burst of stream:true requests can't all clear
+    # `_reject_if_saturated` before any registers (overshooting the cap and
+    # going invisible to /v1/runs/active). This runs in the request task,
+    # which is the same task that later drives event_generator, so it's the
+    # right handle for cancel + shutdown. Mirrors the agent stream path; popped
+    # in the generator's finally below.
+    task = asyncio.current_task()
+    if task is not None:
+        _active_runs[run_id] = task
+
     async def event_generator():
         final: dict | None = None
         accumulated: list[str] = []
@@ -1034,12 +1060,6 @@ async def _llm_chat_completion_stream(
         tool_call_seen = False
         usage: dict | None = None
         finish_reason: str | None = None
-        # Count this stream against the concurrency cap + /v1/runs/active for
-        # its lifetime, matching the agent stream path (which registers its
-        # producer task). Popped in the finally below.
-        task = asyncio.current_task()
-        if task is not None:
-            _active_runs[run_id] = task
         try:
             async for chunk in chat_completion_stream(
                 body, timeout=req.timeout or 60,
@@ -1148,7 +1168,7 @@ async def _llm_chat_completion_stream(
     return _sse_response(event_generator())
 
 
-def _synth_otel_result(final: dict, model: str) -> dict | None:
+def _synth_otel_result(final: dict, model: str | None) -> dict | None:
     """OpenAI-shape envelope so `gen_ai_response_attrs` finds usage/finish
     in the slots it reads (`prompt_tokens` / `completion_tokens`). None on
     error so the span records the error_type instead of empty usage."""
