@@ -130,8 +130,12 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
 ## Project structure
 
 - `core/src/aitelier/` — Python core
-  - `server.py` — FastAPI app bootstrap + lifespan + agent-execution orchestration + the helpers each endpoint module imports lazily (idempotency wrappers, render, probes, webhooks, SSE framing). Routers are included from `endpoints/`; middleware from `middleware.py`.
-  - `endpoints/` — one router per resource. Handlers lazy-import shared helpers from `server.py` to avoid module-load cycles.
+  - `server.py` — FastAPI app bootstrap + lifespan + the primitive route handlers (health/metrics/discovery/ui/schemas) + the schedule handler. Re-exports the helpers below so endpoints can lazy-import them `from aitelier.server`. Routers are included from `endpoints/`; middleware from `middleware.py`.
+  - `inference_exec.py` — inference execution layer: request prep/validation (message translation, few-shot + response-format folding, agent-path field rejections, `aitelier.*` option validation) + the orchestration core (agent/LLM chat-completion runners + streaming, the ACP stream producer, run finalize, status mappers).
+  - `serializers.py` — run/event → dict projections for the HTTP boundary + credential redaction (`_redact_secrets`).
+  - `probes.py` — live dependency probes for `/v1/discovery` + `/v1/health` (LiteLLM, traces, Sandbox Agent).
+  - `runtime.py` — shared runtime infra (leaf): the `_active_runs` in-flight registry + saturation cap, cancellation, SSE framing, webhook enqueue + SSRF guard.
+  - `endpoints/` — one router per resource. Handlers lazy-import shared helpers from `server.py` (which re-exports them from the modules above) to avoid module-load cycles.
     - `inference.py` — `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
     - `runs.py` — `/v1/runs`, `/v1/runs/{id}*` (events, wait, cancel, scores), `/v1/runs/active`, `/v1/runs/export`
     - `schedules.py` — `/v1/schedules*`

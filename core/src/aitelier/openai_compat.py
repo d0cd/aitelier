@@ -12,7 +12,8 @@ that OpenAI shape can't express (workspace, mcp_servers, prepare, artifacts,
 …). Accepted only on the agent path; 400 otherwise.
 
 This module holds the wire types and translation helpers. Routing decisions
-and durable-state side effects live in server.py.
+and durable-state side effects live in inference_exec.py (re-exported through
+server.py).
 """
 
 from __future__ import annotations
@@ -425,9 +426,9 @@ def agent_error_to_chat_completion_error(
 ) -> tuple[int, dict]:
     """Legacy two-tuple shim around `chat_completion_error_envelope`.
 
-    Kept for the prepare/sidecar paths in `server.py` that destructure
-    `(status, body)` for explicit HTTPException raise sites. New code
-    should use the envelope helper directly.
+    Kept for the prepare/sidecar paths in `inference_exec.py` that
+    destructure `(status, body)` for explicit HTTPException raise sites.
+    New code should use the envelope helper directly.
     """
     body = chat_completion_error_envelope(result, status_code=status_code)
     return status_code, body

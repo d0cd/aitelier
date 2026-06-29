@@ -1,8 +1,8 @@
 """Run-id utility — shared between endpoints and the schedule handler.
 
-Inference dispatch (LLM via LiteLLM, agent via Sandbox Agent) lives in the
-endpoint helpers in `server.py`. This module is just the run-id helper that
-multiple call sites share.
+Inference dispatch (LLM via LiteLLM, agent via Sandbox Agent) lives in
+`inference_exec.py`. This module is just the run-id helper that multiple
+call sites share.
 """
 
 from __future__ import annotations

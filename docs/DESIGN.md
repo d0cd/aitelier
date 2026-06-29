@@ -382,7 +382,11 @@ aitelier/
 │   ├── src/aitelier/
 │   │   ├── __init__.py
 │   │   ├── cli.py
-│   │   ├── server.py                  # FastAPI app bootstrap + shared helpers
+│   │   ├── server.py                  # FastAPI app bootstrap + lifespan + primitive routes + re-exports
+│   │   ├── inference_exec.py          # request prep/validation + agent/LLM orchestration + streaming
+│   │   ├── serializers.py             # run/event → dict projections + credential redaction
+│   │   ├── probes.py                  # live dependency probes for /v1/discovery + /v1/health
+│   │   ├── runtime.py                 # in-flight registry + saturation cap + SSE/webhook infra (leaf)
 │   │   ├── endpoints/                 # one router per resource
 │   │   ├── middleware.py              # auth → correlation → body_size → rate_limit
 │   │   ├── idempotency.py             # Idempotency-Key check/record/release
@@ -410,6 +414,7 @@ aitelier/
 │   │       ├── client.py              # control plane + .openai() helper
 │   │       └── _generated/
 │   │           └── models.py          # control-plane Pydantic models
+│   ├── python-mcp/                    # MCP server (aitelier-mcp) over the control plane
 │   └── typescript/
 │       ├── package.json
 │       ├── tsconfig.json

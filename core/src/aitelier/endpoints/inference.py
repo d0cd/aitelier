@@ -3,9 +3,10 @@
 Three handlers register on this module's `router` and the main app
 includes it in `server.py`. The agent + LLM execution helpers
 (`_agent_chat_completion`, `_llm_chat_completion`, streaming variants,
-idempotency wrappers, render helpers) live in `server.py` and are
-imported lazily inside each handler — same pattern as the other
-`endpoints/*.py` modules.
+idempotency wrappers, render helpers) live in `inference_exec.py` and are
+re-exported through `server.py`; each handler imports them lazily from
+`aitelier.server` to break the router-registration cycle — same pattern as
+the other `endpoints/*.py` modules.
 
 Endpoints surfaced here:
 - POST /v1/chat/completions   — sync + streaming inference (LLM + agent)
