@@ -653,14 +653,32 @@ def _load_schema(path: Path) -> dict:
 
 
 def _list_endpoints() -> list[dict]:
-    """Enumerate live HTTP endpoints from the FastAPI app — single source of truth."""
+    """Enumerate live HTTP endpoints from the FastAPI app — single source of truth.
+
+    Newer FastAPI keeps `include_router` routes under an `_IncludedRouter`
+    wrapper (`.original_router`) instead of flattening them into `app.routes`,
+    so a flat `isinstance(APIRoute)` scan misses every router-registered
+    endpoint. Recurse through those wrappers (applying any include prefix);
+    older FastAPI (flattened) falls through the same code. Filtering to APIRoute
+    keeps FastAPI's own /docs and /openapi.json out of the inventory.
+    """
     from fastapi.routing import APIRoute
+
+    def _walk(routes, prefix=""):
+        for route in routes:
+            original = getattr(route, "original_router", None)
+            if original is not None:
+                ctx = getattr(route, "include_context", None)
+                yield from _walk(
+                    original.routes, prefix + (getattr(ctx, "prefix", "") or "")
+                )
+            elif isinstance(route, APIRoute):
+                yield prefix + route.path, route.methods
+
     out: list[dict] = []
-    for route in app.routes:
-        if not isinstance(route, APIRoute):
-            continue
-        for method in route.methods - {"HEAD", "OPTIONS"}:
-            out.append({"method": method, "path": route.path})
+    for path, methods in _walk(app.routes):
+        for method in (methods or set()) - {"HEAD", "OPTIONS"}:
+            out.append({"method": method, "path": path})
     return sorted(out, key=lambda e: (e["path"], e["method"]))
 
 
