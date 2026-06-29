@@ -26,6 +26,7 @@ from aitelier.inference_exec import (  # noqa: F401  (re-exported for endpoints)
     _STREAM_QUEUE_SENTINEL,
     _agent_chat_completion,
     _agent_chat_completion_stream,
+    _check_idempotency,
     _finalize_stream_run,
     _fold_examples,
     _fold_response_format,
@@ -35,7 +36,9 @@ from aitelier.inference_exec import (  # noqa: F401  (re-exported for endpoints)
     _llm_chat_completion,
     _llm_chat_completion_stream,
     _producer_for_acp_stream,
+    _record_idempotency,
     _reject_agent_incompatible_fields,
+    _release_idempotency_ctx,
     _render_chat_completion,
     _replay_cached_stream,
     _stream_chunk_for_done,
@@ -327,6 +330,10 @@ async def lifespan(app: FastAPI):
                 "aitelier_state": "orphaned",
             }
             try:
+                # No _redact_secrets here (unlike the reconciliation enqueue
+                # below): this payload is a fixed constant — error envelope +
+                # run id + state, with no run-supplied result/metadata that
+                # could carry credentials. Scrub it if you ever fold run data in.
                 await store.enqueue_webhook(
                     webhook_url, payload, run_id=rid,
                 )
@@ -479,23 +486,7 @@ _register_middleware(app)
 _PROCESS_STARTED_AT = time.monotonic()
 
 
-# --- Request/Response models ---
-
-
 # --- Primitive endpoints ---
-
-
-# Imported mid-file (after app + helpers) to avoid an import cycle; bound via
-# attribute access so isort keeps this as one stable statement. `_check_idempotency`
-# is re-exported for the endpoints/ modules.
-import aitelier.idempotency as _idem  # noqa: E402
-
-_STREAM_IDEMPOTENCY_MAX_CHUNKS = _idem.STREAM_IDEMPOTENCY_MAX_CHUNKS
-_IdempotencyContext = _idem.IdempotencyContext
-_check_idempotency = _idem.check_idempotency
-_record_idempotency = _idem.record_idempotency
-_release_idempotency_ctx = _idem.release_idempotency_ctx
-
 
 
 _KNOWN_LIMITATIONS = [
@@ -661,6 +652,11 @@ def _list_endpoints() -> list[dict]:
     endpoint. Recurse through those wrappers (applying any include prefix);
     older FastAPI (flattened) falls through the same code. Filtering to APIRoute
     keeps FastAPI's own /docs and /openapi.json out of the inventory.
+
+    The inventory is the exhaustive set of callable aitelier routes, so it
+    includes the `/` redirect and `/ui` dashboard even though they carry
+    `include_in_schema=False` (hidden from /docs). That's intentional: this is
+    a live runtime inventory, not the OpenAPI surface.
     """
     from fastapi.routing import APIRoute
 
@@ -708,16 +704,14 @@ async def discovery() -> dict:
     peer doesn't repeatedly hit LiteLLM and Sandbox Agent. Keep /v1/health
     cheap for liveness; use this for self-discovery.
     """
-    import time as _time
-
-    now = _time.monotonic()
+    now = time.monotonic()
     if _discovery_cache["value"] is not None and \
        now - _discovery_cache["at"] < _DISCOVERY_TTL_SECONDS:
         return _discovery_cache["value"]
 
     async with _discovery_lock:
         # Re-check after lock — another request may have refreshed it
-        now = _time.monotonic()
+        now = time.monotonic()
         if _discovery_cache["value"] is not None and \
            now - _discovery_cache["at"] < _DISCOVERY_TTL_SECONDS:
             return _discovery_cache["value"]
@@ -792,7 +786,7 @@ async def discovery() -> dict:
             "known_limitations": _KNOWN_LIMITATIONS,
         }
         _discovery_cache["value"] = result
-        _discovery_cache["at"] = _time.monotonic()
+        _discovery_cache["at"] = time.monotonic()
         return result
 
 

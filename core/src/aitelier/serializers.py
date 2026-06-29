@@ -7,6 +7,11 @@ the endpoint routers import from here.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from aitelier.storage.models import Run, RunEvent
+
 _REDACTED = "[redacted]"
 
 # Dict keys whose value is a credential and must be redacted from the wire
@@ -18,7 +23,7 @@ _SECRET_KEYS = frozenset({
 })
 
 
-def _redact_secrets(value):
+def _redact_secrets(value: object):
     """Strip secret-bearing fields from any dict/list before it crosses the
     HTTP boundary.
 
@@ -29,7 +34,7 @@ def _redact_secrets(value):
     only the wire projection is redacted. The Sandbox Agent still receives
     real values at dispatch time."""
     if isinstance(value, dict):
-        out: dict = {}
+        out = {}
         for k, v in value.items():
             kl = k.lower() if isinstance(k, str) else k
             if kl in ("headers", "env") and isinstance(v, dict):
@@ -68,7 +73,7 @@ _TRACE_RECORD_KEYS = frozenset({
 })
 
 
-def _duration_ms(run) -> int | None:
+def _duration_ms(run: Run) -> int | None:
     """Wall-clock run duration in milliseconds (ended − started), or None
     when the run hasn't ended. Precomputed so dashboards don't re-derive it;
     maps to the OTel span duration."""
@@ -77,7 +82,7 @@ def _duration_ms(run) -> int | None:
     return None
 
 
-def _run_to_dict(run) -> dict:
+def _run_to_dict(run: Run) -> dict:
     """Canonical Run → dict converter used by /v1/runs*.
 
     Includes every operational field: state, sandbox info, environment,
@@ -134,7 +139,7 @@ def _run_to_dict(run) -> dict:
     }
 
 
-def _run_to_trace_dict(run) -> dict:
+def _run_to_trace_dict(run: Run) -> dict:
     """TraceRecord shape returned by /v1/traces.
 
     A narrower projection of `_run_to_dict` focused on observability fields
@@ -145,7 +150,7 @@ def _run_to_trace_dict(run) -> dict:
     return {k: full[k] for k in _TRACE_RECORD_KEYS if k in full}
 
 
-def _event_to_dict(event) -> dict:
+def _event_to_dict(event: RunEvent) -> dict:
     """tool_call/tool_result payloads carry raw user arguments + tool
     outputs — both can contain credentials (a `bash` tool call's argv,
     or a `read_file` result returning a .env). Redact at the projection
