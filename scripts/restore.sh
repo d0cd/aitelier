@@ -33,8 +33,8 @@ fi
 echo "About to RESTORE into the live aitelier database from:"
 echo "    $file"
 echo "This DROPS and recreates existing objects (--clean --if-exists)."
-echo "Stop the service first so it isn't writing: make stop service"
-echo "(or 'pc stop aitelier' if it's supervised by process-compose)."
+echo "Stop the service first so it isn't writing: pc stop aitelier"
+echo "(or './scripts/stop.sh service' — stops the serve, leaves Postgres up)."
 printf "Type 'yes' to proceed: "
 read -r confirm
 if [ "$confirm" != "yes" ]; then

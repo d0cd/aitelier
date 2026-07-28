@@ -47,7 +47,7 @@ Destructive — drops and recreates objects in the live database. Stop the
 service first so it isn't writing mid-restore:
 
 ```bash
-make stop service               # or: pc stop aitelier
+pc stop aitelier                # or: ./scripts/stop.sh service (leaves Postgres up)
 
 make restore backups/aitelier-20260601-030000.dump
 ```
