@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# launchd entrypoint: ensure infra is up, then run the aitelier service in the
-# FOREGROUND so launchd can supervise it (KeepAlive restarts it on crash).
+# Supervised entrypoint: ensure infra is up, then run the aitelier service in
+# the FOREGROUND so a process supervisor (process-compose — see
+# docs/deploy/process-compose.md) tracks the serve process directly and
+# restarts it on crash.
 #
 # `start.sh infra` is idempotent — it brings up Postgres/LiteLLM/Sandbox Agent
 # and writes runs/.session.toml, then returns. We then `exec` the server, which
-# replaces this shell, so launchd tracks the serve process directly. If the
-# server dies, launchd re-runs this script (re-ensuring infra cheaply).
+# replaces this shell, so the supervisor tracks the serve process. If the
+# server dies, the supervisor re-runs this script (re-ensuring infra cheaply).
 #
 # Not meant to be run by hand — use `make start` for an interactive launch.
 

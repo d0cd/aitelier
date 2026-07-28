@@ -72,8 +72,8 @@ _brig_cell_up() {
         return 1
     fi
     # Self-heal the VM dependency: `brig system up` is idempotent ("ensure VM
-    # + warden running"). Doing it here makes both `make start` and the
-    # launchd supervisor recover after a reboot instead of crash-looping
+    # + warden running"). Doing it here makes both `make start` and a
+    # process supervisor recover after a reboot instead of crash-looping
     # because the VM happened to be down.
     if ! brig system doctor --quick >/dev/null 2>&1; then
         echo "  Brig VM not ready — bringing it up (brig system up) ..."

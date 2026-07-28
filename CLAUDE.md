@@ -162,7 +162,7 @@ const runs = await ait.listRuns({ traceTag: "audit", limit: 20 });
 - `sdks/typescript/` — TypeScript SDK (`aitelier`); inference via `Aitelier.openai()`
 - `examples/` — runnable recipes (fan-out, MCP orchestrator, scheduled audit, webhook receiver)
 - `docker/` — Postgres (always-on) + LiteLLM proxy + optional Ollama profile
-- `scripts/` — start.sh, stop.sh, release.sh, doctor.sh, backup.sh, restore.sh, generate-types.sh, supervise.sh + install/uninstall-launchd.sh (macOS always-on)
+- `scripts/` — start.sh, stop.sh, release.sh, doctor.sh, backup.sh, restore.sh, generate-types.sh, supervise.sh (foreground entrypoint for a process supervisor — see `docs/deploy/process-compose.md`)
 - `core/src/aitelier/static/ui.html` — the read-only `/ui` dashboard (vanilla, no build)
 - `runs/` — gitignored agent run output (prompt, manifest); durable state lives in Postgres
 
@@ -314,8 +314,6 @@ make status               # what's running + log paths + dep healthchecks
 make doctor               # preflight: ports, tools, creds, docker
 make backup               # pg_dump → backups/ (retention-pruned)
 make restore FILE=...     # restore from a backup dump (confirmed)
-make service-install      # macOS launchd: auto-start at login + restart + daily backup
-make service-uninstall    # remove the launchd agents
 make reset                # nuclear: stop + drop Postgres volume + wipe runs/
 make clean                # remove venv, build artifacts
 ./scripts/release.sh X.Y.Z  # lockstep version bump

@@ -61,7 +61,7 @@ resp = await openai.chat.completions.create(
 | `make doctor` | Preflight checks. Run when `make start` fails with a confusing error. |
 | `make test` | Python + TS test suites. |
 | `make backup` / `make restore FILE=…` | Dump / restore the Postgres durable state (see `docs/deploy/backup-restore.md`). |
-| `make service-install` / `make service-uninstall` | macOS: run aitelier always-on via launchd (auto-start at login, restart on crash, daily backup) — see `docs/deploy/launchd.md`. |
+| Run as a service | Supervise aitelier with a process manager — `scripts/supervise.sh` is the foreground entrypoint. See `docs/deploy/process-compose.md`. |
 | `make reset` | **Destructive.** Stops everything *and* wipes the Postgres volume. Asks before doing it. |
 
 ## When something's wrong

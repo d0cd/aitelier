@@ -476,10 +476,22 @@ finally:
         if [ -n "$SANDBOX_TOKEN_VAL" ]; then
             auth_header=("-H" "Authorization: Bearer $SANDBOX_TOKEN_VAL")
         fi
-        if curl -sf "${auth_header[@]}" "$RESOLVED_SANDBOX_URL/v1/agents" >/dev/null 2>&1; then
+        # brig owns the SA cell's lifecycle (`brig system watchdog` recovers it
+        # after host sleep/reboot). We only probe it — a real /v1/agents check
+        # with the token, so a wedged cell (ingress up, agent dead → 502) is
+        # caught. Retry so a cell mid-recovery isn't treated as a hard failure.
+        _sa_ok=0
+        for _ in $(seq 1 15); do
+            if curl -sf "${auth_header[@]}" "$RESOLVED_SANDBOX_URL/v1/agents" >/dev/null 2>&1; then
+                _sa_ok=1; break
+            fi
+            sleep 2
+        done
+        if [ "$_sa_ok" = 1 ]; then
             echo "  ✓ brig SA reachable via ingress $RESOLVED_SANDBOX_URL"
         else
-            echo "  ✗ brig SA unreachable at $RESOLVED_SANDBOX_URL after cell start"
+            echo "  ✗ brig SA unreachable at $RESOLVED_SANDBOX_URL after 30s"
+            echo "    brig manages the SA cell — check: brig system doctor; brig cell list"
             exit 1
         fi
     elif [ "$SA_MODE" = "remote" ] \

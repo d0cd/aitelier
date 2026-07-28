@@ -1,4 +1,4 @@
-.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor backup restore service-install service-uninstall
+.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor backup restore
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -134,17 +134,6 @@ restore:
 		exit 2; \
 	fi
 	@./scripts/restore.sh "$(FILE)"
-
-# ---------------------------------------------------------------------------
-# launchd supervision (macOS): auto-start at login + restart on crash, plus a
-# daily backup agent. See docs/deploy/launchd.md.
-# ---------------------------------------------------------------------------
-
-service-install:
-	@./scripts/install-launchd.sh
-
-service-uninstall:
-	@./scripts/uninstall-launchd.sh
 
 # ---------------------------------------------------------------------------
 # Clean

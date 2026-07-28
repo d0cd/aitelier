@@ -69,11 +69,11 @@ _kill_pid_file() {
 
 if [ "$MODE" = "full" ] || [ "$MODE" = "service" ]; then
     echo "=== Stopping aitelier service ==="
-    # Under launchd supervision, KeepAlive respawns the service the moment we
-    # kill it — so a plain stop looks like it didn't work. Warn explicitly.
-    if launchctl print "gui/$(id -u)/com.aitelier.agent" >/dev/null 2>&1; then
-        echo "  ! launchd agent com.aitelier.agent is loaded — it will respawn the"
-        echo "    service after this kill. To actually stop it: make service-uninstall"
+    # If a supervisor (e.g. process-compose) manages the service, it respawns
+    # the moment we kill it — so a plain stop looks like it didn't work. Warn.
+    if pgrep -f "process-compose up -f" >/dev/null 2>&1; then
+        echo "  ! process-compose is running — if it supervises aitelier it will"
+        echo "    respawn the service after this kill. To stop it: pc stop aitelier"
     fi
     _kill_pid_file "$AITELIER_PID_FILE" "aitelier service" "aitelier serve"
 fi

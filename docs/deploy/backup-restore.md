@@ -25,16 +25,20 @@ AITELIER_BACKUP_RETAIN=30 make backup
 
 Pruning only ever deletes files matching `backups/aitelier-*.dump`.
 
-## Scheduled backup (launchd, daily 03:00)
+## Scheduled backup
 
-`scripts/install-launchd.sh` installs a `com.aitelier.backup` launchd agent
-alongside the service supervisor (see [`launchd.md`](launchd.md)). Output is
-appended to `runs/logs/backup.log`. Remove it with `make service-uninstall`.
-
-Verify it's scheduled:
+`make backup` is manual. aitelier no longer bundles a scheduler — schedule it
+with whatever runs your other periodic jobs. Two common options:
 
 ```bash
-launchctl print "gui/$(id -u)/com.aitelier.backup" 2>/dev/null | grep -E 'state|runs'
+# cron (daily 03:00):
+0 3 * * *  cd /path/to/aitelier && make backup >> runs/logs/backup.log 2>&1
+
+# or a process-compose entry that loops (mirrors the abacus-prices pattern):
+#   aitelier-backup:
+#     working_dir: /path/to/aitelier
+#     command: "while :; do make backup >> runs/logs/backup.log 2>&1; sleep 86400; done"
+#     availability: { restart: on_failure, max_restarts: 100 }
 ```
 
 ## Restore
@@ -43,8 +47,7 @@ Destructive — drops and recreates objects in the live database. Stop the
 service first so it isn't writing mid-restore:
 
 ```bash
-make service-uninstall          # if running under launchd
-# or: make stop service
+make stop service               # or: pc stop aitelier
 
 make restore backups/aitelier-20260601-030000.dump
 ```
