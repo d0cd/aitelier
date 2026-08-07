@@ -14,6 +14,27 @@ submitting service stopped. Trellis now handles its own deterministic scope admi
 awaits all started parallel branches. The remaining items below are Aitelier/Sandbox Agent
 concerns rather than requests for Aitelier to own application workflow control flow.
 
+## P0: credential inspection reveals the Claude OAuth token by default
+
+While diagnosing the Claude backend, this command printed the raw OAuth token even though no
+explicit reveal option was supplied:
+
+```sh
+sandbox-agent credentials extract --agent claude
+```
+
+The token value is intentionally not reproduced here. This is a secret-disclosure defect in
+Sandbox Agent's credential CLI, not a Trellis workflow issue. The exposed credential must be
+rotated.
+
+Acceptance criteria:
+
+- Default credential inspection returns only source, authentication type, and a redacted
+  fingerprint or status.
+- Secret material is emitted only behind a clearly named, explicit reveal option.
+- Regression tests cover every supported agent credential, and neither normal logs nor error
+  messages contain the secret.
+
 ## P0: enforceable agent work budget with a synthesis reserve
 
 Prompt-only tool limits are not reliable. The specialists were explicitly instructed to use
@@ -89,7 +110,7 @@ Suggested behavior:
   failure rather than returning provider success with nonconforming output.
 - Reject ambiguity; never choose between multiple JSON objects.
 
-## P1: current Codex compatibility and terminal-event probing
+## P1: agent compatibility and terminal-turn probing
 
 Codex CLI 0.146.1 emitted useful output through the host ACP path but never produced the
 terminal event Aitelier needed. Run `c4358230830baff1735aa7a73edae716` was manually cancelled
@@ -102,6 +123,20 @@ Suggested improvements:
 - Make `doctor` perform a cheap terminal-turn handshake, not only process/capability discovery.
 - If an agent emits final content but never terminates, retain a diagnostic that distinguishes
   missing terminal protocol from ordinary model latency.
+
+The same class of readiness failure was reproduced with Claude. Discovery advertised
+`agent:claude`, several models, reasoning levels, and approval modes, and session creation
+succeeded, but every actual prompt failed in about 2.2–2.6 seconds before a tool call with a
+long-context usage-credit error. This included a one-turn Haiku probe with no tools and no JSON
+Schema (`7777f7efa8ef918b07410803d2c6cdec`). Direct Claude CLI 2.1.221 worked with the same
+logged-in account. The managed route used `@agentclientprotocol/claude-agent-acp` 0.33.1 with
+Claude Agent SDK/Claude Code 2.1.132, while Aitelier's integration source expects at least 0.36.
+
+Backend discovery should therefore distinguish syntactic availability from execution readiness.
+For the selected agent, `doctor` or a strict readiness probe should perform a cheap terminal turn,
+report the adapter and embedded agent versions, and explain known incompatibilities. Process
+startup, capability advertisement, and `session/new` alone must not be reported as a usable
+backend.
 
 ## P1: usage and reasoning capability gaps
 
