@@ -5,7 +5,8 @@ description = "MCP server exposing the aitelier control plane (runs, traces, sch
 requires-python = ">=3.11"
 dependencies = [
     "aitelier-client",
-    "mcp>=1.0",
+    # The 2.x package removed mcp.server.fastmcp, which this SDK uses.
+    "mcp>=1.0,<2",
 ]
 
 [project.optional-dependencies]
