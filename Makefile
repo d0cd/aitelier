@@ -1,4 +1,4 @@
-.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start stop restart logs status doctor backup restore
+.PHONY: install test test-py test-ts test-live test-host-mode-e2e test-docker-mode-e2e test-brig-mode-e2e test-all-modes-e2e lint clean reset start brig-local stop restart logs status doctor backup restore
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -92,6 +92,12 @@ lint:
 # Boot everything. Idempotent — re-running skips what's already up.
 start:
 	./scripts/start.sh
+
+# Build Sandbox Agent + codex-acp from the authorized local worktrees under
+# ~/tools, bake their Linux binaries into the Brig image, and restart only the
+# sandbox-agent cell. No upstream package publication is required.
+brig-local:
+	./scripts/build-local-agent-image.sh
 
 # Tear everything down. Postgres data volume survives (use `make reset` to wipe it).
 stop:

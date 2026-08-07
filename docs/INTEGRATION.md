@@ -136,7 +136,11 @@ The Python SDK defaults to `"float"`, so no action needed there.
 OpenAI-shape model list. Two flavors of entry:
 
 - **LLM**: standard OpenAI shape — `{id, object: "model", owned_by, response_format}`. `response_format` lists the `json_object` / `json_schema` modes the provider supports. Anthropic / `claude-*` is `[]` because LiteLLM's adapter rejects OpenAI-shape `json_schema`; `local` / `ollama/*` is both (aitelier bypasses LiteLLM and maps to Ollama's native `format` field); OpenAI / `gpt-*` is both.
-- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_inner_llms: [...], aitelier_reasoning_levels: [...], aitelier_approval_modes: [...], aitelier_capabilities: {...}}` — the Sandbox Agent capability flags plus the backend's **actually-advertised** options (probed live per backend and cached): the real inner-model ids, reasoning levels, and approval modes it accepts. These are the authoritative ids for `agent:<backend>/<model>` + `aitelier.reasoning_effort` / `aitelier.approval_mode`; passing one the backend doesn't offer fails fast with the valid list. The three option arrays are omitted for a backend whose probe fails (the entry still appears). See "Selecting the inner model" below.
+- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_agent_version, aitelier_agent_process_version, aitelier_inner_llms: [...], aitelier_reasoning_levels: [...], aitelier_approval_modes: [...], aitelier_capabilities: {...}}` — the Sandbox Agent capability flags plus the native agent/ACP adapter versions and backend's **actually-advertised** options (probed live per backend and cached): the real inner-model ids, reasoning levels, and approval modes it accepts. These are the authoritative compatibility tuple and ids for `agent:<backend>/<model>` + `aitelier.reasoning_effort` / `aitelier.approval_mode`; passing one the backend doesn't offer fails fast with the valid list. Version fields are omitted when the deployed Sandbox Agent cannot report them. The three option arrays are omitted for a backend whose probe fails (the entry still appears). See "Selecting the inner model" below.
+
+Use `GET /v1/models?agent_backend=codex` when validating one selected agent.
+The response still includes LLM entries, but probes and returns only that agent
+backend, so an unavailable unrelated backend cannot add its probe timeout.
 
 Every entry also carries an `aitelier_request_caps` block declaring which
 OpenAI request fields the route honors:
@@ -499,6 +503,12 @@ ignore them; they don't break the OpenAI shape):
   subscription cost can sum the two. Omitted when zero (LLM path, or
   agent backends that don't surface the breakdown).
 
+- **`usage.completion_tokens_details.reasoning_tokens`** (int, when reported)
+  — exact reasoning-output tokens supplied by the inner agent. Codex support
+  requires a `codex-acp` build that forwards Codex core's token counters in ACP
+  `PromptResponse.usage`; context-window `usage_update.used` is not treated as
+  token spend.
+
 ### Streaming
 
 Set `stream: true`. The response is OpenAI-compatible SSE.
@@ -552,6 +562,17 @@ curl -X POST http://localhost:7777/v1/runs \
 The webhook receives the ChatCompletion (or an error body) when the run
 completes. Failed runs whose process died are flipped to `orphaned` on
 service restart (see [Run state machine](#run-state-machine)).
+
+The accepted response is a durability boundary: before it is returned, the
+`pending` run row has been committed. An immediate `GET`, `wait`, or `cancel`
+using the returned id will not transiently 404.
+
+For agent requests using `response_format`, the durable terminal result stores
+the recovered value in `result.parsed`, including a single JSON value wrapped
+in prose or code fences. A `json_schema` result that is absent, ambiguous, or
+does not validate is finalized as `failed` with `error_type: SchemaViolation`;
+the raw content and parsed value (when recoverable) remain available for
+diagnosis.
 
 LLM calls don't go here — they're short enough to stream synchronously.
 `/v1/runs` 400s on non-`agent:` models.
@@ -932,6 +953,27 @@ cached), so consumers can pre-validate instead of hard-coding:
 These fields are omitted for a backend whose probe fails (the entry still
 appears). They are the authoritative source of valid ids — not the LLM-path
 catalog.
+
+The agent entries also expose the compatibility tuple reported by Sandbox
+Agent as `aitelier_agent_version` and `aitelier_agent_process_version`. For
+Codex, these are respectively the native Codex CLI and Zed `codex-acp`
+adapter versions. Record both when diagnosing a missing terminal response.
+
+The Brig image currently pins Codex CLI `0.137.0` with `codex-acp` `0.16.0`,
+matching the Codex core release embedded by that adapter. Trellis previously
+verified CLI `0.132.0` with `codex-acp` `0.14.0`; pairing CLI `0.146.1` with
+that older adapter emitted content but did not terminate. Treat unlisted
+cross-version combinations as unverified rather than assuming CLI and adapter
+versions are interchangeable.
+
+For local development of Sandbox Agent or `codex-acp`, no registry release is
+required. `make brig-local` stages only `~/tools/sandbox-agent`,
+`~/tools/codex-acp`, and Aitelier's required runtime assets into a temporary
+build context, compiles Linux release binaries inside the Brig image build,
+replaces the local `sandbox-agent` cell, and leaves the host worktrees
+untouched. Override either source with `LOCAL_SANDBOX_AGENT_SOURCE` or
+`LOCAL_CODEX_ACP_SOURCE`; use `scripts/build-local-agent-image.sh --build-only`
+to build the image without restarting the cell.
 
 ### Claude-only options on other backends
 
@@ -1467,6 +1509,12 @@ captured per path and normalized — the LLM/embed paths report OpenAI-shape
 `input_tokens`/`output_tokens`. **`null` means the backend reported no
 usage** (some agent backends, or a failed/in-flight run) — distinct from a
 genuine `0`, so dashboards can tell "unknown" from "zero".
+
+For Codex, Aitelier consumes ACP's native end-turn usage. The matching
+`codex-acp` bridge reads Codex core's cumulative input, cached-input, output,
+reasoning-output, and total counters directly; it does not extrapolate from
+the context-window occupancy notification. A fresh ACP session is created for
+each Aitelier run, so the reported session totals are that run's exact totals.
 
 ## Observability — OpenTelemetry export
 

@@ -58,9 +58,9 @@ RUN npm config set fetch-retries 5 \
  && npm config set fetch-retry-maxtimeout 120000 \
  && npm config set fetch-timeout 600000 \
  && npm install -g \
-        @openai/codex@0.132.0 \
+        @openai/codex@0.137.0 \
         @agentclientprotocol/claude-agent-acp@0.36.1 \
-        @zed-industries/codex-acp@0.14.0 \
+        @zed-industries/codex-acp@0.16.0 \
  && command -v codex \
  && command -v claude-agent-acp \
  && command -v codex-acp

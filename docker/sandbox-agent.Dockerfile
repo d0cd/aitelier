@@ -23,7 +23,8 @@ RUN apk add --no-cache curl bash ca-certificates nodejs npm git \
 
 # Credentials get mounted in by docker-compose, not baked in. SA reads
 # ~/.claude/.credentials.json and ~/.codex/auth.json at agent dispatch.
-ENV HOME=/root
+ENV HOME=/root \
+    SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS=3660000
 WORKDIR /workspaces
 
 EXPOSE 2468

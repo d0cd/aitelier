@@ -334,6 +334,11 @@ def agent_usage_to_openai(usage: dict | None) -> dict | None:
         if cache_creation is not None:
             details["cache_creation_tokens"] = int(cache_creation)
         out["prompt_tokens_details"] = details
+    reasoning = usage.get("reasoning_tokens")
+    if reasoning is not None:
+        out["completion_tokens_details"] = {
+            "reasoning_tokens": int(reasoning),
+        }
     return out
 
 
@@ -464,33 +469,47 @@ def wants_json(body: dict) -> bool:
     return isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
 
 
-def try_parse_json(content: str) -> Any:
-    """Best-effort JSON parse with fence + prose stripping.
+def parse_unique_json(content: str) -> tuple[bool, Any]:
+    """Recover exactly one JSON value from raw, fenced, or prose text.
 
     The consumer asked for JSON. The model may have wrapped it in
-    ```json fences``` or prefixed prose ("Here's the JSON: { ... }").
-    Returns the parsed value, or None if nothing parses.
+    ```json fences``` or prefixed prose ("Here's the JSON: { ... }"). Never
+    choose between multiple objects/arrays: ambiguity returns ``(False, None)``.
     """
     if not content:
-        return None
-    candidates = [content.strip()]
-    stripped = candidates[0]
-    if stripped.startswith("```"):
-        inner = stripped.split("\n", 1)[1] if "\n" in stripped else stripped
-        if inner.endswith("```"):
-            inner = inner[:-3].rstrip()
-        candidates.append(inner.strip())
-    for opener, closer in (("{", "}"), ("[", "]")):
-        start = stripped.find(opener)
-        end = stripped.rfind(closer)
-        if start != -1 and end != -1 and end > start:
-            candidates.append(stripped[start:end + 1])
-    for c in candidates:
+        return False, None
+    stripped = content.strip()
+    try:
+        return True, json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    values: list[Any] = []
+    pos = 0
+    while pos < len(stripped):
+        starts = [i for i in (stripped.find("{", pos), stripped.find("[", pos)) if i >= 0]
+        if not starts:
+            break
+        start = min(starts)
         try:
-            return json.loads(c)
+            value, consumed = decoder.raw_decode(stripped[start:])
         except json.JSONDecodeError:
+            pos = start + 1
             continue
-    return None
+        values.append(value)
+        pos = start + consumed
+        if len(values) > 1:
+            return False, None
+    if len(values) == 1:
+        return True, values[0]
+    return False, None
+
+
+def try_parse_json(content: str) -> Any:
+    """Compatibility wrapper returning the unique value or ``None``."""
+    found, value = parse_unique_json(content)
+    return value if found else None
 
 
 def _normalize_usage_cache_details(usage: dict | None) -> None:

@@ -39,7 +39,12 @@ async def start_run(spec: RunSpec) -> None:
     await store.update_run_state(spec.run_id, "running")
 
 
-async def record_run(spec: RunSpec, work: Awaitable[dict[str, Any]]) -> dict:
+async def record_run(
+    spec: RunSpec,
+    work: Awaitable[dict[str, Any]],
+    *,
+    precreated: bool = False,
+) -> dict:
     """Persist a run around an awaitable. Single state-machine path.
 
     Cancellation can land at any await point — including INSIDE create_run
@@ -52,7 +57,8 @@ async def record_run(spec: RunSpec, work: Awaitable[dict[str, Any]]) -> dict:
 
     store = await get_store()
     try:
-        await store.create_run(spec)
+        if not precreated:
+            await store.create_run(spec)
         await store.update_run_state(spec.run_id, "running")
         result = await work
     except asyncio.CancelledError:

@@ -96,6 +96,14 @@ def test_agent_usage_surfaces_native_cache_keys():
     }
 
 
+def test_agent_usage_surfaces_reasoning_tokens():
+    out = agent_usage_to_openai({
+        "input_tokens": 10, "output_tokens": 5, "total_tokens": 15,
+        "reasoning_tokens": 3,
+    })
+    assert out["completion_tokens_details"] == {"reasoning_tokens": 3}
+
+
 def test_agent_usage_none_passthrough():
     assert agent_usage_to_openai(None) is None
     assert agent_usage_to_openai({}) is None

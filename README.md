@@ -54,6 +54,7 @@ resp = await openai.chat.completions.create(
 | Command | What |
 |---|---|
 | `make start` | Bring up everything. Idempotent. |
+| `make brig-local` | Build patched Sandbox Agent + codex-acp worktrees from `~/tools` into the local Brig image and restart its cell; publishes nothing. |
 | `make stop` | Bring everything down. Postgres data survives. |
 | `make restart` | Restart just the aitelier service (leaves infra hot). Use after editing `core/src/aitelier/`. |
 | `make logs` | Tail service + sandbox-agent logs. |
@@ -67,6 +68,9 @@ resp = await openai.chat.completions.create(
 ## When something's wrong
 
 - `make start` fails → `make doctor` names the cause (port conflict, missing creds, Docker down)
+- Suspected agent/adapter mismatch → `./scripts/doctor.sh --agent-turn codex`
+  performs a small billed end-to-end turn and reports the native and ACP
+  adapter versions with the terminal result.
 - Service won't respond → `make logs` shows the last output. Files live at:
   - `runs/logs/aitelier.log` (FastAPI service)
   - `runs/.sandbox-agent.log` (Rivet Sandbox Agent)

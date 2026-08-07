@@ -35,6 +35,7 @@ from aitelier.inference_exec import (  # noqa: F401  (re-exported for endpoints)
     _llm_body_from_request,
     _llm_chat_completion,
     _llm_chat_completion_stream,
+    _plan_agent_run,
     _producer_for_acp_stream,
     _record_idempotency,
     _reject_agent_incompatible_fields,

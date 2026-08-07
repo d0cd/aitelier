@@ -11,6 +11,7 @@ from aitelier.providers.sandbox_agent import (
     AcpError,
     _adapt_mcp_servers,
     _aggregate_result,
+    _translate_note,
     call_via_sandbox,
 )
 
@@ -25,6 +26,7 @@ async def test_call_returns_result_from_synchronous_post():
     fake_resp.json = MagicMock(return_value={"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
     fake_resp.raise_for_status = MagicMock()
     fake_http.post = AsyncMock(return_value=fake_resp)
+    fake_http.delete = AsyncMock(return_value=MagicMock(status_code=204))
 
     async with AcpClient("http://x:2468", "claude-code", http_client=fake_http) as c:
         result = await c.call("initialize", {"protocolVersion": 1}, first=True)
@@ -33,6 +35,9 @@ async def test_call_returns_result_from_synchronous_post():
     # First POST should include the agent query param
     args, kwargs = fake_http.post.call_args
     assert "agent=claude-code" in args[0]
+    delete_args, _ = fake_http.delete.call_args
+    assert delete_args[0].endswith(f"/v1/acp/{c.server_id}")
+    assert "agent=" not in delete_args[0]
 
 
 @pytest.mark.asyncio
@@ -46,6 +51,7 @@ async def test_call_raises_on_jsonrpc_error():
     })
     fake_resp.raise_for_status = MagicMock()
     fake_http.post = AsyncMock(return_value=fake_resp)
+    fake_http.delete = AsyncMock(return_value=MagicMock(status_code=204))
 
     async with AcpClient("http://x:2468", "claude-code", http_client=fake_http) as c:
         with pytest.raises(AcpError) as exc_info:
@@ -333,6 +339,7 @@ def test_aggregate_result_extracts_usage_when_agent_surfaces_it():
         "input_tokens": 120,
         "output_tokens": 45,
         "total_tokens": 165,
+        "reasoning_tokens": None,
         "cached_read_tokens": None,
         "cached_write_tokens": None,
     }
@@ -349,6 +356,7 @@ def test_aggregate_result_extracts_cache_tokens():
             "content": "hi",
             "usage": {
                 "inputTokens": 5, "outputTokens": 200, "totalTokens": 48266,
+                "thoughtTokens": 120,
                 "cachedReadTokens": 47807, "cachedWriteTokens": 254,
             },
         },
@@ -357,6 +365,7 @@ def test_aggregate_result_extracts_cache_tokens():
     )
     assert result["usage"]["input_tokens"] == 5
     assert result["usage"]["output_tokens"] == 200
+    assert result["usage"]["reasoning_tokens"] == 120
     assert result["usage"]["cached_read_tokens"] == 47807
     assert result["usage"]["cached_write_tokens"] == 254
 
@@ -448,6 +457,82 @@ def test_aggregate_result_handles_unparseable_json():
         response_format={"type": "json_schema", "schema": {}},
     )
     assert result["parsed"] is None
+    assert result["status"] == "error"
+    assert result["error_type"] == "SchemaViolation"
+
+
+def test_aggregate_result_parses_fenced_or_prose_prefixed_json():
+    result = _aggregate_result(
+        agent="codex", run_id="r1",
+        turn_result={
+            "stopReason": "completed",
+            "content": 'Review complete.\n```json\n{"answer": 42}\n```',
+        },
+        elapsed=0.2,
+        response_format={"type": "json_schema", "schema": {
+            "type": "object",
+            "required": ["answer"],
+            "properties": {"answer": {"type": "integer"}},
+        }},
+    )
+    assert result["parsed"] == {"answer": 42}
+    assert result["status"] == "ok"
+
+
+def test_aggregate_result_rejects_schema_nonconformance():
+    result = _aggregate_result(
+        agent="codex", run_id="r1",
+        turn_result={"content": '{"answer": "forty-two"}'},
+        elapsed=0.2,
+        response_format={"type": "json_schema", "json_schema": {
+            "name": "answer",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+            },
+        }},
+    )
+    assert result["parsed"] == {"answer": "forty-two"}
+    assert result["status"] == "error"
+    assert result["error_type"] == "SchemaViolation"
+
+
+def test_aggregate_result_rejects_ambiguous_json_values():
+    result = _aggregate_result(
+        agent="codex", run_id="r1",
+        turn_result={"content": 'first {"answer": 1}; second {"answer": 2}'},
+        elapsed=0.2,
+        response_format={"type": "json_schema", "schema": {"type": "object"}},
+    )
+    assert result["parsed"] is None
+    assert result["status"] == "error"
+    assert result["error_type"] == "SchemaViolation"
+
+
+@pytest.mark.asyncio
+async def test_translate_note_counts_calls_without_counting_results():
+    class _Emitter:
+        async def emit(self, kind, payload=None):
+            pass
+
+    calls: list[dict] = []
+    chunks: list[str] = []
+    await _translate_note(
+        {"params": {"update": {
+            "sessionUpdate": "tool_call", "toolCallId": "tc-1", "name": "Read",
+        }}},
+        text_chunks=chunks, tool_calls=calls, emitter=_Emitter(),
+    )
+    await _translate_note(
+        {"params": {"update": {
+            "sessionUpdate": "tool_call_update", "toolCallId": "tc-1",
+            "status": "completed", "name": "Read", "rawOutput": "ok",
+        }}},
+        text_chunks=chunks, tool_calls=calls, emitter=_Emitter(),
+    )
+    assert len(calls) == 1
+    assert calls[0]["tool"] == "Read"
 
 
 # --- MCP server adaptation ---------------------------------------------------
@@ -1026,6 +1111,9 @@ async def test_call_via_sandbox_orchestrates_full_turn():
 async def _patch_acp_aenter_with_fake_http(monkeypatch, fake_http) -> None:
     import aitelier.providers.sandbox_agent as mod
 
+    if not isinstance(fake_http.delete, AsyncMock):
+        fake_http.delete = AsyncMock(return_value=MagicMock(status_code=204))
+
     async def patched_aenter(self):
         self._http = fake_http
         self._owns_http = False
@@ -1086,6 +1174,7 @@ async def test_call_via_sandbox_closes_session_when_prompt_fails(monkeypatch):
         return resp
 
     fake_http.post = AsyncMock(side_effect=fake_post)
+    fake_http.delete = AsyncMock(return_value=MagicMock(status_code=204))
     fake_http.stream = MagicMock(return_value=_fake_sse_stream())
 
     await _patch_acp_aenter_with_fake_http(monkeypatch, fake_http)
@@ -1099,6 +1188,7 @@ async def test_call_via_sandbox_closes_session_when_prompt_fails(monkeypatch):
         "session/close must fire on the prompt-error path; "
         f"observed: {methods}"
     )
+    fake_http.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1141,6 +1231,7 @@ async def test_call_via_sandbox_closes_session_on_cancellation(monkeypatch):
         return resp
 
     fake_http.post = AsyncMock(side_effect=fake_post)
+    fake_http.delete = AsyncMock(return_value=MagicMock(status_code=204))
     fake_http.stream = MagicMock(return_value=_fake_sse_stream())
 
     await _patch_acp_aenter_with_fake_http(monkeypatch, fake_http)
@@ -1161,10 +1252,12 @@ async def test_call_via_sandbox_closes_session_on_cancellation(monkeypatch):
         await task
 
     methods = [p.get("method") for p in posts]
+    assert "session/cancel" in methods
     assert "session/close" in methods, (
         "session/close must fire on the cancellation path; "
         f"observed: {methods}"
     )
+    fake_http.delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio

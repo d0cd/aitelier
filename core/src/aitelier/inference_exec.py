@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import HTTPException, Request
@@ -67,6 +68,74 @@ _release_idempotency_ctx = _idem.release_idempotency_ctx
 
 # Sentinel pushed onto the agent-stream queue to signal end-of-stream.
 _STREAM_QUEUE_SENTINEL: dict = {"_eof": True}
+
+
+@dataclass(frozen=True)
+class _AgentRunPlan:
+    """Deterministic agent request projection used before work is scheduled.
+
+    Keeping the durable RunSpec beside the translated prompt prevents the
+    async endpoint and background executor from constructing subtly different
+    records for the same acknowledged run id.
+    """
+
+    spec: RunSpec
+    opts: AitelierAgentOpts
+    system_prompt: str | None
+    initial_message: str
+
+
+def _plan_agent_run(
+    req: ChatCompletionRequest,
+    request: Request,
+    *,
+    agent_backend: str,
+    inner_llm: str | None,
+    run_id: str,
+    webhook_url: str | None = None,
+) -> _AgentRunPlan:
+    """Validate and project an agent request without starting provider work."""
+
+    cid = request.state.correlation_id
+    _reject_agent_incompatible_fields(req, agent_backend)
+    opts = req.aitelier or AitelierAgentOpts()
+
+    system_prompt, initial_message = _translate_messages(req.messages)
+    system_prompt = _fold_examples(system_prompt, opts.examples)
+    system_prompt = _fold_response_format(system_prompt, req.response_format)
+
+    metadata: dict[str, Any] = {"correlation_id": cid}
+    if webhook_url:
+        metadata["webhook_url"] = webhook_url
+
+    rendered_messages = [
+        {"role": "system", "content": system_prompt or ""},
+        {"role": "user", "content": initial_message or ""},
+    ]
+    spec = RunSpec(
+        run_id=run_id,
+        kind="agent",
+        agent_id=agent_backend,
+        model=inner_llm,
+        trace_tag=opts.trace_tag,
+        correlation_id=cid,
+        parent_run_id=opts.parent_run_id,
+        workspace=opts.workspace,
+        environment={
+            "mcp_servers": opts.mcp_servers or [],
+            "tool_allowlist": opts.tool_allowlist or [],
+        },
+        system_prompt_hash=hash_system_prompt(system_prompt),
+        metadata=metadata,
+        request_body=req.model_dump(exclude_none=True),
+        rendered_messages=rendered_messages,
+    )
+    return _AgentRunPlan(
+        spec=spec,
+        opts=opts,
+        system_prompt=system_prompt,
+        initial_message=initial_message,
+    )
 
 
 def _fold_examples(system_prompt: str | None, examples: list[dict] | None) -> str | None:
@@ -469,10 +538,36 @@ def _stream_terminal_state(final: dict | None, *, agent_backend: str) -> tuple[d
     return final, _terminal_state_from_final(final)
 
 
+async def _finalize_precreated_agent_failure(store, run_id: str, exc: BaseException) -> None:
+    """Settle a pending agent row when setup fails before ``record_run``."""
+
+    if isinstance(exc, asyncio.CancelledError):
+        result = {
+            "status": "cancelled",
+            "error_type": "Cancelled",
+            "error_msg": "run cancelled during preparation",
+            "finish_reason": "cancelled",
+        }
+        state = "cancelled"
+    else:
+        result = {
+            "status": "error",
+            "error_type": classify_error(exc),
+            "error_msg": scrub_error_text(str(exc)),
+            "finish_reason": "error",
+        }
+        state = "failed"
+    try:
+        await store.finalize_run(run_id, result, state=state)
+    except (KeyError, ValueError):
+        pass
+
+
 async def _agent_chat_completion(
     req: ChatCompletionRequest, request: Request, *,
     agent_backend: str, inner_llm: str | None, run_id: str,
     webhook_url: str | None = None,
+    run_precreated: bool = False,
 ) -> dict:
     """Sync agent path: prepare → execute → artifacts → ChatCompletion.
 
@@ -487,51 +582,36 @@ async def _agent_chat_completion(
     """
 
     cid = request.state.correlation_id
-    _reject_agent_incompatible_fields(req, agent_backend)
-    opts = req.aitelier or AitelierAgentOpts()
+    plan = _plan_agent_run(
+        req,
+        request,
+        agent_backend=agent_backend,
+        inner_llm=inner_llm,
+        run_id=run_id,
+        webhook_url=webhook_url,
+    )
+    spec = plan.spec
+    opts = plan.opts
+    system_prompt = plan.system_prompt
+    initial_message = plan.initial_message
 
-    system_prompt, initial_message = _translate_messages(req.messages)
-    system_prompt = _fold_examples(system_prompt, opts.examples)
-    system_prompt = _fold_response_format(system_prompt, req.response_format)
+    store = await get_store()
+    if not run_precreated:
+        await store.create_run(spec)
 
-    prep_result = await _run_prepare(opts.prepare)
+    try:
+        prep_result = await _run_prepare(opts.prepare)
+    except BaseException as exc:
+        await _finalize_precreated_agent_failure(store, run_id, exc)
+        raise
     if prep_result.get("error"):
         await _stop_sidecars(prep_result.get("sidecars") or [])
         failed = _prepare_failed_result(run_id, prep_result, cid)
+        await store.finalize_run(run_id, failed, state="failed")
         status, body = agent_error_to_chat_completion_error(failed)
         body["aitelier_status_code"] = status
         body["correlation_id"] = cid
         return body
-
-    run_metadata: dict[str, Any] = {"correlation_id": cid}
-    if webhook_url:
-        run_metadata["webhook_url"] = webhook_url
-
-    # Rendered messages for the agent path: SA receives system_prompt +
-    # the single initial_message (the message list collapses to "last
-    # user turn"). Capturing this here so consumers reading
-    # `/v1/runs/{id}.rendered_messages` see what the agent actually saw,
-    # which can differ from `request_body.messages` (multi-turn history
-    # is folded into the system prompt before dispatch).
-    rendered_messages = [
-        {"role": "system", "content": system_prompt or ""},
-        {"role": "user", "content": initial_message or ""},
-    ]
-    spec = RunSpec(
-        run_id=run_id, kind="agent",
-        agent_id=agent_backend, model=inner_llm,
-        trace_tag=opts.trace_tag, correlation_id=cid,
-        parent_run_id=opts.parent_run_id,
-        workspace=opts.workspace,
-        environment={
-            "mcp_servers": opts.mcp_servers or [],
-            "tool_allowlist": opts.tool_allowlist or [],
-        },
-        system_prompt_hash=hash_system_prompt(system_prompt),
-        metadata=run_metadata,
-        request_body=req.model_dump(exclude_none=True),
-        rendered_messages=rendered_messages,
-    )
 
     async def _do() -> dict:
         from aitelier.providers.sandbox_agent import call_via_sandbox
@@ -550,7 +630,7 @@ async def _agent_chat_completion(
             run_id=run_id,
         )
 
-    run_task = asyncio.create_task(record_run(spec, _do()))
+    run_task = asyncio.create_task(record_run(spec, _do(), precreated=True))
     _active_runs[run_id] = run_task
     try:
         result = await run_task

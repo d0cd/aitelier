@@ -1014,6 +1014,47 @@ def test_models_endpoint_surfaces_probed_backend_options(client):
     assert entry["aitelier_approval_modes"] == ["read-only", "auto", "full-access"]
 
 
+def test_models_endpoint_can_probe_only_selected_agent_backend(client):
+    """Deployment checks for Codex must not wait on an unrelated backend."""
+    from aitelier.endpoints.inference import _CONFIG_OPTS_CACHE
+    _CONFIG_OPTS_CACHE.clear()
+    agents = [
+        {"id": "codex", "installed": True, "capabilities": {}},
+        {"id": "cursor", "installed": True, "capabilities": {}},
+    ]
+    p1, p2, p3 = _patch_models_env(
+        agents,
+        {"models": ["gpt-5.5"], "reasoning_levels": [], "approval_modes": []},
+    )
+    with p1, p2, p3 as probe:
+        resp = client.get("/v1/models?agent_backend=codex")
+    assert resp.status_code == 200
+    agent_ids = [
+        m["id"] for m in resp.json()["data"] if m.get("aitelier_agent")
+    ]
+    assert agent_ids == ["agent:codex"]
+    probe.assert_awaited_once()
+    assert probe.await_args.args[1] == "codex"
+
+
+def test_models_endpoint_surfaces_native_and_adapter_versions(client):
+    from aitelier.endpoints.inference import _CONFIG_OPTS_CACHE
+    _CONFIG_OPTS_CACHE.clear()
+    agents = [{
+        "id": "codex",
+        "installed": True,
+        "version": "0.137.0",
+        "agentProcessVersion": "0.16.0",
+        "capabilities": {},
+    }]
+    p1, p2, p3 = _patch_models_env(agents, None)
+    with p1, p2, p3:
+        resp = client.get("/v1/models?agent_backend=codex")
+    entry = next(m for m in resp.json()["data"] if m["id"] == "agent:codex")
+    assert entry["aitelier_agent_version"] == "0.137.0"
+    assert entry["aitelier_agent_process_version"] == "0.16.0"
+
+
 def test_models_endpoint_omits_options_when_probe_fails(client):
     """A failed probe omits the advertised-option fields but the entry still
     appears (with request caps)."""
@@ -2248,6 +2289,11 @@ def test_async_run_returns_run_id_immediately(client):
     assert data["status"] == "accepted"
     assert data["run_id"]
     assert data["webhook_url"] is None
+    # The acknowledgement is a durability boundary: consumers may GET the
+    # returned id immediately without polling around a transient 404.
+    run_resp = client.get(f"/v1/runs/{data['run_id']}")
+    assert run_resp.status_code == 200
+    assert run_resp.json()["run_id"] == data["run_id"]
 
 
 def test_async_run_rejects_non_agent_model(client):

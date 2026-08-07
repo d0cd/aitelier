@@ -35,6 +35,35 @@ Acceptance criteria:
 - Regression tests cover every supported agent credential, and neither normal logs nor error
   messages contain the secret.
 
+Implementation update: the local Sandbox Agent worktree now makes every default
+`credentials extract` path metadata-only, including the previously unsafe
+`--agent` and `--provider` branches. Raw selected values require `--reveal`, and
+regression tests assert that default summaries contain no secret material.
+
+## Aitelier implementation status
+
+The Aitelier-owned follow-up is now implemented in this worktree:
+
+- Async acceptance commits the pending run before returning its id.
+- Cancellation settles the owned ACP prompt task, closes the session, and deletes the
+  Sandbox Agent proxy; deployment defaults also keep SA's internal ACP timeout from
+  preempting Aitelier's deadline.
+- Terminal aggregates count `tool_call`, not matching `tool_result`, events.
+- Durable structured results use an ambiguity-rejecting parser and validate requested JSON
+  Schema, finalizing nonconformance as `SchemaViolation`.
+- `GET /v1/models?agent_backend=<id>` probes only the selected backend.
+- Agent discovery records both the native agent and ACP adapter versions; the
+  Brig Codex pairing is updated to CLI `0.137.0` plus `codex-acp` `0.16.0`.
+- ACP-reported token and reasoning usage is normalized into durable/OpenAI
+  usage fields. A local `codex-acp` change now forwards Codex core's exact
+  cumulative counters through ACP `PromptResponse.usage`; the local Brig build
+  workflow deploys that worktree directly, without requiring a registry release.
+
+The hard work-budget/synthesis contract and any missing reasoning-option facts
+remain backend/bridge capabilities. Aitelier maps verifiable signals when Sandbox
+Agent/the selected ACP adapter exposes them; it does not estimate token spend or
+claim a hard limit from prompt-only tool guidance.
+
 ## P0: enforceable agent work budget with a synthesis reserve
 
 Prompt-only tool limits are not reliable. The specialists were explicitly instructed to use
@@ -148,6 +177,13 @@ reasoning levels, forcing consumers to omit `reasoning_effort` and record `backe
 If Codex ACP exposes actual input/output/inner token facts, Aitelier should map them. Context
 window `used` samples must not be relabeled as spend. Reasoning levels should be advertised
 only when the backend can prove it applies them.
+
+Implementation update: Codex core `0.137.0` already emits exact input, cached-input,
+output, reasoning-output, and total counters. The local `codex-acp` worktree now
+maps those counters to ACP's native `PromptResponse.usage`, and Aitelier preserves
+them (including OpenAI `completion_tokens_details.reasoning_tokens`). This is not
+an extrapolation from context-window occupancy. The deployed adapter must include
+that bridge change; `make brig-local` supplies it directly from the local worktree.
 
 ## P2: model discovery latency is dominated by unrelated backends
 

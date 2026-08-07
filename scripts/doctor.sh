@@ -6,6 +6,30 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 issues=0
+agent_turn_backend=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --agent-turn)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                echo "usage: $0 [--agent-turn <backend>]" >&2
+                exit 2
+            fi
+            agent_turn_backend="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "usage: $0 [--agent-turn <backend>]"
+            echo "  --agent-turn <backend>  run a small billed terminal-turn handshake"
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $1" >&2
+            echo "usage: $0 [--agent-turn <backend>]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # shellcheck source=lib.sh
 . "$(dirname "$0")/lib.sh"
@@ -231,6 +255,76 @@ if [ "$SA_MODE" = "brig" ]; then
     else
         _fail "prebaked claude binary missing (docker/prebaked-agents/claude/claude)"
         printf "      → see docker/sandbox-agent.brig.Dockerfile for the one-time fetch command\n"
+    fi
+fi
+
+if [ -n "$agent_turn_backend" ]; then
+    echo ""
+    echo "=== Agent terminal handshake ($agent_turn_backend) ==="
+    if ! _aitelier_alive_on 7777; then
+        _fail "aitelier is not running; start it before the terminal-turn handshake"
+    else
+        if handshake_output="$(uv run --project core python - "$agent_turn_backend" <<'PY'
+import json
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+backend = sys.argv[1]
+base = "http://127.0.0.1:7777"
+
+try:
+    query = urllib.parse.urlencode({"agent_backend": backend})
+    with urllib.request.urlopen(f"{base}/v1/models?{query}", timeout=20) as response:
+        catalog = json.load(response)
+    entry = next(
+        model for model in catalog.get("data", [])
+        if model.get("id") == f"agent:{backend}"
+    )
+    inner_models = entry.get("aitelier_inner_llms") or []
+    if not inner_models:
+        raise RuntimeError(f"{backend} advertised no selectable inner models")
+    selected = inner_models[0]
+    payload = json.dumps({
+        "model": f"agent:{backend}/{selected}",
+        "messages": [{
+            "role": "user",
+            "content": "Reply with exactly OK. Do not use tools.",
+        }],
+        "timeout": 45,
+        "aitelier": {"approval_mode": "read-only"},
+    }).encode()
+    request = urllib.request.Request(
+        f"{base}/v1/chat/completions",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=55) as response:
+        result = json.load(response)
+    if result.get("error"):
+        raise RuntimeError(json.dumps(result["error"], sort_keys=True))
+    choices = result.get("choices") or []
+    if not choices or choices[0].get("finish_reason") is None:
+        raise RuntimeError("response arrived without a terminal finish_reason")
+    print(json.dumps({
+        "backend": backend,
+        "model": selected,
+        "agent_version": entry.get("aitelier_agent_version"),
+        "agent_process_version": entry.get("aitelier_agent_process_version"),
+        "finish_reason": choices[0]["finish_reason"],
+        "run_id": result.get("aitelier_run_id"),
+    }, sort_keys=True))
+except (OSError, KeyError, StopIteration, RuntimeError, urllib.error.HTTPError) as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+PY
+)"; then
+            _ok "terminal turn completed: $handshake_output"
+        else
+            _fail "terminal turn failed for $agent_turn_backend"
+        fi
     fi
 fi
 

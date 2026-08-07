@@ -49,7 +49,7 @@ async def _probe_traces() -> dict:
         return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
-async def _sandbox_agents_request(cfg):
+async def _sandbox_agents_request(cfg, *, config: bool = False):
     """GET Sandbox Agent's /v1/agents. Returns the httpx response so callers
     apply their own status/error handling. Raises on transport failure."""
     from aitelier.providers.llm import get_shared_client
@@ -60,6 +60,7 @@ async def _sandbox_agents_request(cfg):
     return await client.get(
         f"{cfg.sandbox_agent.base_url}/v1/agents",
         headers=headers,
+        params={"config": "true"} if config else None,
         timeout=3,
     )
 

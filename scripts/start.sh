@@ -82,6 +82,12 @@ fi
 # reproducible deploys, pin an exact patch (e.g. "0.4.3") here and keep the
 # docker/*.Dockerfile ARGs in sync. Override via env if needed.
 SANDBOX_AGENT_CHANNEL="${SANDBOX_AGENT_CHANNEL:-0.4.x}"
+# Sandbox Agent's ACP proxy otherwise defaults to 120s, shorter than
+# aitelier's 600s default and common explicit long-run timeouts. Keep the
+# inner request alive long enough for aitelier to remain the authoritative
+# deadline owner; operators can still override this deployment default.
+SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS="${SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS:-3660000}"
+export SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS
 
 # Sandbox Agent port resolution (in order):
 #   1. --sandbox-agent-port <N> CLI flag

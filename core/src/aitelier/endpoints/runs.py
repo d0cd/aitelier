@@ -58,6 +58,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
         _check_idempotency,
         _check_webhook_url_or_die,
         _enqueue_webhook,
+        _plan_agent_run,
         _record_idempotency,
         _reject_if_saturated,
         _release_idempotency_ctx,
@@ -91,12 +92,27 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
         webhook_url = req.webhook_url
         inner_req = req  # ChatCompletionRequest fields are a subset
 
+        # The acknowledgement is a durability boundary: once the client sees
+        # this run id, GET/wait/cancel must never race a missing database row.
+        # Project and commit the pending row before scheduling provider work.
+        plan = _plan_agent_run(
+            inner_req,
+            request,
+            agent_backend=agent_backend,
+            inner_llm=inner_llm,
+            run_id=run_id,
+            webhook_url=webhook_url,
+        )
+        store = await get_store()
+        await store.create_run(plan.spec)
+
         async def _run_and_callback() -> None:
             try:
                 result = await _agent_chat_completion(
                     inner_req, request,
                     agent_backend=agent_backend, inner_llm=inner_llm, run_id=run_id,
                     webhook_url=webhook_url,
+                    run_precreated=True,
                 )
             except Exception as exc:
                 # scrub_error_text() before persistence/delivery so upstream
@@ -460,5 +476,4 @@ def _score_to_dict(s: RunScore) -> dict:
         "metadata":   s.metadata,
         "created_at": s.created_at.isoformat() if s.created_at else None,
     }
-
 

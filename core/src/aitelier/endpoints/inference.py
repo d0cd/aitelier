@@ -191,7 +191,7 @@ def _ensure_base64_embeddings(resp: dict) -> None:
 
 
 @router.get("/v1/models")
-async def list_models_endpoint() -> dict:
+async def list_models_endpoint(agent_backend: str | None = None) -> dict:
     """OpenAI-shape model list. Entries fall into two flavors:
 
     - **LLM**: standard OpenAI shape (`id`, `object: "model"`, `owned_by`).
@@ -210,11 +210,11 @@ async def list_models_endpoint() -> dict:
             status_code=exc.status_code or 502, detail=str(exc),
         ) from None
     cfg = get_config()
-    agents = await _list_agent_models(cfg)
+    agents = await _list_agent_models(cfg, agent_backend=agent_backend)
     return {"object": "list", "data": data + agents}
 
 
-async def _list_agent_models(cfg) -> list[dict]:
+async def _list_agent_models(cfg, *, agent_backend: str | None = None) -> list[dict]:
     """Build agent-model entries by probing Sandbox Agent's /v1/agents.
 
     Returns an empty list when SA is unreachable — `/v1/models` shouldn't
@@ -226,7 +226,7 @@ async def _list_agent_models(cfg) -> list[dict]:
     """
     from aitelier.server import _normalize_agents_payload, _sandbox_agents_request
     try:
-        resp = await _sandbox_agents_request(cfg)
+        resp = await _sandbox_agents_request(cfg, config=True)
         if resp.status_code != 200:
             logger.warning(
                 "agent model enumeration: SA /v1/agents returned HTTP %s "
@@ -246,8 +246,13 @@ async def _list_agent_models(cfg) -> list[dict]:
         return []
 
     agents_raw = _normalize_agents_payload(raw)
-    installed = [a for a in agents_raw
-                 if isinstance(a, dict) and a.get("id") and a.get("installed", True)]
+    installed = [
+        a for a in agents_raw
+        if isinstance(a, dict)
+        and a.get("id")
+        and a.get("installed", True)
+        and (agent_backend is None or a["id"] == agent_backend)
+    ]
 
     # Probe each backend (cached) for the models / reasoning levels / approval
     # modes it actually advertises — the LiteLLM catalog is not the backend's
@@ -291,6 +296,10 @@ async def _list_agent_models(cfg) -> list[dict]:
                 "response_format": ["json_object", "json_schema"],
             },
         }
+        if a.get("version"):
+            entry["aitelier_agent_version"] = a["version"]
+        if a.get("agentProcessVersion"):
+            entry["aitelier_agent_process_version"] = a["agentProcessVersion"]
         if opts is not None:
             # Real, backend-native ids: pair as `agent:<backend>/<model>`,
             # set reasoning via `aitelier.reasoning_effort`, approval via

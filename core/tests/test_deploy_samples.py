@@ -31,6 +31,7 @@ _SA_BRIG_DOCKERFILE = _REPO_ROOT / "docker" / "sandbox-agent.brig.Dockerfile"
 _AITELIER_DOCKERFILE = _REPO_ROOT / "docker" / "Dockerfile"
 _COMPOSE_YAML = _REPO_ROOT / "docker" / "docker-compose.yml"
 _START_SH = _REPO_ROOT / "scripts" / "start.sh"
+_CELL_ENTRYPOINT = _REPO_ROOT / "scripts" / "cell-entrypoint.sh"
 _CONFIG_PY = _REPO_ROOT / "core" / "src" / "aitelier" / "config.py"
 
 
@@ -111,6 +112,14 @@ def test_brig_cell_env_block_contains_no_aitelier_env_vars():
         f"cell yaml env block lists AITELIER_* vars but aitelier reads "
         f"no env vars (see config.py): {bogus}"
     )
+
+
+def test_sandbox_agent_deployments_raise_internal_acp_timeout():
+    """SA's 120s default must not preempt aitelier's longer run deadline."""
+    setting = "SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS"
+    assert setting in _START_SH.read_text()
+    assert setting in _SA_DOCKERFILE.read_text()
+    assert setting in _CELL_ENTRYPOINT.read_text()
 
 
 def test_brig_cell_policy_allows_llm_providers():

@@ -17,13 +17,13 @@ Transport (Sandbox Agent's HTTP wrapping of ACP):
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from typing import Any
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
+from aitelier.openai_compat import parse_unique_json
 from aitelier.pricing import compute_cost
 from aitelier.providers.acp_transport import (
     ACP_PROTOCOL_VERSION as _ACP_PROTOCOL_VERSION,
@@ -397,6 +397,38 @@ async def _close_acp_session(client: AcpClient, session_id: str) -> None:
         )
 
 
+async def _settle_prompt_task(
+    client: AcpClient,
+    session_id: str,
+    prompt_task: asyncio.Task | None,
+) -> None:
+    """Cancel and consume an in-flight prompt before closing its session.
+
+    Merely closing the ACP session leaves the locally-owned ``prompt_task``
+    free to fail later with a transport error. Consuming it here keeps timeout
+    and caller cancellation from producing "Task exception was never
+    retrieved" warnings.
+    """
+    if prompt_task is None:
+        return
+    if not prompt_task.done():
+        try:
+            await asyncio.wait_for(
+                client.notify("session/cancel", {"sessionId": session_id}),
+                timeout=2.0,
+            )
+        except Exception as exc:
+            logger.warning(
+                "session/cancel failed for session %s: %s",
+                session_id, exc,
+            )
+        prompt_task.cancel()
+    try:
+        await prompt_task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 async def probe_backend_config_options(
     cfg, backend: str, *, timeout: float = 10.0,
 ) -> dict | None:
@@ -558,16 +590,16 @@ async def _translate_note(
 
     Each notification is consumed exactly once (from the client queue),
     so both the live phase and the post-prompt drain accumulate into the
-    same `text_chunks` / `tool_calls` — a tool event that lands during
-    drain still counts toward `done.tool_call_count`, keeping the terminal
-    payload consistent with the events the consumer saw on the stream.
+    same `text_chunks` / `tool_calls`. Only `tool_call` events enter the
+    aggregate; matching `tool_result` events remain independently observable
+    on the stream and must not double the terminal call count.
     """
     ev = _notification_to_event(note)
     if ev is None:
         return None
     if ev["type"] == "delta":
         text_chunks.append(ev["content"])
-    elif ev["type"] in ("tool_call", "tool_result"):
+    elif ev["type"] == "tool_call":
         tool_calls.append({k: v for k, v in ev.items() if k != "type"})
     await emitter.emit(
         ev["type"], {k: v for k, v in ev.items() if k != "type"},
@@ -638,6 +670,7 @@ async def call_via_sandbox_stream(
                                  tool_allowlist, emitter)) as client:
             await _persist_sandbox_server_id(run_id, cfg.base_url, client.server_id)
             session_id: str | None = None
+            prompt_task: asyncio.Task | None = None
             try:
                 session_id = await _open_acp_session(
                     client,
@@ -710,9 +743,10 @@ async def call_via_sandbox_stream(
                             name, run_id, timeout,
                         )
                 finally:
-                    # Close session on every exit path — cancellation, prompt
-                    # error, successful completion. Without this the inner
-                    # agent process stays alive indefinitely.
+                    # Cancel/consume the owned request before closing the ACP
+                    # session. This ordering prevents transport fallout from
+                    # surfacing later as an unobserved task exception.
+                    await _settle_prompt_task(client, session_id, prompt_task)
                     await _close_acp_session(client, session_id)
                     session_id = None
 
@@ -782,9 +816,8 @@ async def _build_done_event(
         elapsed=time.monotonic() - start,
         response_format=response_format,
         agent_model=agent_model,
+        content_override="".join(text_chunks) if text_chunks else None,
     )
-    if text_chunks:
-        done["content"] = "".join(text_chunks)
     if tool_calls:
         done["tool_calls"] = tool_calls
     done["type"] = "done"
@@ -964,6 +997,7 @@ def _aggregate_result(
     elapsed: float,
     response_format: dict | None,
     agent_model: str | None = None,
+    content_override: str | None = None,
 ) -> dict:
     """Build the final aitelier result dict from an ACP turn response.
 
@@ -1037,22 +1071,21 @@ def _aggregate_result(
                               "cache_read_input_tokens")
             cache_write = _opt("cached_write_tokens", "cachedWriteTokens",
                                "cache_creation_input_tokens")
+            reasoning = _opt("thought_tokens", "thoughtTokens",
+                             "reasoning_output_tokens", "reasoningOutputTokens")
             usage = {
                 "input_tokens": in_tok,
                 "output_tokens": out_tok,
                 "total_tokens": tot_tok,
+                "reasoning_tokens": reasoning,
                 "cached_read_tokens": cache_read,
                 "cached_write_tokens": cache_write,
             }
 
-    parsed = None
-    if response_format and response_format.get("type") == "json_schema" and content:
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, ValueError):
-            pass
+    if content_override is not None:
+        content = content_override
 
-    return {
+    result = {
         "kind": "agent",
         "provider": agent,
         "status": "ok",
@@ -1060,7 +1093,7 @@ def _aggregate_result(
         "run_id": run_id,
         "trace_id": run_id,
         "content": content,
-        "parsed": parsed,
+        "parsed": None,
         "usage": usage,
         "finish_reason": finish_reason,
         "tool_calls": [],
@@ -1071,6 +1104,60 @@ def _aggregate_result(
         "error_type": None,
         "error_msg": None,
     }
+    _apply_structured_output(result, response_format)
+    return result
+
+
+def _response_format_schema(response_format: dict | None) -> dict | None:
+    """Extract JSON Schema from either OpenAI's nested or flat shape."""
+    if not response_format or response_format.get("type") != "json_schema":
+        return None
+    nested = response_format.get("json_schema")
+    if isinstance(nested, dict) and isinstance(nested.get("schema"), dict):
+        return nested["schema"]
+    schema = response_format.get("schema")
+    return schema if isinstance(schema, dict) else None
+
+
+def _apply_structured_output(result: dict, response_format: dict | None) -> None:
+    """Parse a unique JSON value and enforce requested JSON Schema.
+
+    Agent backends commonly wrap otherwise valid JSON in prose or fences, so
+    use the same tolerant parser as the OpenAI-compatible path. Multiple JSON
+    values remain ambiguous and therefore do not parse.
+    """
+    fmt_type = (response_format or {}).get("type")
+    if fmt_type not in ("json_object", "json_schema"):
+        return
+    content = result.get("content") or ""
+    found, parsed = parse_unique_json(content)
+    result["parsed"] = parsed
+    if fmt_type != "json_schema":
+        return
+
+    violation: str | None = None
+    if not found:
+        violation = "structured output did not contain exactly one JSON value"
+    else:
+        schema = _response_format_schema(response_format)
+        if schema is not None:
+            from jsonschema import Draft202012Validator
+
+            try:
+                Draft202012Validator.check_schema(schema)
+                error = next(Draft202012Validator(schema).iter_errors(parsed), None)
+                if error is not None:
+                    violation = error.message
+            except Exception as exc:
+                violation = f"invalid requested JSON Schema: {exc}"
+
+    if violation is not None:
+        result["status"] = "error"
+        result["finish_reason"] = "error"
+        result["error_type"] = "SchemaViolation"
+        result["error_msg"] = scrub_error_text(
+            f"Structured output conformance failed: {violation}"
+        )
 
 
 def _timeout_result(agent: str, run_id: str, elapsed: float) -> dict:

@@ -12,6 +12,8 @@
 set -e
 
 export HOME=/tmp/home
+: "${SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS:=3660000}"
+export SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS
 mkdir -p "$HOME/.claude" "$HOME/.codex"
 
 # Brig mounts secrets read-only at /run/secrets/<name>. Symlink (don't

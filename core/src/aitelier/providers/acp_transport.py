@@ -91,6 +91,7 @@ class AcpClient:
         self._sse_task: asyncio.Task | None = None
         self._http = http_client
         self._owns_http = http_client is None
+        self._server_started = False
         # Optional async policy: (params) -> bool deciding a permission ask.
         # None keeps the historical auto-allow. Owned by the orchestration
         # layer (it carries the allowlist + run-event emitter); this wire layer
@@ -123,8 +124,29 @@ class AcpClient:
                 await self._sse_task
             except (asyncio.CancelledError, Exception):
                 pass
+        # Sandbox Agent owns a per-server adapter process behind this URL.
+        # Closing the logical ACP session is not sufficient to release that
+        # process on every server/error path; DELETE is the proxy lifecycle
+        # boundary exposed by Sandbox Agent.
+        if self._server_started:
+            try:
+                await asyncio.wait_for(self.delete_server(), timeout=5.0)
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "ACP proxy cleanup failed for server %s: %s",
+                    self.server_id, cleanup_exc,
+                )
         if self._owns_http and self._http is not None:
             await self._http.aclose()
+
+    async def delete_server(self) -> None:
+        """Release this server id and its adapter process in Sandbox Agent."""
+        if self._http is None:
+            return
+        resp = await self._http.delete(self._url(), headers=self._headers())
+        # 404 is idempotent success: the server may already have reclaimed it.
+        if resp.status_code not in (200, 202, 204, 404):
+            resp.raise_for_status()
 
     async def call(self, method: str, params: dict | None = None,
                    *, first: bool = False) -> Any:
@@ -140,6 +162,10 @@ class AcpClient:
             "params": params or {},
         }
         url = self._url(with_agent=first)
+        if first:
+            # Sandbox Agent allocates the adapter for the first request. Mark
+            # it before I/O so a failed initialize still gets a DELETE.
+            self._server_started = True
         resp = await self._http.post(url, json=envelope, headers=self._headers())
         resp.raise_for_status()
         body = resp.json()
