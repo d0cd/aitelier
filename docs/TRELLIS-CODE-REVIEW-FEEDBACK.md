@@ -54,6 +54,8 @@ The Aitelier-owned follow-up is now implemented in this worktree:
 - `GET /v1/models?agent_backend=<id>` probes only the selected backend.
 - Agent discovery records both the native agent and ACP adapter versions; the
   Brig Codex pairing is updated to CLI `0.137.0` plus `codex-acp` `0.16.0`.
+- Model selection follows the backend-advertised config option; legacy
+  `session/set_model` is used only for adapters that do not advertise one.
 - A timeout after answer text was emitted retains that text and records
   `MissingTerminalEvent`, separating a terminal-protocol failure from ordinary
   no-output latency.

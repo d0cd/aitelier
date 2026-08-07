@@ -965,6 +965,10 @@ Agent as `aitelier_agent_version` and `aitelier_agent_process_version`. For
 Codex, these are respectively the native Codex CLI and Zed `codex-acp`
 adapter versions. Record both when diagnosing a missing terminal response.
 
+For non-Claude backends, Aitelier applies the selected inner model through the
+model config option advertised by `session/new`. It uses legacy
+`session/set_model` only when an older adapter does not advertise that option.
+
 The Brig image currently pins Codex CLI `0.137.0` with `codex-acp` `0.16.0`,
 matching the Codex core release embedded by that adapter. Trellis previously
 verified CLI `0.132.0` with `codex-acp` `0.14.0`; pairing CLI `0.146.1` with

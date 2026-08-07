@@ -669,8 +669,7 @@ def test_build_session_new_meta_claude_omits_unset_fields():
 
 def test_build_session_new_meta_non_claude_returns_none():
     """codex-acp / opencode / amp don't read `_meta.claudeCode`. Returning
-    None routes their model through `session/set_model`, reasoning through
-    `session/set_config_option`, and approval mode through `session/set_mode`."""
+    None routes their settings through the backend's advertised ACP verbs."""
     from aitelier.providers.sandbox_agent import _build_session_new_meta
 
     meta = _build_session_new_meta(
@@ -713,9 +712,8 @@ async def test_open_acp_session_raises_classified_error_on_missing_sessionId():
 
 
 @pytest.mark.asyncio
-async def test_open_acp_session_sets_inner_model_via_set_model_for_non_claude():
-    """Non-claude backends receive the inner LLM through session/set_model
-    (params {sessionId, modelId}), not the claude _meta path."""
+async def test_open_acp_session_uses_legacy_set_model_when_not_advertised():
+    """Adapters without a model config option retain the legacy verb."""
     from aitelier.providers.sandbox_agent import _open_acp_session
 
     calls = []
@@ -743,6 +741,39 @@ async def test_open_acp_session_sets_inner_model_via_set_model_for_non_claude():
     assert sid == "sess-1"
     set_model = [p for (m, p) in calls if m == "session/set_model"]
     assert set_model == [{"sessionId": "sess-1", "modelId": "gpt-5.4"}]
+
+
+@pytest.mark.asyncio
+async def test_open_acp_session_sets_advertised_model_config_option():
+    """codex-acp 0.16 advertises model as a config option and does not
+    implement the legacy session/set_model method."""
+    from aitelier.providers.sandbox_agent import _open_acp_session
+
+    calls = []
+
+    class _FakeClient:
+        agent = "codex"
+        async def call(self, method, params, first=False):
+            calls.append((method, params))
+            if method == "session/new":
+                return {"sessionId": "sess-1", "configOptions": [{
+                    "id": "model", "category": "model",
+                    "options": [{"value": "gpt-5.5"}],
+                }]}
+            return {}
+        def start_stream(self): pass
+        async def notify(self, *a, **k): pass
+
+    await _open_acp_session(
+        _FakeClient(), agent_name="codex",
+        workspace=None, mcp_servers=None, system_prompt=None,
+        agent_model="gpt-5.5", tool_allowlist=None, max_turns=None, run_id="",
+    )
+    assert (
+        "session/set_config_option",
+        {"sessionId": "sess-1", "configId": "model", "value": "gpt-5.5"},
+    ) in calls
+    assert not any(method == "session/set_model" for method, _ in calls)
 
 
 @pytest.mark.asyncio
@@ -845,7 +876,10 @@ async def test_open_acp_session_model_validation_is_exact_match():
         workspace=None, mcp_servers=None, system_prompt=None,
         agent_model="sonnet[1m]", tool_allowlist=None, max_turns=None, run_id="",
     )
-    assert ("session/set_model", {"sessionId": "s", "modelId": "sonnet[1m]"}) in ok_calls
+    assert (
+        "session/set_config_option",
+        {"sessionId": "s", "configId": "model", "value": "sonnet[1m]"},
+    ) in ok_calls
 
     with pytest.raises(AcpError, match="does not offer inner model"):
         await _open_acp_session(
@@ -914,9 +948,16 @@ async def test_open_acp_session_applies_in_order_model_reasoning_mode():
         agent_model="gpt-5.4", tool_allowlist=None, max_turns=None,
         reasoning_effort="high", approval_mode="auto", run_id="",
     )
-    seq = [m for (m, _) in calls
-           if m in ("session/set_model", "session/set_config_option", "session/set_mode")]
-    assert seq == ["session/set_model", "session/set_config_option", "session/set_mode"]
+    seq = [
+        (method, params.get("configId"))
+        for method, params in calls
+        if method in ("session/set_model", "session/set_config_option", "session/set_mode")
+    ]
+    assert seq == [
+        ("session/set_config_option", "model"),
+        ("session/set_config_option", "reasoning_effort"),
+        ("session/set_mode", None),
+    ]
 
 
 @pytest.mark.asyncio

@@ -129,8 +129,8 @@ def _build_session_new_meta(
 
     Each ACP bridge reads config from a different place. This builds the
     claude-only `_meta` block; non-claude backends return None here and get
-    their config via the advertised verbs (`session/set_model`,
-    `session/set_config_option`, `session/set_mode`) in `_open_acp_session`.
+    their config via the advertised config-option/mode verbs in
+    `_open_acp_session`.
 
     claude-agent-acp ≥0.36 (dist/acp-agent.js:1371-1450) reads:
       - `_meta.systemPrompt`         → system prompt override
@@ -276,7 +276,8 @@ async def _open_acp_session(
     # Apply session config from what the backend actually advertised, in the
     # order model → reasoning → approval (claude rebuilds its effort options
     # from the current model, so model must land first). claude takes its model
-    # via `_meta` above; non-claude takes it via `session/set_model`.
+    # via `_meta` above; non-claude uses the advertised model config option,
+    # with legacy `session/set_model` retained only for older adapters.
     #
     # The session is live now — if a validation/apply step raises (bad model,
     # unadvertised reasoning_effort/approval_mode), close it before propagating
@@ -330,11 +331,12 @@ async def _apply_model(
     client: AcpClient, session_id: str, agent_name: str,
     agent_model: str, advertised: dict,
 ) -> None:
-    """Set the inner model via `session/set_model`. Validates against the
-    advertised model values first — `set_model` is permissive (accepts any id
-    and only fails later at prompt time), so an eager check turns a wasted turn
-    into a precise error. `modelId` must be backend-native (codex: 'gpt-5.4');
-    `openai/*` and curated aliases are LLM-path ids the backend rejects."""
+    """Set the inner model through the backend's advertised ACP shape.
+
+    Current adapters expose model as a config option and implement
+    `session/set_config_option`; older adapters used `session/set_model`.
+    Prefer the advertised option and keep the legacy verb only as a fallback.
+    """
     opt = advertised.get("model")
     values = (opt or {}).get("values") or []
     if values and agent_model not in values:
@@ -346,9 +348,16 @@ async def _apply_model(
             f"'openai/…' and curated aliases are LLM-path ids, not agent "
             f"inner-model ids.",
         )
-    await client.call("session/set_model", {
-        "sessionId": session_id, "modelId": agent_model,
-    })
+    if opt is not None:
+        await client.call("session/set_config_option", {
+            "sessionId": session_id,
+            "configId": opt["id"],
+            "value": agent_model,
+        })
+    else:
+        await client.call("session/set_model", {
+            "sessionId": session_id, "modelId": agent_model,
+        })
 
 
 async def _apply_categorical(
