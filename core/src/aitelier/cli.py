@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -299,9 +300,19 @@ def _cmd_status(all_models: bool = False) -> None:
     print("\nCredentials:")
     from pathlib import Path as P
     claude_creds = P.home() / ".claude" / ".credentials.json"
+    brig_claude_token = P.home() / ".brig" / "secrets" / "claude-oauth-token"
     codex_creds = P.home() / ".codex" / "auth.json"
 
-    if claude_creds.exists():
+    setup_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    try:
+        brig_setup_token = brig_claude_token.read_text().strip()
+    except (OSError, UnicodeError):
+        brig_setup_token = ""
+    if setup_token.startswith("sk-ant-oat"):
+        print("  ✓ Claude OAuth     long-lived setup token (environment)")
+    elif brig_setup_token.startswith("sk-ant-oat"):
+        print("  ✓ Claude OAuth     long-lived setup token (brig secret)")
+    elif claude_creds.exists():
         try:
             import time
             data = json.loads(claude_creds.read_text())
@@ -310,13 +321,13 @@ def _cmd_status(all_models: bool = False) -> None:
                 remaining_h = (expires - time.time() * 1000) / 3_600_000
                 print(f"  ✓ Claude OAuth     valid ({remaining_h:.0f}h remaining)")
             elif expires:
-                print("  ✗ Claude OAuth     expired — run 'claude login'")
+                print("  ✗ Claude OAuth     legacy snapshot expired — use 'claude setup-token'")
             else:
                 print("  ? Claude OAuth     no expiry info")
         except Exception:
             print("  ? Claude OAuth     failed to read")
     else:
-        print("  ✗ Claude OAuth     not logged in — run 'claude login'")
+        print("  ✗ Claude OAuth     direct-model token missing — use 'claude setup-token'")
 
     if codex_creds.exists():
         print(f"  ✓ Codex OAuth      {codex_creds}")

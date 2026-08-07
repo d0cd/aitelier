@@ -14,10 +14,14 @@ go.
 ## Quick start
 
 ```bash
-claude login              # once — OAuth for Anthropic via Claude Code
 make install              # one-time deps (uv + pnpm)
 make start                # Postgres + LiteLLM + Sandbox Agent + aitelier service
 ```
+
+Claude agent and direct-model routes use a long-lived setup token. Register it
+once as the brig secret `claude-oauth-token` (`claude setup-token` creates one);
+`make start` reuses that same secret for LiteLLM. A normal interactive Claude
+login is refreshable for the host CLI but is not exported as a provider token.
 
 The service is now at `http://localhost:7777`. Health check:
 `curl localhost:7777/v1/health`. A read-only dashboard (runs, events, trace

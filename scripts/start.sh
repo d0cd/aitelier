@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start aitelier — extract credentials from CLI logins, boot infra, launch service.
+# Start aitelier — materialize provider credentials, boot infra, launch service.
 #
 # Usage:
 #   ./scripts/start.sh                              # full stack
@@ -11,8 +11,8 @@
 #   --sandbox-agent-port <N>  >  $SANDBOX_AGENT_PORT  >  2468 (or dynamic if taken)
 # The chosen URL is written to runs/.session.toml so the aitelier service picks it up.
 #
-# Credentials are extracted from Claude Code and Codex CLI credential files.
-# No manual API keys needed — just run `claude login` and `codex login` first.
+# Claude prefers the long-lived setup token already registered with brig, then
+# falls back to the legacy Claude Code credentials file. Codex uses auth.json.
 
 set -euo pipefail
 
@@ -227,10 +227,10 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Extract credentials from CLI credential files
+# 1. Materialize provider credentials
 # ---------------------------------------------------------------------------
 
-echo "=== Extracting credentials ==="
+echo "=== Materializing credentials ==="
 
 # Safety: ensure docker/.env is gitignored
 if ! grep -q "docker/.env" "$REPO_ROOT/.gitignore" 2>/dev/null; then
@@ -238,7 +238,7 @@ if ! grep -q "docker/.env" "$REPO_ROOT/.gitignore" 2>/dev/null; then
     echo "  Added docker/.env to .gitignore"
 fi
 
-# Extract credentials via Python (handles JSON + expiry check). Credentials are
+# Resolve credentials via Python (handles JSON + expiry check). Credentials are
 # advisory, not required: the control plane and the local/ollama LLM paths need
 # no API key, so a missing or expired Claude/Codex login degrades capability but
 # never blocks startup. Absent keys are written empty so LiteLLM's env refs still
@@ -254,27 +254,51 @@ env_file = sys.argv[1]
 anthropic_key = ""
 openai_key = ""
 
-# --- Claude Code ---
-claude_creds = Path.home() / ".claude" / ".credentials.json"
-if claude_creds.exists():
+# --- Claude ---
+# A setup token is long-lived and is also what the brig-hosted Claude agent
+# consumes. LiteLLM recognizes its sk-ant-oat prefix and sends it as an OAuth
+# Bearer token, so reuse it for direct claude-*/anthropic/* routes as well.
+setup_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+setup_source = "CLAUDE_CODE_OAUTH_TOKEN"
+brig_setup_token = Path.home() / ".brig" / "secrets" / "claude-oauth-token"
+if not setup_token and brig_setup_token.exists():
     try:
-        data = json.loads(claude_creds.read_text())
-        oauth = data.get("claudeAiOauth", {})
-        token = oauth.get("accessToken", "")
-        expires = oauth.get("expiresAt", 0)
-
-        if not token:
-            print("  - Claude: credentials file exists but no token found")
-        elif expires and expires < time.time() * 1000:  # expiresAt is in ms
-            print("  - Claude: OAuth token expired — run 'claude login' to refresh")
-        else:
-            anthropic_key = token
-            remaining_h = (expires - time.time() * 1000) / 3_600_000 if expires else 0
-            print(f"  ✓ Claude: token valid ({remaining_h:.0f}h remaining)")
+        setup_token = brig_setup_token.read_text().strip()
+        setup_source = "brig secret claude-oauth-token"
     except Exception as e:
-        print(f"  - Claude: failed to read credentials: {e}")
-else:
-    print("  - Claude: not logged in — run 'claude login'")
+        print(f"  - Claude: failed to read brig setup token: {e}")
+
+if setup_token and setup_token.startswith("sk-ant-oat"):
+    anthropic_key = setup_token
+    print(f"  ✓ Claude: long-lived setup token found ({setup_source})")
+elif setup_token:
+    print(f"  - Claude: ignored invalid setup token from {setup_source}")
+
+# Legacy fallback. New Claude Code versions can keep their refreshable login in
+# secure storage without updating this file, so it must not override a setup
+# token and an expired snapshot is advisory only.
+if not anthropic_key:
+    claude_creds = Path.home() / ".claude" / ".credentials.json"
+    if claude_creds.exists():
+        try:
+            data = json.loads(claude_creds.read_text())
+            oauth = data.get("claudeAiOauth", {})
+            token = oauth.get("accessToken", "")
+            expires = oauth.get("expiresAt", 0)
+
+            if not token:
+                print("  - Claude: credentials file exists but no token found")
+            elif expires and expires < time.time() * 1000:  # expiresAt is in ms
+                print("  - Claude: legacy OAuth snapshot expired")
+            else:
+                anthropic_key = token
+                remaining_h = (expires - time.time() * 1000) / 3_600_000 if expires else 0
+                print(f"  ✓ Claude: legacy OAuth token valid ({remaining_h:.0f}h remaining)")
+        except Exception as e:
+            print(f"  - Claude: failed to read credentials: {e}")
+
+if not anthropic_key:
+    print("  - Claude: no direct-model token; run 'claude setup-token' and register claude-oauth-token")
 
 # --- Codex ---
 codex_creds = Path.home() / ".codex" / "auth.json"

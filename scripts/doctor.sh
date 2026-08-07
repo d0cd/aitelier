@@ -197,7 +197,15 @@ echo "=== Credentials ==="
 # disables the matching model families. (agent:claude manages its own
 # credential via the Sandbox Agent and is unaffected by the LiteLLM key here.)
 _claude_cred_state() {
-    # Prints: missing | no-token | expired | valid:<hours>
+    # Prints: setup-env | setup-brig | missing | no-token | expired | valid:<hours>
+    case "${CLAUDE_CODE_OAUTH_TOKEN:-}" in
+        sk-ant-oat*) echo "setup-env"; return ;;
+    esac
+    local setup="$HOME/.brig/secrets/claude-oauth-token"
+    if [ -f "$setup" ] && grep -q '^sk-ant-oat' "$setup" 2>/dev/null; then
+        echo "setup-brig"
+        return
+    fi
     local f="$HOME/.claude/.credentials.json"
     [ -f "$f" ] || { echo "missing"; return; }
     python3 - "$f" <<'PY'
@@ -217,10 +225,12 @@ PY
 }
 claude_state="$(_claude_cred_state)"
 case "$claude_state" in
-    valid:*) _ok "Claude credentials valid (${claude_state#valid:}h remaining)" ;;
-    expired) _warn "Claude OAuth token expired — \`claude login\` to refresh (claude-*/anthropic/* LLM models unavailable until then)" ;;
-    no-token) _warn "Claude credentials file present but no token — \`claude login\` (claude-*/anthropic/* unavailable)" ;;
-    *) _warn "Claude not logged in — \`claude login\` for claude-*/anthropic/* LLM models (optional)" ;;
+    setup-env) _ok "Claude long-lived setup token present (CLAUDE_CODE_OAUTH_TOKEN)" ;;
+    setup-brig) _ok "Claude long-lived setup token present (brig secret)" ;;
+    valid:*) _ok "Claude legacy OAuth token valid (${claude_state#valid:}h remaining)" ;;
+    expired) _warn "Claude legacy OAuth snapshot expired — use \`claude setup-token\` for claude-*/anthropic/* LLM models" ;;
+    no-token) _warn "Claude credentials file has no token — use \`claude setup-token\` for claude-*/anthropic/* models" ;;
+    *) _warn "Claude direct-model token missing — use \`claude setup-token\` (optional)" ;;
 esac
 
 if [ -f "$HOME/.codex/auth.json" ]; then

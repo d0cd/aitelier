@@ -12,9 +12,9 @@
 #
 # REQUIREMENTS:
 #   - Docker installed and running.
-#   - Real LLM provider credentials extractable by the cred-materialize
-#     step (~/.claude/.credentials.json or equivalent) — the live agent
-#     tests need a working backend.
+#   - Real LLM provider credentials materializable by start.sh (prefer the
+#     long-lived Claude setup token; legacy ~/.claude/.credentials.json is a
+#     fallback) — the live agent tests need a working backend.
 #
 # Run with: ./scripts/test-docker-mode.sh
 # Or via:   make test-docker-mode-e2e
