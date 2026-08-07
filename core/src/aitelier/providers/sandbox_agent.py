@@ -525,6 +525,7 @@ async def call_via_sandbox(
     start = time.monotonic()
     final: dict | None = None
     last_error: dict | None = None
+    partial_content: list[str] = []
     try:
         async def _consume() -> None:
             nonlocal final, last_error
@@ -542,10 +543,22 @@ async def call_via_sandbox(
                     final = {k: v for k, v in event.items() if k != "type"}
                 elif etype == "error":
                     last_error = event
+                elif etype == "delta" and isinstance(event.get("content"), str):
+                    partial_content.append(event["content"])
 
         await asyncio.wait_for(_consume(), timeout=timeout)
     except TimeoutError:
-        return _timeout_result(name, run_id, time.monotonic() - start)
+        result = _timeout_result(name, run_id, time.monotonic() - start)
+        if partial_content:
+            result.update({
+                "content": "".join(partial_content),
+                "error_type": "MissingTerminalEvent",
+                "error_msg": (
+                    "Agent emitted answer content but did not produce a "
+                    "terminal ACP response before the run timeout"
+                ),
+            })
+        return result
 
     if final is not None:
         return final

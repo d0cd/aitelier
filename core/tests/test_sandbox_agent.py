@@ -1284,6 +1284,30 @@ async def test_call_via_sandbox_returns_timeout_on_overrun(monkeypatch):
     assert result["finish_reason"] == "timeout"
 
 
+@pytest.mark.asyncio
+async def test_timeout_after_content_identifies_missing_terminal_event(monkeypatch):
+    """Answer text without ACP termination is a protocol diagnostic, not
+    indistinguishable ordinary model latency."""
+    import asyncio
+
+    async def unterminated_stream(*args, **kwargs):
+        yield {"type": "delta", "content": "useful partial answer"}
+        await asyncio.sleep(10)
+
+    monkeypatch.setattr(
+        "aitelier.providers.sandbox_agent.call_via_sandbox_stream",
+        unterminated_stream,
+    )
+    result = await call_via_sandbox(
+        "codex", "review", run_id="run-missing-terminal", timeout=0.01,
+    )
+
+    assert result["status"] == "error"
+    assert result["finish_reason"] == "timeout"
+    assert result["error_type"] == "MissingTerminalEvent"
+    assert result["content"] == "useful partial answer"
+
+
 # --- SSE: agent → client requests (permission handshake) -------------------
 
 

@@ -54,15 +54,20 @@ The Aitelier-owned follow-up is now implemented in this worktree:
 - `GET /v1/models?agent_backend=<id>` probes only the selected backend.
 - Agent discovery records both the native agent and ACP adapter versions; the
   Brig Codex pairing is updated to CLI `0.137.0` plus `codex-acp` `0.16.0`.
+- A timeout after answer text was emitted retains that text and records
+  `MissingTerminalEvent`, separating a terminal-protocol failure from ordinary
+  no-output latency.
 - ACP-reported token and reasoning usage is normalized into durable/OpenAI
   usage fields. A local `codex-acp` change now forwards Codex core's exact
   cumulative counters through ACP `PromptResponse.usage`; the local Brig build
   workflow deploys that worktree directly, without requiring a registry release.
 
 The hard work-budget/synthesis contract and any missing reasoning-option facts
-remain backend/bridge capabilities. Aitelier maps verifiable signals when Sandbox
-Agent/the selected ACP adapter exposes them; it does not estimate token spend or
-claim a hard limit from prompt-only tool guidance.
+remain backend/bridge capabilities. Until a backend implements the former,
+`/v1/models` explicitly reports `aitelier_capabilities.hardToolBudget: false`.
+Aitelier maps verifiable signals when Sandbox Agent/the selected ACP adapter
+exposes them; it does not estimate token spend or claim a hard limit from
+prompt-only tool guidance.
 
 ## P0: enforceable agent work budget with a synthesis reserve
 

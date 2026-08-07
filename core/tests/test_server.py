@@ -994,6 +994,7 @@ def test_models_endpoint_declares_agent_request_caps(client):
     assert caps["response_format"] == ["json_object", "json_schema"]
     # The ACP backend cap block is preserved separately.
     assert agent_entry["aitelier_capabilities"]["toolCalls"] is True
+    assert agent_entry["aitelier_capabilities"]["hardToolBudget"] is False
 
 
 def test_models_endpoint_surfaces_probed_backend_options(client):

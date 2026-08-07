@@ -136,7 +136,7 @@ The Python SDK defaults to `"float"`, so no action needed there.
 OpenAI-shape model list. Two flavors of entry:
 
 - **LLM**: standard OpenAI shape — `{id, object: "model", owned_by, response_format}`. `response_format` lists the `json_object` / `json_schema` modes the provider supports. Anthropic / `claude-*` is `[]` because LiteLLM's adapter rejects OpenAI-shape `json_schema`; `local` / `ollama/*` is both (aitelier bypasses LiteLLM and maps to Ollama's native `format` field); OpenAI / `gpt-*` is both.
-- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_agent_version, aitelier_agent_process_version, aitelier_inner_llms: [...], aitelier_reasoning_levels: [...], aitelier_approval_modes: [...], aitelier_capabilities: {...}}` — the Sandbox Agent capability flags plus the native agent/ACP adapter versions and backend's **actually-advertised** options (probed live per backend and cached): the real inner-model ids, reasoning levels, and approval modes it accepts. These are the authoritative compatibility tuple and ids for `agent:<backend>/<model>` + `aitelier.reasoning_effort` / `aitelier.approval_mode`; passing one the backend doesn't offer fails fast with the valid list. Version fields are omitted when the deployed Sandbox Agent cannot report them. The three option arrays are omitted for a backend whose probe fails (the entry still appears). See "Selecting the inner model" below.
+- **Agent**: `{id: "agent:<backend>", aitelier_agent: true, aitelier_agent_version, aitelier_agent_process_version, aitelier_inner_llms: [...], aitelier_reasoning_levels: [...], aitelier_approval_modes: [...], aitelier_capabilities: {...}}` — the Sandbox Agent capability flags plus the native agent/ACP adapter versions and backend's **actually-advertised** options (probed live per backend and cached): the real inner-model ids, reasoning levels, and approval modes it accepts. These are the authoritative compatibility tuple and ids for `agent:<backend>/<model>` + `aitelier.reasoning_effort` / `aitelier.approval_mode`; passing one the backend doesn't offer fails fast with the valid list. Version fields are omitted when the deployed Sandbox Agent cannot report them. `aitelier_capabilities.hardToolBudget` is explicitly `false` when the backend does not advertise enforceable tool-work budgeting; prompt-only limits do not count as support. The three option arrays are omitted for a backend whose probe fails (the entry still appears). See "Selecting the inner model" below.
 
 Use `GET /v1/models?agent_backend=codex` when validating one selected agent.
 The response still includes LLM entries, but probes and returns only that agent
@@ -573,6 +573,12 @@ in prose or code fences. A `json_schema` result that is absent, ambiguous, or
 does not validate is finalized as `failed` with `error_type: SchemaViolation`;
 the raw content and parsed value (when recoverable) remain available for
 diagnosis.
+
+If an agent emits answer text but never sends the terminal ACP response before
+the deadline, the run still fails with `finish_reason: timeout`, but records
+`error_type: MissingTerminalEvent` and retains the partial content. This
+distinguishes a native/adapter protocol mismatch from a run that produced no
+answer before timing out.
 
 LLM calls don't go here — they're short enough to stream synchronously.
 `/v1/runs` 400s on non-`agent:` models.

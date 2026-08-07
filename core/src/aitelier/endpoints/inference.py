@@ -264,12 +264,18 @@ async def _list_agent_models(cfg, *, agent_backend: str | None = None) -> list[d
 
     out: list[dict] = []
     for a, opts in zip(installed, probes):
+        capabilities = dict(a.get("capabilities") or {})
+        # Absence is not support: older Sandbox Agent deployments do not
+        # advertise an enforceable work budget. Preserve a future backend's
+        # explicit true value, but make today's unsupported contract visible
+        # to workflow clients instead of forcing them to infer it.
+        capabilities.setdefault("hardToolBudget", False)
         entry = {
             "id": f"agent:{a['id']}",
             "object": "model",
             "owned_by": "sandbox-agent",
             "aitelier_agent": True,
-            "aitelier_capabilities": a.get("capabilities") or {},
+            "aitelier_capabilities": capabilities,
             # Declarative request-field caps mirroring the agent-path gates
             # enforced by `_reject_agent_incompatible_fields`. Generic
             # consumers (model pickers, doctor probes) can pre-strip
