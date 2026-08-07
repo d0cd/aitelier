@@ -17,6 +17,7 @@ Transport (Sandbox Agent's HTTP wrapping of ACP):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Any
@@ -43,6 +44,19 @@ logger = logging.getLogger("aitelier.sandbox_agent")
 # run-row stamping) lives in `acp_transport.py`. Imported above so existing
 # call sites here and external test patches like
 # `aitelier.providers.sandbox_agent.AcpClient` keep resolving.
+
+
+def _acp_exception_text(exc: Exception) -> str:
+    """Render useful JSON-RPC error data for the existing scrub pipeline."""
+    text = str(exc) or type(exc).__name__
+    if not isinstance(exc, AcpError) or exc.data is None:
+        return text
+
+    if isinstance(exc.data, dict) and isinstance(exc.data.get("message"), str):
+        detail = exc.data["message"]
+    else:
+        detail = json.dumps(exc.data, default=str, sort_keys=True)
+    return f"{text}: {detail[:2000]}"
 
 
 class _RunEventEmitter:
@@ -733,7 +747,9 @@ async def call_via_sandbox_stream(
                             "type": "error",
                             "error_type": classify_error(exc),
                             "error_msg": scrub_error_text(
-                                _scrub_sandbox_url(str(exc), cfg.base_url)
+                                _scrub_sandbox_url(
+                                    _acp_exception_text(exc), cfg.base_url,
+                                )
                             ),
                         }
 
@@ -802,7 +818,7 @@ async def call_via_sandbox_stream(
             "type": "error",
             "error_type": classify_error(exc),
             "error_msg": scrub_error_text(
-                _scrub_sandbox_url(str(exc), cfg.base_url)
+                _scrub_sandbox_url(_acp_exception_text(exc), cfg.base_url)
             ),
         }
         await emitter.emit("error", err)
@@ -1221,7 +1237,9 @@ def _error_result(
     exception and lose the original taxonomy, leaking `RuntimeError` /
     `ReadTimeout` etc. to consumers instead of the documented vocabulary.
     """
-    msg = _scrub_sandbox_url(str(exc) or type(exc).__name__, base_url)
+    msg = scrub_error_text(
+        _scrub_sandbox_url(_acp_exception_text(exc), base_url),
+    )
     parts = [msg]
     if base_url:
         parts.append(

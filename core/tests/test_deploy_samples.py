@@ -32,6 +32,7 @@ _AITELIER_DOCKERFILE = _REPO_ROOT / "docker" / "Dockerfile"
 _COMPOSE_YAML = _REPO_ROOT / "docker" / "docker-compose.yml"
 _START_SH = _REPO_ROOT / "scripts" / "start.sh"
 _CELL_ENTRYPOINT = _REPO_ROOT / "scripts" / "cell-entrypoint.sh"
+_DOCTOR_SH = _REPO_ROOT / "scripts" / "doctor.sh"
 _CONFIG_PY = _REPO_ROOT / "core" / "src" / "aitelier" / "config.py"
 
 
@@ -316,3 +317,10 @@ def test_compose_sa_profile_is_off_by_default():
     data = yaml.safe_load(_COMPOSE_YAML.read_text())
     sa = data["services"]["sandbox-agent"]
     assert sa.get("profiles"), "sandbox-agent has no profiles — would auto-start"
+
+
+def test_doctor_terminal_probe_reports_http_error_body():
+    """A failed live probe must preserve Aitelier's sanitized diagnosis."""
+    text = _DOCTOR_SH.read_text()
+    assert "except urllib.error.HTTPError as exc:" in text
+    assert "exc.read().decode" in text

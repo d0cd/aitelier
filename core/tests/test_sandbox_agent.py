@@ -113,6 +113,22 @@ def test_error_result_scrubs_url_embedded_in_exception_text():
     assert "<sandbox>" in r["error_msg"]
 
 
+def test_error_result_includes_sanitized_acp_error_data():
+    """Backend detail stays actionable without exposing a carried secret."""
+    from aitelier.providers.sandbox_agent import _error_result
+
+    exc = AcpError(
+        -32603,
+        "Internal error",
+        {"message": "refresh token was revoked; Authorization: Bearer secret"},
+    )
+    result = _error_result("codex", "r1", exc, 1.0)
+
+    assert "refresh token was revoked" in result["error_msg"]
+    assert "Bearer secret" not in result["error_msg"]
+    assert "Bearer [redacted]" in result["error_msg"]
+
+
 @pytest.mark.asyncio
 async def test_notify_accepts_202():
     fake_http = MagicMock()

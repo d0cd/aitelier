@@ -316,7 +316,15 @@ try:
         "finish_reason": choices[0]["finish_reason"],
         "run_id": result.get("aitelier_run_id"),
     }, sort_keys=True))
-except (OSError, KeyError, StopIteration, RuntimeError, urllib.error.HTTPError) as exc:
+except urllib.error.HTTPError as exc:
+    try:
+        detail = exc.read().decode("utf-8", errors="replace")
+    except OSError:
+        detail = ""
+    suffix = f": {detail}" if detail else ""
+    print(f"HTTP {exc.code} {exc.reason}{suffix}", file=sys.stderr)
+    raise SystemExit(1)
+except (OSError, KeyError, StopIteration, RuntimeError) as exc:
     print(str(exc), file=sys.stderr)
     raise SystemExit(1)
 PY

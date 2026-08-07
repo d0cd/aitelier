@@ -142,6 +142,10 @@ Use `GET /v1/models?agent_backend=codex` when validating one selected agent.
 The response still includes LLM entries, but probes and returns only that agent
 backend, so an unavailable unrelated backend cannot add its probe timeout.
 
+For an end-to-end terminal check, run `scripts/doctor.sh --agent-turn codex`.
+If the API rejects the turn, doctor prints Aitelier's sanitized response body so
+adapter, compatibility, and credential failures remain distinguishable.
+
 Every entry also carries an `aitelier_request_caps` block declaring which
 OpenAI request fields the route honors:
 

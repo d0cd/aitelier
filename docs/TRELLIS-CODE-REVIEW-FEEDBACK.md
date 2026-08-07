@@ -59,6 +59,9 @@ The Aitelier-owned follow-up is now implemented in this worktree:
 - A timeout after answer text was emitted retains that text and records
   `MissingTerminalEvent`, separating a terminal-protocol failure from ordinary
   no-output latency.
+- ACP JSON-RPC error data is scrubbed and preserved in API failures, and the
+  terminal doctor probe prints that sanitized response instead of reducing all
+  HTTP failures to a status line.
 - ACP-reported token and reasoning usage is normalized into durable/OpenAI
   usage fields. A local `codex-acp` change now forwards Codex core's exact
   cumulative counters through ACP `PromptResponse.usage`; the local Brig build
