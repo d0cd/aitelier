@@ -286,15 +286,22 @@ try:
     if not inner_models:
         raise RuntimeError(f"{backend} advertised no selectable inner models")
     selected = inner_models[0]
-    payload = json.dumps({
+    approval_modes = entry.get("aitelier_approval_modes") or []
+    approval_mode = next(
+        (mode for mode in ("read-only", "default", "plan") if mode in approval_modes),
+        None,
+    )
+    request_body = {
         "model": f"agent:{backend}/{selected}",
         "messages": [{
             "role": "user",
             "content": "Reply with exactly OK. Do not use tools.",
         }],
         "timeout": 45,
-        "aitelier": {"approval_mode": "read-only"},
-    }).encode()
+    }
+    if approval_mode is not None:
+        request_body["aitelier"] = {"approval_mode": approval_mode}
+    payload = json.dumps(request_body).encode()
     request = urllib.request.Request(
         f"{base}/v1/chat/completions",
         data=payload,
@@ -311,6 +318,7 @@ try:
     print(json.dumps({
         "backend": backend,
         "model": selected,
+        "approval_mode": approval_mode,
         "agent_version": entry.get("aitelier_agent_version"),
         "agent_process_version": entry.get("aitelier_agent_process_version"),
         "finish_reason": choices[0]["finish_reason"],
