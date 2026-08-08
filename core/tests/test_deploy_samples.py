@@ -348,6 +348,11 @@ def test_host_and_docker_sa_receive_claude_setup_token_without_image_copy():
     ]
 
     assert "claude-oauth-token" in secret_names
+    secret_mount = next(
+        item for item in sa["secrets"]
+        if isinstance(item, dict) and item.get("source") == "claude-oauth-token"
+    )
+    assert str(secret_mount["mode"]) == "0400"
     assert compose["secrets"]["claude-oauth-token"]["file"].endswith(
         "runs/.claude-oauth-token"
     )
@@ -356,6 +361,20 @@ def test_host_and_docker_sa_receive_claude_setup_token_without_image_copy():
     assert "/run/secrets/claude-oauth-token" in entrypoint
     assert "CLAUDE_CODE_OAUTH_TOKEN" in _START_SH.read_text()
     assert "COPY claude-oauth-token" not in _SA_DOCKERFILE.read_text()
+
+
+def test_lifecycle_scripts_validate_pid_identity_and_avoid_broad_pkill():
+    start = _START_SH.read_text()
+    stop = (_REPO_ROOT / "scripts" / "stop.sh").read_text()
+    shared = (_REPO_ROOT / "scripts" / "lib.sh").read_text()
+
+    assert "_process_matches" in start
+    assert "_process_matches" in stop
+    assert "ps -p" in shared
+    assert "pkill -f" not in stop
+    assert start.index("Stopping host-mode SA before switching to Docker") < start.index(
+        'docker compose "${COMPOSE_PROFILE_ARGS[@]}" up -d'
+    )
 
 
 def test_doctor_terminal_probe_reports_http_error_body():

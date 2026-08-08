@@ -88,14 +88,15 @@ def test_doctor_and_start_prefer_long_lived_claude_setup_token():
     of depending on Claude Code's short-lived credentials-file snapshot."""
     doctor = DOCTOR_SH.read_text()
     start = (REPO_ROOT / "scripts" / "start.sh").read_text()
+    materializer = (REPO_ROOT / "scripts" / "materialize_credentials.py").read_text()
 
-    for text in (doctor, start):
+    for text in (doctor, materializer):
         assert ".brig" in text
         assert "claude-oauth-token" in text
         assert "sk-ant-oat" in text
 
     assert "setup-brig" in doctor
-    assert "long-lived setup token found" in start
+    assert "long-lived setup token found" in materializer
     assert "CLAUDE_CODE_OAUTH_TOKEN" in start
     assert "CLAUDE_SETUP_TOKEN_FILE" in start
 

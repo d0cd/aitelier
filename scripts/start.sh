@@ -16,6 +16,10 @@
 
 set -euo pipefail
 
+# Runtime overlays and credential snapshots must never inherit a permissive
+# host umask. Existing files are tightened explicitly at their write sites.
+umask 077
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/docker/.env"
 CLAUDE_SETUP_TOKEN_FILE="$REPO_ROOT/runs/.claude-oauth-token"
@@ -189,6 +193,13 @@ fi
 # file is for things start.sh discovers at runtime that the user can't write
 # ahead of time. stop.sh removes it.
 mkdir -p "$REPO_ROOT/runs"
+if [ -L "$SESSION_TOML" ]; then
+    echo "  ✗ refusing to replace symlinked runtime config: $SESSION_TOML"
+    exit 1
+fi
+if [ -e "$SESSION_TOML" ]; then
+    chmod 600 "$SESSION_TOML"
+fi
 _overlay_header="# Written by scripts/start.sh on $(date -u +"%Y-%m-%dT%H:%M:%SZ"). Ephemeral.
 # Removed by scripts/stop.sh. Do not edit by hand — your changes will be
 # overwritten on next start. Put persistent config in aitelier.toml instead."
@@ -228,6 +239,7 @@ base_url = "http://127.0.0.1:${SANDBOX_AGENT_PORT}"
 url = "postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier"
 EOF
 fi
+chmod 600 "$SESSION_TOML"
 
 # ---------------------------------------------------------------------------
 # 1. Materialize provider credentials
@@ -246,138 +258,13 @@ fi
 # no API key, so a missing or expired Claude/Codex login degrades capability but
 # never blocks startup. Absent keys are written empty so LiteLLM's env refs still
 # resolve and the proxy boots; the affected models just error at call time.
-# Use `uv run python` (not bare `python3`) so this works on a uv-managed
-# machine that has no system python3 — same interpreter the mode detection
-# above uses.
-uv run python - "$ENV_FILE" "$CLAUDE_SETUP_TOKEN_FILE" "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE" <<'PYEOF'
-import hashlib, json, os, sys, time
-from pathlib import Path
-
-env_file = sys.argv[1]
-setup_token_file = sys.argv[2]
-setup_token_fingerprint_file = sys.argv[3]
-anthropic_key = ""
-openai_key = ""
-
-# --- Claude ---
-# A setup token is long-lived and is also what the brig-hosted Claude agent
-# consumes. LiteLLM recognizes its sk-ant-oat prefix and sends it as an OAuth
-# Bearer token, so reuse it for direct claude-*/anthropic/* routes as well.
-setup_token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
-setup_source = "CLAUDE_CODE_OAUTH_TOKEN"
-brig_setup_token = Path.home() / ".brig" / "secrets" / "claude-oauth-token"
-if not setup_token and brig_setup_token.exists():
-    try:
-        setup_token = brig_setup_token.read_text().strip()
-        setup_source = "brig secret claude-oauth-token"
-    except Exception as e:
-        print(f"  - Claude: failed to read brig setup token: {e}")
-
-if setup_token and setup_token.startswith("sk-ant-oat"):
-    anthropic_key = setup_token
-    print(f"  ✓ Claude: long-lived setup token found ({setup_source})")
-elif setup_token:
-    print(f"  - Claude: ignored invalid setup token from {setup_source}")
-
-# Legacy fallback. New Claude Code versions can keep their refreshable login in
-# secure storage without updating this file, so it must not override a setup
-# token and an expired snapshot is advisory only.
-if not anthropic_key:
-    claude_creds = Path.home() / ".claude" / ".credentials.json"
-    if claude_creds.exists():
-        try:
-            data = json.loads(claude_creds.read_text())
-            oauth = data.get("claudeAiOauth", {})
-            token = oauth.get("accessToken", "")
-            expires = oauth.get("expiresAt", 0)
-
-            if not token:
-                print("  - Claude: credentials file exists but no token found")
-            elif expires and expires < time.time() * 1000:  # expiresAt is in ms
-                print("  - Claude: legacy OAuth snapshot expired")
-            else:
-                anthropic_key = token
-                remaining_h = (expires - time.time() * 1000) / 3_600_000 if expires else 0
-                print(f"  ✓ Claude: legacy OAuth token valid ({remaining_h:.0f}h remaining)")
-        except Exception as e:
-            print(f"  - Claude: failed to read credentials: {e}")
-
-if not anthropic_key:
-    print("  - Claude: no direct-model token; run 'claude setup-token' and register claude-oauth-token")
-
-# --- Codex ---
-codex_creds = Path.home() / ".codex" / "auth.json"
-if codex_creds.exists():
-    try:
-        data = json.loads(codex_creds.read_text())
-        # Codex stores tokens nested under "tokens"
-        tokens = data.get("tokens", {})
-        token = tokens.get("access_token") or data.get("access_token") or data.get("api_key", "")
-        if token:
-            openai_key = token
-            print("  ✓ Codex: token found")
-        else:
-            print("  - Codex: auth.json exists but no token")
-    except Exception as e:
-        print(f"  - Codex: failed to read auth.json: {e}")
-else:
-    print("  - Codex: not logged in — run 'codex login' if needed")
-
-# --- Write .env ---
-# Keys are always written (empty when unavailable) so every os.environ/ ref in
-# the LiteLLM config resolves and the proxy boots regardless of which logins exist.
-lines = [
-    f"ANTHROPIC_API_KEY={anthropic_key}",
-    f"OPENAI_API_KEY={openai_key}",
-    "CLAUDE_SETUP_TOKEN_FINGERPRINT=" + (
-        hashlib.sha256(setup_token.encode()).hexdigest()
-        if setup_token.startswith("sk-ant-oat") else "none"
-    ),
-    "LITELLM_MASTER_KEY=sk-litellm-local",
-]
-
-# Ollama API base. Default to the host install via host.docker.internal;
-# `make start ollama` (or AITELIER_OLLAMA_PROFILE=1) flips this to the
-# in-compose service.
-if os.environ.get("AITELIER_OLLAMA_PROFILE") == "1":
-    lines.append("OLLAMA_BASE_URL=http://ollama:11434")
-else:
-    lines.append("OLLAMA_BASE_URL=http://host.docker.internal:11434")
-
-Path(env_file).write_text("\n".join(lines) + "\n")
-# Restrict permissions — tokens are sensitive
-Path(env_file).chmod(0o600)
-
-# Host and Docker Sandbox Agent modes consume the same setup token through a
-# runtime-only file. Docker mounts it read-only as a Compose secret; host mode
-# reads it once into only the SA process environment. Always create the file so
-# the optional Compose profile remains valid when no setup token is configured.
-runtime_setup_token = setup_token if setup_token.startswith("sk-ant-oat") else ""
-Path(setup_token_file).write_text(runtime_setup_token + ("\n" if runtime_setup_token else ""))
-Path(setup_token_file).chmod(0o600)
-fingerprint = (
-    hashlib.sha256(runtime_setup_token.encode()).hexdigest()
-    if runtime_setup_token else "none"
-)
-Path(setup_token_fingerprint_file).write_text(fingerprint + "\n")
-Path(setup_token_fingerprint_file).chmod(0o600)
-
-# Capability summary — make degraded model families obvious at a glance.
-print("")
-print("  Available models:")
-print("    • local, nomic-embed-text, ollama/*  (no credential required)")
-# agent:* backends use the Sandbox Agent's own credentials (claude/codex
-# logins), NOT the LiteLLM key extracted here — don't gate them on it.
-if anthropic_key:
-    print("    • claude-sonnet, claude-haiku, anthropic/*  (LLM path)")
-else:
-    print("    ✗ claude-sonnet, claude-haiku, anthropic/*  (no Anthropic LLM credential)")
-if openai_key:
-    print("    • openai/*  (LLM path)")
-else:
-    print("    ✗ openai/*  (no OpenAI LLM credential)")
-print("    • agent:claude / agent:codex / …  (via Sandbox Agent's own logins)")
-PYEOF
+# Use the uv-managed interpreter so startup works on machines without a
+# system Python. The helper atomically writes private files and is unit tested
+# independently from the service lifecycle.
+uv run python "$REPO_ROOT/scripts/materialize_credentials.py" \
+    "$ENV_FILE" \
+    "$CLAUDE_SETUP_TOKEN_FILE" \
+    "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE"
 
 echo "  Written to docker/.env (mode 600)"
 
@@ -404,6 +291,32 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     echo ""
     echo "=== Preflight ==="
     preflight_ok=1
+    # Mode transitions are handled before Compose claims :2468. Doing this
+    # after `docker compose up` is too late: the old host process would make
+    # container creation fail before the cleanup branch could run.
+    if [ "${AITELIER_SA_PROFILE:-}" = "1" ] \
+       && [ -f "$SANDBOX_AGENT_PID_FILE" ]; then
+        HOST_SA_PID="$(cat "$SANDBOX_AGENT_PID_FILE" 2>/dev/null || true)"
+        if _process_matches "$HOST_SA_PID" "sandbox-agent server"; then
+            echo "  Stopping host-mode SA before switching to Docker (PID $HOST_SA_PID)"
+            kill "$HOST_SA_PID"
+            for _ in {1..50}; do
+                kill -0 "$HOST_SA_PID" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$HOST_SA_PID" 2>/dev/null; then
+                echo "  ✗ host Sandbox Agent did not stop; refusing to start Docker SA"
+                exit 1
+            fi
+            rm -f "$SANDBOX_AGENT_PID_FILE"
+        elif kill -0 "$HOST_SA_PID" 2>/dev/null; then
+            echo "  ✗ refusing to stop PID $HOST_SA_PID: it is not Sandbox Agent"
+            echo "    Remove the stale $SANDBOX_AGENT_PID_FILE after checking that process."
+            exit 1
+        else
+            rm -f "$SANDBOX_AGENT_PID_FILE"
+        fi
+    fi
     # _check_port_or_die treats our own running container as fine, so we can
     # call it unconditionally — `docker compose up -d` is idempotent.
     _check_port_or_die 5433 "Postgres" \
@@ -412,6 +325,11 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
     _check_port_or_die 4000 "LiteLLM proxy" \
         "stop the conflicting process or override LITELLM_BASE_URL" \
         || preflight_ok=0
+    if [ "${AITELIER_SA_PROFILE:-}" = "1" ]; then
+        _check_port_or_die 2468 "Docker Sandbox Agent" \
+            "stop the conflicting process or switch [sandbox_agent] mode" \
+            || preflight_ok=0
+    fi
     if [ $preflight_ok -eq 0 ]; then
         echo ""
         echo "  Fix the port conflict(s) above, then re-run \`make start\`."
@@ -490,18 +408,7 @@ finally:
 ' 2>/dev/null || echo "http://localhost:2468")"
 
     if [ "${AITELIER_SA_PROFILE:-}" = "1" ]; then
-        echo "  Docker: SA runs in the compose `sa` profile container"
-        # If a previous host-mode SA is still bound to :2468, the docker
-        # container can't claim the port. Tear down the host SA before
-        # waiting on the container.
-        if [ -f "$SANDBOX_AGENT_PID_FILE" ]; then
-            HOST_SA_PID="$(cat "$SANDBOX_AGENT_PID_FILE" 2>/dev/null || true)"
-            if [ -n "$HOST_SA_PID" ] && kill -0 "$HOST_SA_PID" 2>/dev/null; then
-                echo "  Stopping previously-running host-mode SA (PID $HOST_SA_PID)"
-                kill "$HOST_SA_PID" 2>/dev/null || true
-                rm -f "$SANDBOX_AGENT_PID_FILE"
-            fi
-        fi
+        echo "  Docker: SA runs in the Compose profile named sa"
         echo "  → docker compose --profile sa up -d (handled above)"
         for i in {1..30}; do
             if curl -sf "http://localhost:2468/v1/agents" >/dev/null 2>&1; then
@@ -613,7 +520,8 @@ EOF
     if [ "$_host_sa_reachable" = 1 ] \
        && [ "$_expected_claude_fingerprint" != "$_applied_claude_fingerprint" ]; then
         _host_sa_pid="$(cat "$SANDBOX_AGENT_PID_FILE" 2>/dev/null || true)"
-        if [ -n "$_host_sa_pid" ] && kill -0 "$_host_sa_pid" 2>/dev/null; then
+        if _process_matches \
+            "$_host_sa_pid" "sandbox-agent server" "--port ${SANDBOX_AGENT_PORT}"; then
             echo "  Claude credential changed; restarting host Sandbox Agent"
             kill "$_host_sa_pid"
             for _ in $(seq 1 50); do
@@ -657,7 +565,7 @@ EOF
         echo "  Started (PID $(cat "$SANDBOX_AGENT_PID_FILE")) on :${SANDBOX_AGENT_PORT}"
         echo "  Logs: $SANDBOX_AGENT_LOG"
 
-        for i in {1..20}; do
+        for _ in {1..20}; do
             if curl -sf "http://localhost:${SANDBOX_AGENT_PORT}/v1/agents" >/dev/null 2>&1; then
                 break
             fi
@@ -697,7 +605,7 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "service" ]; then
         echo "  Started (PID $AITELIER_PID) on :7777"
         echo "  Logs: $AITELIER_LOG"
 
-        for i in {1..10}; do
+        for _ in {1..10}; do
             if curl -sf http://localhost:7777/v1/health >/dev/null 2>&1; then
                 echo "  ✓ aitelier service ready"
                 break

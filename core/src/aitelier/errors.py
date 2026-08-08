@@ -288,9 +288,8 @@ def scrub_upstream_body(body: str) -> str:
     """Scrub an upstream provider error body for surfacing to consumers +
     persisting to `runs.error_msg`. Runs the conservative named-credential
     patterns first, then the token-shape/entropy recall net for unenumerated
-    secrets. Heuristic by design — monitor the surfaced output and tune
-    `_looks_secret` over time. The unredacted body stays in the WARNING log
-    for operator review."""
+    secrets. Heuristic by design — monitor aggregate redaction behavior and
+    tune `_looks_secret` over time. Callers must not log the unredacted body."""
     if not body:
         return body
     out = scrub_error_text(body)

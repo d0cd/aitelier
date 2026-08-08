@@ -38,12 +38,14 @@ print("host")
 ' 2>/dev/null || echo "host")"
 
 _kill_pid_file() {
-    # $1 = pid file path, $2 = label, $3 = fallback pkill pattern.
-    local pid_file="$1" label="$2" fallback_pattern="$3"
+    # $1 = pid file path, $2 = label, $3 = literal command fragment.
+    # Never fall back to pkill: a broad process-name match can terminate a
+    # service owned by another checkout or by the user directly.
+    local pid_file="$1" label="$2" expected_command="$3"
     if [ -f "$pid_file" ]; then
         local pid
         pid="$(cat "$pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
+        if _process_matches "$pid" "$expected_command"; then
             kill "$pid" 2>/dev/null || true
             # Confirm exit before removing the PID file — otherwise a process
             # that ignores SIGTERM keeps running while we drop its PID file,
@@ -53,20 +55,22 @@ _kill_pid_file() {
                 sleep 0.1
                 waited=$((waited + 1))
             done
-            if kill -0 "$pid" 2>/dev/null; then
+            if _process_matches "$pid" "$expected_command"; then
                 kill -9 "$pid" 2>/dev/null || true
                 echo "  ✓ $label force-killed (PID $pid ignored SIGTERM)"
+            elif kill -0 "$pid" 2>/dev/null; then
+                echo "  ! $label PID $pid changed identity; refusing to force-kill it"
             else
                 echo "  ✓ $label stopped (PID $pid)"
             fi
+        elif kill -0 "$pid" 2>/dev/null; then
+            echo "  ! $label PID file points at a different process; refusing to stop PID $pid"
         else
             echo "  - $label PID file stale (process not running)"
         fi
         rm -f "$pid_file"
-    elif pkill -f "$fallback_pattern" 2>/dev/null; then
-        echo "  ✓ $label stopped (via pkill — no PID file)"
     else
-        echo "  - $label not running"
+        echo "  - $label not managed by this checkout (no PID file)"
     fi
 }
 

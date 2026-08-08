@@ -23,7 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 import aitelier.idempotency as _idem
 from aitelier.config import get_config
-from aitelier.errors import classify_error, scrub_error_text
+from aitelier.errors import classify_error, scrub_error_text, scrub_upstream_body
 from aitelier.openai_compat import (
     AitelierAgentOpts,
     ChatCompletionRequest,
@@ -492,6 +492,10 @@ def _stream_error_payload(
     dict for storage. Errors are NOT recorded for idempotency replay —
     a retrying consumer should get a fresh attempt at success."""
     err_type = event.get("error_type") or "ProviderError"
+    # This is the final API/storage boundary. Providers normally scrub before
+    # yielding, but defensive redaction here also protects future providers,
+    # test doubles, and adapter regressions from persisting upstream secrets.
+    error_msg = scrub_upstream_body(event.get("error_msg") or "stream error")
     # A provider may discover a terminal error only after aggregating the
     # complete answer (notably structured-output conformance). Preserve that
     # full terminal aggregate for durable diagnosis instead of replacing it
@@ -501,12 +505,12 @@ def _stream_error_payload(
     final.setdefault("provider", agent_backend)
     final["status"] = "error"
     final["error_type"] = err_type
-    final["error_msg"] = event.get("error_msg") or "stream error"
+    final["error_msg"] = error_msg
     final["finish_reason"] = (
         "cancelled" if err_type == "Cancelled" else "error"
     )
     frame = {
-        "error": {"type": err_type, "message": event.get("error_msg")},
+        "error": {"type": err_type, "message": error_msg},
         "aitelier_run_id": run_id,
         "correlation_id": cid,
     }

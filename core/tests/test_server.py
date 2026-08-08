@@ -115,6 +115,9 @@ def test_health(client):
     assert data["version"] == "0.1.0"
     assert "known_limitations" in data
     assert isinstance(data["known_limitations"], list)
+    limitations = " ".join(data["known_limitations"])
+    assert "agent cost_usd is always null" not in limitations
+    assert "agent cost_usd is an estimate" in limitations
 
 
 # --- Body-size middleware ----------------------------------------------------
@@ -2406,11 +2409,13 @@ def test_chat_completions_agent_stream_yields_openai_chunks(client):
 
 
 def test_chat_completions_agent_stream_error_event_on_failure(client):
+    secret = "sk-ant-oat01-FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"
+
     async def fake_stream(name, prompt, **kwargs):
         if False:  # pragma: no cover
             yield {}
         yield {"type": "error", "error_type": "ProviderError",
-               "error_msg": "agent crashed"}
+               "error_msg": f"agent crashed while authenticating: {secret}"}
 
     with patch(
         "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
@@ -2424,6 +2429,12 @@ def test_chat_completions_agent_stream_error_event_on_failure(client):
     body = resp.text
     assert "ProviderError" in body
     assert "agent crashed" in body
+    assert secret not in body
+
+    run = _runs_from_store()[-1]
+    assert run.state == "failed"
+    assert "agent crashed" in run.error_msg
+    assert secret not in run.error_msg
 
 
 def test_chat_completions_agent_stream_schema_failure_is_not_success(client):

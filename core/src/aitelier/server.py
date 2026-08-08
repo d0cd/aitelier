@@ -491,7 +491,8 @@ _PROCESS_STARTED_AT = time.monotonic()
 
 
 _KNOWN_LIMITATIONS = [
-    "agent cost_usd is always null — only complete/embed track cost",
+    "agent cost_usd is an estimate from reported token usage and the local "
+    "pricing table; unknown models remain null",
     "runs are purged on startup per [purge] run_retention_days "
     "(default 30); events and terminal webhook deliveries age out via "
     "the background purge worker",

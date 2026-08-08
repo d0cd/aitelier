@@ -39,6 +39,25 @@ _pick_free_port() {
     uv run python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()'
 }
 
+_process_matches() {
+    # Return success only when $1 is a live numeric PID whose command contains
+    # every remaining literal fragment. A PID file alone is not proof of
+    # ownership: PIDs are reusable, so lifecycle scripts must validate before
+    # sending a signal.
+    local pid="$1" command expected
+    shift
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    command="$(ps -p "$pid" -o command= 2>/dev/null)" || return 1
+    [ -n "$command" ] || return 1
+    for expected in "$@"; do
+        case "$command" in
+            *"$expected"*) ;;
+            *) return 1 ;;
+        esac
+    done
+}
+
 # --- Brig cell lifecycle (SA-in-a-cell) ------------------------------------
 # Shared by start.sh (bring up) and stop.sh (tear down). Constants match
 # scripts/test-brig-mode.sh and docs/deploy/sandbox-agent.cell.yaml.

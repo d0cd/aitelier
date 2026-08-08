@@ -68,7 +68,9 @@ services:
       - "${HOME}/.codex:/root/.codex:ro"
       - aitelier_sa_workspaces:/workspaces
     secrets:
-      - claude-oauth-token
+      - source: claude-oauth-token
+        target: claude-oauth-token
+        mode: "0400"
     # Compose recreates the service when credential material changes, while
     # revealing only a one-way fingerprint in container metadata.
     labels:
