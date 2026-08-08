@@ -1424,6 +1424,60 @@ async def test_call_via_sandbox_returns_timeout_on_overrun(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_call_via_sandbox_preserves_terminal_error_aggregate(monkeypatch):
+    aggregate = {
+        "type": "error", "kind": "agent", "provider": "claude",
+        "status": "error", "duration_s": 0.2, "run_id": "run-schema",
+        "trace_id": "run-schema", "content": '{"answer": "wrong"}',
+        "parsed": {"answer": "wrong"},
+        "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        "finish_reason": "error", "tool_calls": [], "cost_usd": 0.001,
+        "error_type": "SchemaViolation",
+        "error_msg": "Structured output conformance failed",
+    }
+
+    async def terminal_error_stream(*args, **kwargs):
+        yield aggregate
+
+    monkeypatch.setattr(
+        "aitelier.providers.sandbox_agent.call_via_sandbox_stream",
+        terminal_error_stream,
+    )
+    result = await call_via_sandbox(
+        "claude", "return JSON", run_id="run-schema", timeout=1,
+    )
+
+    assert result == {k: v for k, v in aggregate.items() if k != "type"}
+
+
+@pytest.mark.asyncio
+async def test_call_via_sandbox_expands_minimal_transport_error(monkeypatch):
+    async def transport_error_stream(*args, **kwargs):
+        yield {
+            "type": "error", "error_type": "ProviderUnavailable",
+            "error_msg": "connection reset",
+        }
+
+    monkeypatch.setattr(
+        "aitelier.providers.sandbox_agent.call_via_sandbox_stream",
+        transport_error_stream,
+    )
+    result = await call_via_sandbox(
+        "claude", "hello", run_id="run-transport", timeout=1,
+    )
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "ProviderUnavailable"
+    assert result["content"] is None
+    assert result["parsed"] is None
+    assert result["usage"] == {
+        "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+    }
+    assert result["cost_usd"] is None
+    assert "connection reset" in result["error_msg"]
+
+
+@pytest.mark.asyncio
 async def test_timeout_after_content_identifies_missing_terminal_event(monkeypatch):
     """Answer text without ACP termination is a protocol diagnostic, not
     indistinguishable ordinary model latency."""

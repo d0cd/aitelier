@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from aitelier.providers.llm import (
     LLMError,
     UnsupportedResponseFormat,
     _apply_response_format_gates,
+    _safe_connect_message,
+    _safe_upstream_message,
     _wants_anthropic_prompt_caching,
     chat_completion,
     chat_completion_stream,
@@ -27,6 +31,61 @@ from aitelier.providers.ollama import (
 )
 
 # --- Response-format gating -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body", "secret", "diagnosis"),
+    [
+        (
+            "authentication revoked; Bearer FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+            "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+            "authentication revoked",
+        ),
+        (
+            '{"message":"bad key","api_key":"FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"}',
+            "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+            "bad key",
+        ),
+        (
+            "failed https://provider.test?token=FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+            "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+            "provider.test",
+        ),
+        (
+            "credential rejected: sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56",
+            "sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56",
+            "credential rejected",
+        ),
+    ],
+)
+def test_safe_upstream_message_scrubs_return_and_warning_log(
+    body, secret, diagnosis, caplog,
+):
+    response = httpx.Response(401, text=body)
+    with caplog.at_level(logging.WARNING, logger="aitelier.llm"):
+        message = _safe_upstream_message(401, response)
+
+    assert secret not in message
+    assert secret not in caplog.text
+    assert diagnosis in message
+    assert diagnosis in caplog.text
+    assert "HTTP 401" in message
+    assert "Upstream 401" in caplog.text
+
+
+def test_safe_connect_message_scrubs_warning_log(caplog):
+    secret = "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"
+    request = httpx.Request("GET", "https://provider.test")
+    exc = httpx.ConnectError(
+        f"failed https://provider.test?api_key={secret}", request=request,
+    )
+    with caplog.at_level(logging.WARNING, logger="aitelier.llm"):
+        message = _safe_connect_message(exc)
+
+    assert message == "Upstream transport failure (ConnectError)"
+    assert secret not in caplog.text
+    assert "api_key=[redacted]" in caplog.text
+    assert "provider.test" in caplog.text
 
 
 def test_json_object_on_anthropic_strips_and_injects_directive():

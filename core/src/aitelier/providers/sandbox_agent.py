@@ -596,6 +596,20 @@ async def call_via_sandbox(
     if final is not None:
         return final
     if last_error is not None:
+        # Structured-output validation and other producer-side terminal
+        # failures carry a complete canonical aggregate. Preserve it exactly
+        # (apart from the stream discriminator) so non-streaming execution
+        # retains the same content, parsed output, usage, and cost as the
+        # streaming durable result. Minimal transport errors have no status
+        # and continue through _error_result below to acquire the standard
+        # result shape.
+        if last_error.get("status") == "error":
+            result = {k: v for k, v in last_error.items() if k != "type"}
+            result["error_msg"] = scrub_upstream_body(
+                result.get("error_msg") or "stream error"
+            )
+            return result
+
         # Reconstruct a full Result from the streamed error event. The
         # producer already classified the exception via `classify_error`
         # before serializing it into the event — preserve that type

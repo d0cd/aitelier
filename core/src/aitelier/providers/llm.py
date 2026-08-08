@@ -26,7 +26,7 @@ from typing import Any
 import httpx
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error
+from aitelier.errors import classify_error, scrub_upstream_body
 
 logger = logging.getLogger("aitelier.llm")
 
@@ -236,11 +236,12 @@ def _safe_connect_message(exc: BaseException) -> str:
 
     `str(exc)` from httpx routinely includes the upstream URL/host. In
     hosted mode that leaks internal topology to consumers via the error
-    envelope. Surface only the exception class + a generic phrase and
-    log the full string server-side.
+    envelope. Surface only the exception class + a generic phrase. The
+    operator log keeps the scrubbed diagnosis, never the raw exception.
     """
     cls = type(exc).__name__
-    logger.warning("LLM transport failure: %s: %s", cls, exc)
+    safe_detail = scrub_upstream_body(str(exc))
+    logger.warning("LLM transport failure: %s: %s", cls, safe_detail)
     return f"Upstream transport failure ({cls})"
 
 
@@ -252,24 +253,24 @@ def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
     The raw body can carry provider internals or an echoed key fragment in
     free prose, so it goes through `scrub_upstream_body` (named-credential
     patterns + a token-shape/entropy recall net) before being surfaced to
-    consumers and persisted to `runs.error_msg`. The scrub is heuristic; the
-    full unredacted body stays in the WARNING log for operator review +
-    tuning.
+    consumers, logs, and persisted to `runs.error_msg`. The scrub is
+    heuristic; no ordinary-log path retains the unredacted body.
     """
-    from aitelier.errors import scrub_upstream_body
     canonical = {
         "RateLimited":   "Upstream rate limit",
         "AuthError":     "Upstream auth failure",
         "ProviderError": "Upstream provider error",
     }.get(_classify_llm_status(status), "Upstream provider error")
-    body_preview = resp.text[:500] if resp.text else ""
-    if not body_preview:
+    if not resp.text:
         return f"{canonical} (HTTP {status})"
+    # Scrub before truncating so a credential crossing the preview boundary
+    # cannot leave a short, otherwise-unrecognizable fragment in the log.
+    body_preview = scrub_upstream_body(resp.text)[:500]
     logger.warning(
         "Upstream %d (%s); response body: %s",
         status, canonical, body_preview,
     )
-    return f"{canonical} (HTTP {status}): {scrub_upstream_body(body_preview)}"
+    return f"{canonical} (HTTP {status}): {body_preview}"
 
 
 # Ollama bypass routing lives in `providers/ollama.py` — the

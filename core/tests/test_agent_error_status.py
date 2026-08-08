@@ -4,6 +4,8 @@ status-code-based retry/backoff for OpenAI-SDK consumers."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from aitelier.openai_compat import chat_completion_error_envelope
 from aitelier.server import _http_status_for_agent_error
 
@@ -23,6 +25,17 @@ def test_agent_error_status_mapping():
     # The whole point of the fix: an opaque agent error is 502, never 500.
     assert _http_status_for_agent_error({"error_type": None}) == 502
     assert _http_status_for_agent_error({}) == 502
+
+
+def test_invalid_inner_model_guide_example_matches_provider_error_status():
+    guide = (
+        Path(__file__).resolve().parents[2] / "docs" / "INTEGRATION.md"
+    ).read_text()
+    example = "agent:codex/openai/gpt-4o  →  HTTP"
+
+    assert f"{example} 502" in guide
+    assert f"{example} 500" not in guide
+    assert _http_status_for_agent_error({"error_type": "ProviderError"}) == 502
 
 
 def test_agent_timeout_error_envelope_yields_504_not_500():

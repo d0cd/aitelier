@@ -923,7 +923,7 @@ backend advertises and, on a miss, returns a `ProviderError` **before** running
 any turn, naming the ids that are valid:
 
 ```jsonc
-// agent:codex/openai/gpt-4o  →  HTTP 500
+// agent:codex/openai/gpt-4o  →  HTTP 502
 { "error": { "type": "ProviderError",
   "message": "backend 'codex' does not offer inner model 'openai/gpt-4o'. Available: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2. Use a backend-native id ..." } }
 ```
