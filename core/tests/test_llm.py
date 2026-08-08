@@ -14,6 +14,7 @@ from aitelier.providers.llm import (
     _apply_response_format_gates,
     _safe_connect_message,
     _safe_upstream_message,
+    _scrubbed_preview,
     _wants_anthropic_prompt_caching,
     chat_completion,
     chat_completion_stream,
@@ -86,6 +87,29 @@ def test_safe_connect_message_scrubs_warning_log(caplog):
     assert secret not in caplog.text
     assert "api_key=[redacted]" in caplog.text
     assert "provider.test" in caplog.text
+
+
+def test_scrubbed_preview_catches_boundary_secret_without_scanning_full_body(
+    monkeypatch,
+):
+    import aitelier.providers.llm as llm
+
+    secret = "sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56"
+    body = "x" * 475 + " key " + secret + "z" * 1_000_000
+    scanned_lengths = []
+    real_scrubber = llm.scrub_upstream_body
+
+    def capture_scan(value):
+        scanned_lengths.append(len(value))
+        return real_scrubber(value)
+
+    monkeypatch.setattr(llm, "scrub_upstream_body", capture_scan)
+    preview = _scrubbed_preview(body, limit=500)
+
+    assert secret not in preview
+    assert "[redacted]" in preview
+    assert len(preview) <= 500
+    assert scanned_lengths and scanned_lengths[0] < 10_000
 
 
 def test_json_object_on_anthropic_strips_and_injects_directive():

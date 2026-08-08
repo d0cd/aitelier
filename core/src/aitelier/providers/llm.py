@@ -30,6 +30,10 @@ from aitelier.errors import classify_error, scrub_upstream_body
 
 logger = logging.getLogger("aitelier.llm")
 
+_UPSTREAM_BODY_PREVIEW_LIMIT = 500
+_TRANSPORT_DETAIL_PREVIEW_LIMIT = 2000
+_SECRET_SCAN_PADDING = 4096
+
 # Per-provider response_format support. Used to soft-fall-back for `json_object`
 # (intent: "give me JSON" — a system-prompt directive substitutes well) and to
 # hard-reject `json_schema` on providers that can't enforce structured output
@@ -231,6 +235,18 @@ def _classify_llm_status(status: int) -> str:
     return "ProviderError"
 
 
+def _scrubbed_preview(detail: str, *, limit: int) -> str:
+    """Return a bounded, scrubbed prefix suitable for ordinary logs.
+
+    Scan beyond the emitted prefix so a credential crossing ``limit`` is
+    still recognized before truncation. Bounding the scan prevents a hostile
+    multi-megabyte provider body from turning error rendering into avoidable
+    latency; the shared scrubber remains the only credential-pattern source.
+    """
+    scan_limit = limit + _SECRET_SCAN_PADDING
+    return scrub_upstream_body(detail[:scan_limit])[:limit]
+
+
 def _safe_connect_message(exc: BaseException) -> str:
     """Sanitize a transport-layer failure (DNS, connect, read timeout).
 
@@ -240,7 +256,9 @@ def _safe_connect_message(exc: BaseException) -> str:
     operator log keeps the scrubbed diagnosis, never the raw exception.
     """
     cls = type(exc).__name__
-    safe_detail = scrub_upstream_body(str(exc))
+    safe_detail = _scrubbed_preview(
+        str(exc), limit=_TRANSPORT_DETAIL_PREVIEW_LIMIT,
+    )
     logger.warning("LLM transport failure: %s: %s", cls, safe_detail)
     return f"Upstream transport failure ({cls})"
 
@@ -263,9 +281,11 @@ def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
     }.get(_classify_llm_status(status), "Upstream provider error")
     if not resp.text:
         return f"{canonical} (HTTP {status})"
-    # Scrub before truncating so a credential crossing the preview boundary
-    # cannot leave a short, otherwise-unrecognizable fragment in the log.
-    body_preview = scrub_upstream_body(resp.text)[:500]
+    # Scan past the emitted cutoff before truncating so a credential crossing
+    # the preview boundary cannot leave a short, unrecognizable fragment.
+    body_preview = _scrubbed_preview(
+        resp.text, limit=_UPSTREAM_BODY_PREVIEW_LIMIT,
+    )
     logger.warning(
         "Upstream %d (%s); response body: %s",
         status, canonical, body_preview,
