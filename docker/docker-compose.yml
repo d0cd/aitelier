@@ -49,8 +49,9 @@ services:
   #
   # The agent inside SA inherits this container's permissions —
   # filesystem reach is bounded by the `volumes` block below. Credential
-  # files (~/.claude, ~/.codex) are mounted read-only so SA can dispatch
-  # to claude-code / codex without baking secrets into the image.
+  # files are mounted read-only so SA can dispatch to claude-code / codex
+  # without baking secrets into the image. Claude prefers the same long-lived
+  # setup token as Brig/direct LiteLLM; the legacy ~/.claude mount is fallback.
   #
   # Workspace: aitelier passes `aitelier.workspace` as the agent's cwd.
   # Mount any host paths the agent should be able to read/write under
@@ -66,6 +67,12 @@ services:
       - "${HOME}/.claude:/root/.claude:ro"
       - "${HOME}/.codex:/root/.codex:ro"
       - aitelier_sa_workspaces:/workspaces
+    secrets:
+      - claude-oauth-token
+    # Compose recreates the service when credential material changes, while
+    # revealing only a one-way fingerprint in container metadata.
+    labels:
+      dev.aitelier.claude-token-fingerprint: "${CLAUDE_SETUP_TOKEN_FINGERPRINT:-none}"
     restart: unless-stopped
     healthcheck:
       # `curl` is installed in the SA Dockerfile; wget isn't.
@@ -105,3 +112,7 @@ volumes:
   aitelier_pg_data: {}
   aitelier_ollama_models: {}
   aitelier_sa_workspaces: {}
+
+secrets:
+  claude-oauth-token:
+    file: ../runs/.claude-oauth-token

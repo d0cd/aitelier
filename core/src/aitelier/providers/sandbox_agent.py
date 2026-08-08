@@ -23,7 +23,7 @@ import time
 from typing import Any
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error, scrub_error_text
+from aitelier.errors import classify_error, scrub_error_text, scrub_upstream_body
 from aitelier.openai_compat import parse_unique_json
 from aitelier.pricing import compute_cost
 from aitelier.providers.acp_transport import (
@@ -47,16 +47,26 @@ logger = logging.getLogger("aitelier.sandbox_agent")
 
 
 def _acp_exception_text(exc: Exception) -> str:
-    """Render useful JSON-RPC error data for the existing scrub pipeline."""
+    """Render useful JSON-RPC error data through the upstream trust boundary.
+
+    ACP ``error.data`` is controlled by an adapter/provider and may contain a
+    bare credential that the intentionally conservative ``scrub_error_text``
+    does not recognize. Treat the complete ACP error as upstream detail and
+    apply the shared high-recall scrubber before any caller can persist, log,
+    or return it.
+    """
     text = str(exc) or type(exc).__name__
-    if not isinstance(exc, AcpError) or exc.data is None:
+    if not isinstance(exc, AcpError):
         return text
+
+    if exc.data is None:
+        return scrub_upstream_body(text)
 
     if isinstance(exc.data, dict) and isinstance(exc.data.get("message"), str):
         detail = exc.data["message"]
     else:
         detail = json.dumps(exc.data, default=str, sort_keys=True)
-    return f"{text}: {detail[:2000]}"
+    return scrub_upstream_body(f"{text}: {detail[:2000]}")
 
 
 class _RunEventEmitter:
@@ -841,12 +851,13 @@ async def _build_done_event(
     text_chunks: list[str], tool_calls: list[dict],
     emitter: _RunEventEmitter, agent_model: str | None = None,
 ) -> dict:
-    """Assemble the terminal `done` event from turn_result + accumulators.
+    """Assemble the terminal event from turn_result + accumulators.
 
     Lives in its own function because the streaming entry point's
     happy-path tail was the densest part of `call_via_sandbox_stream` —
-    aggregator call + accumulator merge + finish emit. Pulling it out
-    keeps the orchestration loop readable."""
+    aggregator call + accumulator merge + finish emit. Structured-output
+    validation can promote the aggregate to a typed ``error`` event; successful
+    aggregates remain ``done``. Pulling it out keeps the loop readable."""
     done = _aggregate_result(
         agent=client.agent,
         run_id=run_id,
@@ -858,9 +869,12 @@ async def _build_done_event(
     )
     if tool_calls:
         done["tool_calls"] = tool_calls
-    done["type"] = "done"
-    await emitter.emit("finish", {
+    failed = done.get("status") == "error"
+    done["type"] = "error" if failed else "done"
+    await emitter.emit("error" if failed else "finish", {
         "finish_reason": done.get("finish_reason"),
+        "error_type": done.get("error_type"),
+        "error_msg": done.get("error_msg"),
         "tool_call_count": len(tool_calls),
     })
     return done
@@ -1169,14 +1183,12 @@ def _apply_structured_output(result: dict, response_format: dict | None) -> None
         return
     content = result.get("content") or ""
     found, parsed = parse_unique_json(content)
-    result["parsed"] = parsed
-    if fmt_type != "json_schema":
-        return
-
     violation: str | None = None
     if not found:
         violation = "structured output did not contain exactly one JSON value"
-    else:
+    elif fmt_type == "json_object" and not isinstance(parsed, dict):
+        violation = "structured output was not a JSON object"
+    elif fmt_type == "json_schema":
         schema = _response_format_schema(response_format)
         if schema is not None:
             from jsonschema import Draft202012Validator
@@ -1188,6 +1200,8 @@ def _apply_structured_output(result: dict, response_format: dict | None) -> None
                     violation = error.message
             except Exception as exc:
                 violation = f"invalid requested JSON Schema: {exc}"
+
+    result["parsed"] = parsed
 
     if violation is not None:
         result["status"] = "error"

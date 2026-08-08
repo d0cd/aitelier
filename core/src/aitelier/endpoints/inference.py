@@ -198,7 +198,8 @@ async def list_models_endpoint(agent_backend: str | None = None) -> dict:
       `response_format` annotates which `json_object`/`json_schema` modes
       the provider supports.
     - **Agent**: `id = "agent:<backend>"`, `aitelier_agent: true`. Lists
-      `aitelier_inner_llms` (the LLM aliases the backend can drive) and
+      `aitelier_inner_llms` (the backend-native model ids advertised by the
+      live ACP session) and
       `aitelier_capabilities` (a subset of Sandbox Agent's capability
       flags). Consumers can validate `agent:<backend>/<inner-llm>`
       strings upfront rather than after a failed run.

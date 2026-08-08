@@ -1,12 +1,13 @@
-# Active Trellis code-review feedback for Aitelier
+# Trellis code-review resolution record for Aitelier
 
 Date: 2026-08-07
 
 Verified against Aitelier `9ed53231842636285c24ad33401efcb6e33a233a`
 
-This is an active backlog, not a history of earlier findings. Resolved items were removed.
-The remaining entries were independently checked against current code after two retained
-Trellis persistent-lead reviews:
+Status: all five findings recorded below are resolved in the current code and
+covered by focused regressions. They are retained here as review/acceptance
+history rather than as an active backlog. The findings were independently
+checked after two retained Trellis persistent-lead reviews:
 
 - `755ebd4b-7bfa-4692-a5fa-4df063de28ed` reviewed the main hardening commit
   (27 files, 1,194 changed lines).
@@ -17,7 +18,7 @@ Both current Brig terminal handshakes pass: Claude Code `2.1.144` through adapte
 and Codex CLI `0.137.0` through `codex-acp` `0.16.0`. The active runtime defects below do
 not mean that those basic terminal turns are unavailable.
 
-## P0 — ACP error detail can disclose an unlabelled credential
+## Resolved P0 — ACP error detail could disclose an unlabelled credential
 
 ### Problem
 
@@ -54,7 +55,11 @@ only covers `Authorization: Bearer ...`, so it does not exercise this path.
   or ordinary logs.
 - The non-secret backend diagnosis remains visible.
 
-## P1 — Streaming structured-output failure is emitted as success
+Resolution: ACP errors now cross the shared `scrub_upstream_body` boundary before
+rendering. Regressions cover bare setup tokens, named refresh tokens, nested
+authorization data, and query credentials while retaining diagnosis text.
+
+## Resolved P1 — Streaming structured-output failure was emitted as success
 
 ### Problem
 
@@ -101,7 +106,11 @@ send a success terminal chunk for the same result.
   projection.
 - Regression tests cover both the SSE body and the durable run state.
 
-## P1 — Claude setup-token behavior is inconsistent in host and Docker modes
+Resolution: structured-output aggregation now promotes conformance failures to
+typed `error` events. SSE emits `SchemaViolation` without a success terminal
+chunk, while durable results retain content, parsed data, and usage.
+
+## Resolved P1 — Claude setup-token behavior was inconsistent across modes
 
 ### Problem
 
@@ -145,7 +154,12 @@ the quick-start and doctor claims and report the two credential domains separate
 - Mode-specific tests or probes fail clearly when the credential required by that mode is
   absent or stale.
 
-## P2 — Inner-model discovery documentation contradicts the implementation
+Resolution: `start.sh` materializes a mode-600 runtime secret. Host SA receives
+it only in its process environment, Docker SA through a read-only Compose secret
+and entrypoint, and Brig keeps its existing secret mount. Fingerprints trigger
+credential-aware host/Docker recreation without exposing the token.
+
+## Resolved P2 — Inner-model discovery documentation contradicted the implementation
 
 ### Problem
 
@@ -169,7 +183,11 @@ model configuration option and uses `session/set_model` only as a legacy fallbac
 - Documentation examples match a live `GET /v1/models?agent_backend=codex` response and the
   tested configuration method.
 
-## P2 — Brig deployment documentation describes the obsolete topology
+Resolution: the guide now treats live `aitelier_inner_llms` as authoritative
+when present, documents advertised model configuration as the normal path, and
+uses the current live Codex model list.
+
+## Resolved P2 — Brig deployment documentation described the obsolete topology
 
 ### Problem
 
@@ -196,6 +214,10 @@ not running inside the cell.
 - Every Brig example uses the SA-only cell, ingress port 2468, and external Aitelier service.
 - Secret and workspace mounts are assigned to the component that consumes them.
 - Narrative claims and deployment-shape tests agree on the same topology.
+
+Resolution: the guide now documents `mode = "brig"` as an SA-only cell with
+authenticated port-2468 ingress and host-side Aitelier; shape tests prevent the
+obsolete co-located topology from returning.
 
 ## Verified non-findings
 

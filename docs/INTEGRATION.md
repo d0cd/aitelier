@@ -177,7 +177,9 @@ for field in ("tools", "tool_choice"):
 
 For inner-LLM selection on agent routes, see "Selecting the inner model"
 under [Available agents](#available-agents) — the id must be backend-native,
-and `aitelier_inner_llms` is not the authoritative per-backend list.
+and `aitelier_inner_llms` is authoritative when the live backend probe supplies
+it. If the field is omitted, capability state is temporarily unavailable; no
+hard-coded fallback list becomes authoritative.
 
 ### Reasoning models on `local` / `ollama/*`
 
@@ -573,10 +575,12 @@ using the returned id will not transiently 404.
 
 For agent requests using `response_format`, the durable terminal result stores
 the recovered value in `result.parsed`, including a single JSON value wrapped
-in prose or code fences. A `json_schema` result that is absent, ambiguous, or
-does not validate is finalized as `failed` with `error_type: SchemaViolation`;
-the raw content and parsed value (when recoverable) remain available for
-diagnosis.
+in prose or code fences. A `json_object` result that is absent, ambiguous, or
+not an object—and a `json_schema` result that is absent, ambiguous, or does not
+validate—is finalized as `failed` with `error_type: SchemaViolation`; the raw
+content and parsed value (when recoverable) remain available for diagnosis.
+Streaming requests receive the same typed error frame and never a conflicting
+`finish_reason: stop` success chunk.
 
 If an agent emits answer text but never sends the terminal ACP response before
 the deadline, the run still fails with `finish_reason: timeout`, but records
@@ -902,18 +906,14 @@ lists each backend's real ids under `aitelier_inner_llms` (see below).
 | Backend | Inner-model id format | Examples | Wired via |
 |---|---|---|---|
 | `claude` | Anthropic aliases or full ids | `agent:claude/sonnet`, `agent:claude/haiku`, `agent:claude/claude-sonnet-4-5` | `session/new` `_meta` |
-| `codex` | Codex-native ids | `agent:codex/gpt-5.5`, `agent:codex/gpt-5.4` | `session/set_model` |
-| `opencode`, `cursor`, `amp`, `pi` | the backend's own ids | (see `/v1/models`) | `session/set_model` |
+| `codex` | Codex-native ids | `agent:codex/gpt-5.5`, `agent:codex/gpt-5.4` | advertised model config option |
+| `opencode`, `cursor`, `amp`, `pi` | the backend's own ids | (see `/v1/models`) | advertised model config option; legacy `session/set_model` fallback |
 
-> **codex + ChatGPT-account login:** always pass an explicit model
-> (`agent:codex/gpt-5.5`). Bare `agent:codex/gpt-5.5` lets codex-acp fall back to its
-> own default (`gpt-5.3-codex`), which a **ChatGPT-subscription** OAuth login
-> can't use — the turn fails. aitelier surfaces only codex-acp's wire-level
-> `ACP error -32603: Internal error` (the actionable detail —
-> *"'gpt-5.3-codex' model is not supported when using Codex with a ChatGPT
-> account"* — is logged to codex's stderr inside the sandbox, not returned
-> over ACP, so aitelier can't relay it). The `-codex`-suffixed ids in
-> particular are API-key-only; ChatGPT accounts want a plain `gpt-5.x`.
+> **codex + ChatGPT-account login:** select one of the plain `gpt-5.x` ids
+> advertised by the live backend. Aitelier rejects a missing or unknown inner
+> model before the turn, then applies the selected id through codex-acp's
+> advertised model configuration option. Do not infer availability from model
+> names in the LLM-path catalog.
 
 Common mistake: `agent:codex/openai/gpt-4o`. The `openai/*` strings (and curated
 aliases like `claude-sonnet`) are **LLM-path** ids — they work for
@@ -925,7 +925,7 @@ any turn, naming the ids that are valid:
 ```jsonc
 // agent:codex/openai/gpt-4o  →  HTTP 500
 { "error": { "type": "ProviderError",
-  "message": "backend 'codex' does not offer inner model 'openai/gpt-4o'. Available: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.3-codex-spark, gpt-5.2. Use a backend-native id ..." } }
+  "message": "backend 'codex' does not offer inner model 'openai/gpt-4o'. Available: gpt-5.5, gpt-5.4, gpt-5.4-mini, gpt-5.3-codex, gpt-5.2. Use a backend-native id ..." } }
 ```
 
 ### Reasoning effort & approval mode
@@ -955,7 +955,7 @@ cached), so consumers can pre-validate instead of hard-coding:
 
 ```jsonc
 { "id": "agent:codex", "aitelier_agent": true,
-  "aitelier_inner_llms":      ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"],
+  "aitelier_inner_llms":      ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2"],
   "aitelier_reasoning_levels": ["low", "medium", "high", "xhigh"],
   "aitelier_approval_modes":   ["read-only", "auto", "full-access"] }
 ```
@@ -1039,9 +1039,12 @@ curl -s -X POST http://localhost:7777/v1/runs \
   }'
 ```
 
-In a Brig-cell deployment, replace `localhost:7777` with
-`http://aitelier.host.brig/v1`. For local dev where you need
-loopback webhook callbacks, set `[service] allow_loopback_webhooks = true`.
+From an agent sandbox, use an Aitelier base URL that is reachable from that
+sandbox; `localhost:7777` refers to the sandbox itself. In the recommended
+Brig deployment Aitelier remains outside the SA cell, so expose an explicitly
+authenticated host/overlay URL rather than assuming an in-cell Aitelier
+hostname. For local dev where you need loopback webhook callbacks, set
+`[service] allow_loopback_webhooks = true`.
 
 ### Approach 2: agent loads `aitelier-mcp` as an MCP server
 
@@ -1424,12 +1427,13 @@ Rivet's Sandbox Agent is a control plane, not a sandbox. It's a
 15 MB Rust binary that gives a uniform HTTP/ACP API over claude-code /
 codex / opencode / cursor / amp / pi. **Isolation comes from wherever
 you run the binary** — SA itself doesn't add it. aitelier supports
-three deployment modes via `[sandbox_agent] mode`:
+four deployment modes via `[sandbox_agent] mode`:
 
 ```toml
 [sandbox_agent]
 mode = "host"    # bare host install; no isolation. Default. Dev only.
 # mode = "docker"  # SA inside the docker-compose `sa` profile container.
+# mode = "brig"    # SA-only Brig cell; Aitelier stays on the host.
 # mode = "remote"  # SA elsewhere; set base_url + token.
 ```
 
@@ -1445,19 +1449,24 @@ mode = "host"    # bare host install; no isolation. Default. Dev only.
   Sandboxes (Docker Desktop 4.60+ runs each container in a microVM —
   hard hypervisor boundary; the agent can't see host paths at all).
 
+- **`mode = "brig"`** — `start.sh` manages the SA-only cell defined by
+  `docs/deploy/sandbox-agent.cell.yaml`. Aitelier continues running on the host
+  and reaches Sandbox Agent through Brig's authenticated ingress at
+  `http://127.0.0.1:8443/sandbox-agent`; ingress forwards SA's port 2468. Only
+  agent-runtime credentials and the cell workspace enter the sandbox.
+
 - **`mode = "remote"`** — aitelier connects to SA running elsewhere.
   Set `base_url` to the remote URL and `token` to the auth header in
   `aitelier.secrets.toml`. Common targets: E2B, Daytona, Modal, Vercel
-  Sandboxes, Cloudflare Containers, or a brig cell. `start.sh` detects
+  Sandboxes or Cloudflare Containers. `start.sh` detects
   non-localhost URLs and skips the local install.
 
-For **brig-cell deployments**, the recommended shape is the cell
-itself as the sandbox — aitelier + SA both run inside one cell with
-`mode = "host"` (within the cell). The cell's podman boundary +
-Warden network policy provide isolation. A sample
-`docs/deploy/sandbox-agent.cell.yaml` shows the layout, including
-workspace mount declarations, ingress on :7777, and the recommended
-`policy.allow` list.
+For **Brig deployments**, do not place Aitelier in the agent cell. The cell is
+the untrusted execution boundary; co-locating the control plane would give
+agent work access to Aitelier's database/configuration domain. The sample
+`docs/deploy/sandbox-agent.cell.yaml` therefore starts only Sandbox Agent,
+mounts only its credentials/workspace, and exposes only authenticated SA
+ingress on port 2468. Aitelier's host configuration points to that ingress.
 
 ### Test coverage for deployment modes
 
@@ -1466,7 +1475,8 @@ Three tiers, ordered by cost:
 1. **Shape validation** (`core/tests/test_deploy_samples.py`) — runs
    on every CI commit. Parses `docs/deploy/sandbox-agent.cell.yaml`,
    checks required brig keys (`name`, `image`, `command`, `network`,
-   `policy.allow`, `ingress.port == 7777`, …), validates
+   `policy.allow`, `ingress.port == 2468`, …), asserts that the cell does not
+   run Aitelier or receive Aitelier-only secrets, validates
    `docker/sandbox-agent.Dockerfile` mentions the Rivet install URL +
    `EXPOSE 2468`, and asserts the compose `sa` profile is opt-in.
    ~10 ms; pure file inspection.
@@ -1486,12 +1496,12 @@ Three tiers, ordered by cost:
    Requires Docker + real LLM credentials. Not in CI.
 
 **Brig-mode e2e is intentionally not in this repo's CI.** Brig is one
-optional remote-sandbox target (see the sandbox modes above), not a
+optional local sandbox substrate (see the sandbox modes above), not a
 required part of running aitelier; it isn't on PyPI / homebrew / a
 CI-installable artifact registry, so wiring it into GitHub Actions is
-impractical. If you deploy aitelier onto a brig cell, that integration
-signal lives in your own deployment's CI — your consumer talking to an
-aitelier cell — not here.
+impractical. Run `./scripts/test-brig-mode.sh` (or
+`make test-brig-mode-e2e`) locally; it starts the SA-only cell and tests the
+host Aitelier service through authenticated SA ingress.
 
 ## Cost tracking
 

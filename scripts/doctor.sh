@@ -225,8 +225,8 @@ PY
 }
 claude_state="$(_claude_cred_state)"
 case "$claude_state" in
-    setup-env) _ok "Claude long-lived setup token present (CLAUDE_CODE_OAUTH_TOKEN)" ;;
-    setup-brig) _ok "Claude long-lived setup token present (brig secret)" ;;
+    setup-env) _ok "Claude long-lived setup token present for direct + ${SA_MODE} agent routes (environment)" ;;
+    setup-brig) _ok "Claude long-lived setup token present for direct + ${SA_MODE} agent routes (brig secret)" ;;
     valid:*) _ok "Claude legacy OAuth token valid (${claude_state#valid:}h remaining)" ;;
     expired) _warn "Claude legacy OAuth snapshot expired — use \`claude setup-token\` for claude-*/anthropic/* LLM models" ;;
     no-token) _warn "Claude credentials file has no token — use \`claude setup-token\` for claude-*/anthropic/* models" ;;

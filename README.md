@@ -20,8 +20,11 @@ make start                # Postgres + LiteLLM + Sandbox Agent + aitelier servic
 
 Claude agent and direct-model routes use a long-lived setup token. Register it
 once as the brig secret `claude-oauth-token` (`claude setup-token` creates one);
-`make start` reuses that same secret for LiteLLM. A normal interactive Claude
-login is refreshable for the host CLI but is not exported as a provider token.
+or supply it as `CLAUDE_CODE_OAUTH_TOKEN` when starting without Brig.
+`make start` passes that same token to LiteLLM and the selected host, Docker, or
+Brig Sandbox Agent through mode-appropriate secret boundaries. A normal
+interactive Claude login is refreshable for the host CLI but is not exported
+as a provider token.
 
 The service is now at `http://localhost:7777`. Health check:
 `curl localhost:7777/v1/health`. A read-only dashboard (runs, events, trace

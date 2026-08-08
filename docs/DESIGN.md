@@ -296,10 +296,12 @@ spans) is a deliberate future investment, not currently wired. The
 The brig-hosted Claude agent reads a long-lived setup token from the
 `claude-oauth-token` brig secret; Codex reads the registered snapshot of
 `~/.codex/auth.json`. Aitelier does not proxy agent credentials. At startup it
-does reuse the Claude setup token for LiteLLM's direct `claude-*` and
-`anthropic/*` routes. A legacy `~/.claude/.credentials.json` access token is
-accepted only as a fallback because newer Claude Code releases may keep the
-refreshable host login in secure storage without updating that file.
+reuses the Claude setup token for LiteLLM's direct `claude-*` / `anthropic/*`
+routes and passes it to the selected local Sandbox Agent mode through a scoped
+process environment (host) or read-only secret mount (Docker/Brig). A legacy
+`~/.claude/.credentials.json` access token is accepted only as a fallback
+because newer Claude Code releases may keep the refreshable host login in
+secure storage without updating that file.
 
 LiteLLM API keys (for provider routing) live in `aitelier.secrets.toml`
 under `[litellm] api_key`. Optional `[service] api_key` enables hosted-mode

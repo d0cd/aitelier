@@ -129,6 +129,31 @@ def test_error_result_includes_sanitized_acp_error_data():
     assert "Bearer [redacted]" in result["error_msg"]
 
 
+@pytest.mark.parametrize("data", [
+    {"message": "refresh token was revoked: sk-ant-oat01-FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"},
+    {"refresh_token": "rfr_FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc", "reason": "revoked"},
+    {"nested": {"authorization": "Bearer FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"}},
+    {"message": "failed URL https://example.test?api_key=FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"},
+])
+def test_error_result_aggressively_scrubs_all_acp_error_data(data):
+    """ACP error data is an upstream trust boundary, including serialized
+    nested values and bare high-entropy tokens without a credential label."""
+    from aitelier.providers.sandbox_agent import _error_result
+
+    marker_fragments = (
+        "sk-ant-oat01-FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+        "rfr_FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+        "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc",
+    )
+    result = _error_result(
+        "claude", "r1", AcpError(-32603, "Internal error", data), 1.0,
+    )
+
+    assert "Internal error" in result["error_msg"]
+    assert "revoked" in result["error_msg"] or "[redacted]" in result["error_msg"]
+    assert all(fragment not in result["error_msg"] for fragment in marker_fragments)
+
+
 @pytest.mark.asyncio
 async def test_notify_accepts_202():
     fake_http = MagicMock()
@@ -475,6 +500,63 @@ def test_aggregate_result_handles_unparseable_json():
     assert result["parsed"] is None
     assert result["status"] == "error"
     assert result["error_type"] == "SchemaViolation"
+
+
+def test_aggregate_result_rejects_unparseable_json_object():
+    result = _aggregate_result(
+        agent="claude-code", run_id="r1",
+        turn_result={"stopReason": "completed", "content": "not json"},
+        elapsed=0.2,
+        response_format={"type": "json_object"},
+    )
+    assert result["parsed"] is None
+    assert result["status"] == "error"
+    assert result["finish_reason"] == "error"
+    assert result["error_type"] == "SchemaViolation"
+
+
+def test_aggregate_result_rejects_non_object_json_object():
+    result = _aggregate_result(
+        agent="claude-code", run_id="r1",
+        turn_result={"stopReason": "completed", "content": "[1, 2, 3]"},
+        elapsed=0.2,
+        response_format={"type": "json_object"},
+    )
+    assert result["parsed"] == [1, 2, 3]
+    assert result["status"] == "error"
+    assert result["error_type"] == "SchemaViolation"
+
+
+@pytest.mark.asyncio
+async def test_build_done_event_promotes_schema_violation_to_error_event():
+    import time
+    from types import SimpleNamespace
+
+    from aitelier.providers.sandbox_agent import _build_done_event
+
+    emitted: list[tuple[str, dict]] = []
+
+    class Emitter:
+        async def emit(self, kind, payload=None):
+            emitted.append((kind, payload or {}))
+
+    event = await _build_done_event(
+        client=SimpleNamespace(agent="codex"),
+        run_id="r1", start=time.monotonic(),
+        turn_result={"stopReason": "completed", "content": "not json"},
+        response_format={"type": "json_object"},
+        text_chunks=[], tool_calls=[], emitter=Emitter(), agent_model="gpt-5.4",
+    )
+
+    assert event["type"] == "error"
+    assert event["status"] == "error"
+    assert event["error_type"] == "SchemaViolation"
+    assert emitted == [("error", {
+        "finish_reason": "error",
+        "error_type": "SchemaViolation",
+        "error_msg": event["error_msg"],
+        "tool_call_count": 0,
+    })]
 
 
 def test_aggregate_result_parses_fenced_or_prose_prefixed_json():

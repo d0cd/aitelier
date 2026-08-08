@@ -492,15 +492,19 @@ def _stream_error_payload(
     dict for storage. Errors are NOT recorded for idempotency replay —
     a retrying consumer should get a fresh attempt at success."""
     err_type = event.get("error_type") or "ProviderError"
-    final = {
-        "kind": "agent", "provider": agent_backend,
-        "status": "error",
-        "error_type": err_type,
-        "error_msg": event.get("error_msg") or "stream error",
-        "finish_reason": (
-            "cancelled" if err_type == "Cancelled" else "error"
-        ),
-    }
+    # A provider may discover a terminal error only after aggregating the
+    # complete answer (notably structured-output conformance). Preserve that
+    # full terminal aggregate for durable diagnosis instead of replacing it
+    # with the minimal transport-error shape.
+    final = {k: v for k, v in event.items() if k != "type"}
+    final.setdefault("kind", "agent")
+    final.setdefault("provider", agent_backend)
+    final["status"] = "error"
+    final["error_type"] = err_type
+    final["error_msg"] = event.get("error_msg") or "stream error"
+    final["finish_reason"] = (
+        "cancelled" if err_type == "Cancelled" else "error"
+    )
     frame = {
         "error": {"type": err_type, "message": event.get("error_msg")},
         "aitelier_run_id": run_id,

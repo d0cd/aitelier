@@ -2426,6 +2426,44 @@ def test_chat_completions_agent_stream_error_event_on_failure(client):
     assert "agent crashed" in body
 
 
+def test_chat_completions_agent_stream_schema_failure_is_not_success(client):
+    """A terminal structured-output failure is an SSE error and a failed
+    durable run, never a synthetic finish_reason=stop success chunk."""
+    async def fake_stream(name, prompt, **kwargs):
+        yield {
+            "type": "error", "kind": "agent", "provider": name,
+            "status": "error", "duration_s": 0.2,
+            "content": '{"answer": "wrong"}',
+            "parsed": {"answer": "wrong"},
+            "usage": {"input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+            "finish_reason": "error", "tool_calls": [],
+            "cost_usd": None, "error_type": "SchemaViolation",
+            "error_msg": "Structured output conformance failed",
+        }
+
+    with patch(
+        "aitelier.providers.sandbox_agent.call_via_sandbox_stream", fake_stream,
+    ):
+        resp = client.post("/v1/chat/completions", json={
+            "model": "agent:claude-code/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "return JSON"}],
+            "stream": True,
+            "response_format": {"type": "json_object"},
+        })
+
+    assert resp.status_code == 200
+    assert "SchemaViolation" in resp.text
+    assert '"finish_reason": "stop"' not in resp.text
+    assert '"finish_reason":"stop"' not in resp.text
+    assert "data: [DONE]" in resp.text
+
+    run = _runs_from_store()[-1]
+    assert run.state == "failed"
+    assert run.result["error_type"] == "SchemaViolation"
+    assert run.result["content"] == '{"answer": "wrong"}'
+    assert run.result["parsed"] == {"answer": "wrong"}
+
+
 def test_chat_completions_agent_stream_emits_keepalive_during_silence(
     client, monkeypatch,
 ):

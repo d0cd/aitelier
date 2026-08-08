@@ -14,6 +14,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SANDBOX_AGENT_PID_FILE="$REPO_ROOT/runs/.sandbox-agent.pid"
 AITELIER_PID_FILE="$REPO_ROOT/runs/.aitelier.pid"
 SESSION_TOML="$REPO_ROOT/runs/.session.toml"
+CLAUDE_SETUP_TOKEN_FILE="$REPO_ROOT/runs/.claude-oauth-token"
+CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE="$REPO_ROOT/runs/.claude-oauth-token.sha256"
+SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE="$REPO_ROOT/runs/.sandbox-agent-claude-token.sha256"
 MODE="${1:-full}"
 
 # shellcheck source=lib.sh
@@ -99,6 +102,9 @@ if [ "$MODE" = "full" ] || [ "$MODE" = "infra" ]; then
         rm -f "$SESSION_TOML"
         echo "  ✓ removed runs/.session.toml"
     fi
+    rm -f "$CLAUDE_SETUP_TOKEN_FILE" \
+          "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE" \
+          "$SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE"
 fi
 
 echo "Done."

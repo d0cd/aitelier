@@ -21,11 +21,14 @@ RUN apk add --no-cache curl bash ca-certificates nodejs npm git \
  && curl -fsSL "https://releases.rivet.dev/sandbox-agent/${SA_CHANNEL}/install.sh" | bash \
  && sandbox-agent --version
 
-# Credentials get mounted in by docker-compose, not baked in. SA reads
-# ~/.claude/.credentials.json and ~/.codex/auth.json at agent dispatch.
+# Credentials get mounted in by docker-compose, not baked in. The entrypoint
+# exports the read-only Claude setup-token secret for only this process tree;
+# legacy ~/.claude and ~/.codex mounts remain available as fallbacks.
 ENV HOME=/root \
     SANDBOX_AGENT_ACP_REQUEST_TIMEOUT_MS=3660000
 WORKDIR /workspaces
+
+COPY --chmod=755 sandbox-agent-entrypoint.sh /usr/local/bin/aitelier-sa-entrypoint
 
 EXPOSE 2468
 
@@ -34,4 +37,5 @@ EXPOSE 2468
 # Bind 0.0.0.0 so the docker bridge can route aitelier↔SA. `--no-token`
 # is fine inside the container — the only consumer is aitelier on the
 # same compose network. Add SANDBOX_TOKEN if you expose SA off-network.
+ENTRYPOINT ["/usr/local/bin/aitelier-sa-entrypoint"]
 CMD ["sandbox-agent", "server", "--host", "0.0.0.0", "--port", "2468", "--no-token"]

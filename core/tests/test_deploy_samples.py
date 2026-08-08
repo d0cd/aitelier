@@ -30,10 +30,12 @@ _SA_DOCKERFILE = _REPO_ROOT / "docker" / "sandbox-agent.Dockerfile"
 _SA_BRIG_DOCKERFILE = _REPO_ROOT / "docker" / "sandbox-agent.brig.Dockerfile"
 _AITELIER_DOCKERFILE = _REPO_ROOT / "docker" / "Dockerfile"
 _COMPOSE_YAML = _REPO_ROOT / "docker" / "docker-compose.yml"
+_DOCKER_SA_ENTRYPOINT = _REPO_ROOT / "docker" / "sandbox-agent-entrypoint.sh"
 _START_SH = _REPO_ROOT / "scripts" / "start.sh"
 _CELL_ENTRYPOINT = _REPO_ROOT / "scripts" / "cell-entrypoint.sh"
 _DOCTOR_SH = _REPO_ROOT / "scripts" / "doctor.sh"
 _CONFIG_PY = _REPO_ROOT / "core" / "src" / "aitelier" / "config.py"
+_INTEGRATION_DOC = _REPO_ROOT / "docs" / "INTEGRATION.md"
 
 
 # --- brig cell yaml ---------------------------------------------------------
@@ -146,6 +148,22 @@ def test_brig_cell_ingress_exposes_sa_port():
     assert any(
         (i.get("port") == 2468) for i in ingress
     ), f"ingress doesn't forward SA's :2468: {ingress}"
+
+
+def test_integration_guide_matches_sa_only_brig_topology():
+    text = _INTEGRATION_DOC.read_text()
+    assert "Aitelier remains outside the SA cell" in text
+    assert "ingress.port == 2468" in text
+    assert "aitelier + SA both run inside one cell" not in text
+    assert "ingress.port == 7777" not in text
+
+
+def test_integration_guide_uses_live_inner_model_contract():
+    text = _INTEGRATION_DOC.read_text()
+    assert "aitelier_inner_llms` is authoritative" in text
+    assert "advertised model config option" in text
+    assert "`session/set_model` only when an older adapter" in text
+    assert "gpt-5.3-codex-spark" not in text
 
 
 def test_brig_cell_image_is_sa_dedicated():
@@ -317,6 +335,27 @@ def test_compose_sa_profile_is_off_by_default():
     data = yaml.safe_load(_COMPOSE_YAML.read_text())
     sa = data["services"]["sandbox-agent"]
     assert sa.get("profiles"), "sandbox-agent has no profiles — would auto-start"
+
+
+def test_host_and_docker_sa_receive_claude_setup_token_without_image_copy():
+    """The one documented setup token must reach every local SA mode through
+    a process/secret boundary, never through a Docker image layer."""
+    compose = yaml.safe_load(_COMPOSE_YAML.read_text())
+    sa = compose["services"]["sandbox-agent"]
+    secret_names = [
+        item if isinstance(item, str) else item.get("source")
+        for item in (sa.get("secrets") or [])
+    ]
+
+    assert "claude-oauth-token" in secret_names
+    assert compose["secrets"]["claude-oauth-token"]["file"].endswith(
+        "runs/.claude-oauth-token"
+    )
+    entrypoint = _DOCKER_SA_ENTRYPOINT.read_text()
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in entrypoint
+    assert "/run/secrets/claude-oauth-token" in entrypoint
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in _START_SH.read_text()
+    assert "COPY claude-oauth-token" not in _SA_DOCKERFILE.read_text()
 
 
 def test_doctor_terminal_probe_reports_http_error_body():

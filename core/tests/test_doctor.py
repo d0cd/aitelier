@@ -96,6 +96,8 @@ def test_doctor_and_start_prefer_long_lived_claude_setup_token():
 
     assert "setup-brig" in doctor
     assert "long-lived setup token found" in start
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in start
+    assert "CLAUDE_SETUP_TOKEN_FILE" in start
 
 
 def test_aitelier_doctor_subcommand_locates_script():

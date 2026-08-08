@@ -18,6 +18,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ENV_FILE="$REPO_ROOT/docker/.env"
+CLAUDE_SETUP_TOKEN_FILE="$REPO_ROOT/runs/.claude-oauth-token"
+CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE="$REPO_ROOT/runs/.claude-oauth-token.sha256"
+SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE="$REPO_ROOT/runs/.sandbox-agent-claude-token.sha256"
 SANDBOX_AGENT_PID_FILE="$REPO_ROOT/runs/.sandbox-agent.pid"
 SANDBOX_AGENT_LOG="$REPO_ROOT/runs/.sandbox-agent.log"
 AITELIER_LOG_DIR="$REPO_ROOT/runs/logs"
@@ -246,11 +249,13 @@ fi
 # Use `uv run python` (not bare `python3`) so this works on a uv-managed
 # machine that has no system python3 — same interpreter the mode detection
 # above uses.
-uv run python - "$ENV_FILE" <<'PYEOF'
-import json, os, sys, time
+uv run python - "$ENV_FILE" "$CLAUDE_SETUP_TOKEN_FILE" "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE" <<'PYEOF'
+import hashlib, json, os, sys, time
 from pathlib import Path
 
 env_file = sys.argv[1]
+setup_token_file = sys.argv[2]
+setup_token_fingerprint_file = sys.argv[3]
 anthropic_key = ""
 openai_key = ""
 
@@ -324,6 +329,10 @@ else:
 lines = [
     f"ANTHROPIC_API_KEY={anthropic_key}",
     f"OPENAI_API_KEY={openai_key}",
+    "CLAUDE_SETUP_TOKEN_FINGERPRINT=" + (
+        hashlib.sha256(setup_token.encode()).hexdigest()
+        if setup_token.startswith("sk-ant-oat") else "none"
+    ),
     "LITELLM_MASTER_KEY=sk-litellm-local",
 ]
 
@@ -338,6 +347,20 @@ else:
 Path(env_file).write_text("\n".join(lines) + "\n")
 # Restrict permissions — tokens are sensitive
 Path(env_file).chmod(0o600)
+
+# Host and Docker Sandbox Agent modes consume the same setup token through a
+# runtime-only file. Docker mounts it read-only as a Compose secret; host mode
+# reads it once into only the SA process environment. Always create the file so
+# the optional Compose profile remains valid when no setup token is configured.
+runtime_setup_token = setup_token if setup_token.startswith("sk-ant-oat") else ""
+Path(setup_token_file).write_text(runtime_setup_token + ("\n" if runtime_setup_token else ""))
+Path(setup_token_file).chmod(0o600)
+fingerprint = (
+    hashlib.sha256(runtime_setup_token.encode()).hexdigest()
+    if runtime_setup_token else "none"
+)
+Path(setup_token_fingerprint_file).write_text(fingerprint + "\n")
+Path(setup_token_fingerprint_file).chmod(0o600)
 
 # Capability summary — make degraded model families obvious at a glance.
 print("")
@@ -577,16 +600,60 @@ EOF
         echo "  ✓ Installed: $(command -v sandbox-agent)"
     fi
 
+    _expected_claude_fingerprint="$(cat "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE")"
+    _applied_claude_fingerprint="$(cat "$SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE" 2>/dev/null || echo unknown)"
+    _host_sa_reachable=0
     if curl -sf "http://localhost:${SANDBOX_AGENT_PORT}/v1/agents" >/dev/null 2>&1; then
+        _host_sa_reachable=1
+    fi
+
+    # A setup-token rotation must reach an already-running host SA. Restart
+    # only a process owned by this start script; never kill an unrelated
+    # listener merely because its credential state is unknowable.
+    if [ "$_host_sa_reachable" = 1 ] \
+       && [ "$_expected_claude_fingerprint" != "$_applied_claude_fingerprint" ]; then
+        _host_sa_pid="$(cat "$SANDBOX_AGENT_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$_host_sa_pid" ] && kill -0 "$_host_sa_pid" 2>/dev/null; then
+            echo "  Claude credential changed; restarting host Sandbox Agent"
+            kill "$_host_sa_pid"
+            for _ in $(seq 1 50); do
+                kill -0 "$_host_sa_pid" 2>/dev/null || break
+                sleep 0.1
+            done
+            if kill -0 "$_host_sa_pid" 2>/dev/null; then
+                echo "  ✗ host Sandbox Agent did not stop after credential change"
+                exit 1
+            fi
+            rm -f "$SANDBOX_AGENT_PID_FILE"
+            _host_sa_reachable=0
+        else
+            echo "  ! reachable Sandbox Agent was not started by aitelier; its Claude credential cannot be verified"
+            echo "    Stop it and rerun make start to apply the configured setup token."
+        fi
+    fi
+
+    if [ "$_host_sa_reachable" = 1 ]; then
         echo "  ✓ sandbox-agent already running on :${SANDBOX_AGENT_PORT}"
     else
         # Spawn detached, log to file, store PID for stop.sh
-        nohup sandbox-agent server \
-            --host 127.0.0.1 \
-            --port "${SANDBOX_AGENT_PORT}" \
-            --no-token \
-            > "$SANDBOX_AGENT_LOG" 2>&1 &
+        if [ -s "$CLAUDE_SETUP_TOKEN_FILE" ]; then
+            CLAUDE_CODE_OAUTH_TOKEN="$(cat "$CLAUDE_SETUP_TOKEN_FILE")" \
+                nohup sandbox-agent server \
+                --host 127.0.0.1 \
+                --port "${SANDBOX_AGENT_PORT}" \
+                --no-token \
+                > "$SANDBOX_AGENT_LOG" 2>&1 &
+        else
+            nohup sandbox-agent server \
+                --host 127.0.0.1 \
+                --port "${SANDBOX_AGENT_PORT}" \
+                --no-token \
+                > "$SANDBOX_AGENT_LOG" 2>&1 &
+        fi
         echo $! > "$SANDBOX_AGENT_PID_FILE"
+        cp "$CLAUDE_SETUP_TOKEN_FINGERPRINT_FILE" \
+           "$SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE"
+        chmod 600 "$SANDBOX_AGENT_TOKEN_FINGERPRINT_FILE"
         echo "  Started (PID $(cat "$SANDBOX_AGENT_PID_FILE")) on :${SANDBOX_AGENT_PORT}"
         echo "  Logs: $SANDBOX_AGENT_LOG"
 
