@@ -1,223 +1,220 @@
-# Trellis code-review integration feedback
+# Active Trellis code-review feedback for Aitelier
 
 Date: 2026-08-07
 
-This feedback comes from repeated local Trellis code-review workflows using Aitelier's
-durable agent control plane. The workflow used `agent:codex/gpt-5.5`, Codex CLI 0.132.0,
-Sandbox Agent 0.4.2 in host mode, read-only approval, async `POST /v1/runs`, repeated
-`POST /v1/runs/{id}/wait`, and trace tag `trellis.code-review/v1`.
+Verified against Aitelier `9ed53231842636285c24ad33401efcb6e33a233a`
 
-The integration's core shape worked well: one acknowledged native run ID survived client
-wait reconnects, Postgres retained full run/event history, parallel runs remained separately
-addressable, and the records were still queryable through another Aitelier service after the
-submitting service stopped. Trellis now handles its own deterministic scope admission and
-awaits all started parallel branches. The remaining items below are Aitelier/Sandbox Agent
-concerns rather than requests for Aitelier to own application workflow control flow.
+This is an active backlog, not a history of earlier findings. Resolved items were removed.
+The remaining entries were independently checked against current code after two retained
+Trellis persistent-lead reviews:
 
-## P0: credential inspection reveals the Claude OAuth token by default
+- `755ebd4b-7bfa-4692-a5fa-4df063de28ed` reviewed the main hardening commit
+  (27 files, 1,194 changed lines).
+- `d509c4f9-739b-407f-a297-7ae72486af3d` reviewed its follow-ups
+  (15 files, 393 changed lines).
 
-While diagnosing the Claude backend, this command printed the raw OAuth token even though no
-explicit reveal option was supplied:
+Both current Brig terminal handshakes pass: Claude Code `2.1.144` through adapter `0.36.1`,
+and Codex CLI `0.137.0` through `codex-acp` `0.16.0`. The active runtime defects below do
+not mean that those basic terminal turns are unavailable.
 
-```sh
-sandbox-agent credentials extract --agent claude
-```
+## P0 — ACP error detail can disclose an unlabelled credential
 
-The token value is intentionally not reproduced here. This is a secret-disclosure defect in
-Sandbox Agent's credential CLI, not a Trellis workflow issue. The exposed credential must be
-rotated.
+### Problem
 
-Acceptance criteria:
+`_acp_exception_text` appends `AcpError.data` to the consumer-visible error message. The
+three caller paths apply `scrub_error_text`, whose intentionally conservative contract only
+redacts named credentials and recognizable headers/query parameters. It does not redact a
+bare setup token, refresh token, or other high-entropy credential included in free-form ACP
+error data.
 
-- Default credential inspection returns only source, authentication type, and a redacted
-  fingerprint or status.
-- Secret material is emitted only behind a clearly named, explicit reveal option.
-- Regression tests cover every supported agent credential, and neither normal logs nor error
-  messages contain the secret.
+That message can be persisted in the run row and returned through API errors, webhooks, and
+the terminal doctor probe. Preserving the backend diagnosis is useful, but JSON-RPC error
+data is an upstream trust boundary and needs the stronger treatment used for upstream
+provider bodies.
 
-Implementation update: the local Sandbox Agent worktree now makes every default
-`credentials extract` path metadata-only, including the previously unsafe
-`--agent` and `--provider` branches. Raw selected values require `--reveal`, and
-regression tests assert that default summaries contain no secret material.
+### Verification
 
-## Aitelier implementation status
+A fake marker shaped as `sk-ant-oat01-...` was placed in `AcpError.data.message` and passed
+through `_error_result`. The complete marker survived in `error_msg`. The existing regression
+only covers `Authorization: Bearer ...`, so it does not exercise this path.
 
-The Aitelier-owned follow-up is now implemented in this worktree:
+### Required change
 
-- Async acceptance commits the pending run before returning its id.
-- Cancellation settles the owned ACP prompt task, closes the session, and deletes the
-  Sandbox Agent proxy; deployment defaults also keep SA's internal ACP timeout from
-  preempting Aitelier's deadline.
-- Terminal aggregates count `tool_call`, not matching `tool_result`, events.
-- Durable structured results use an ambiguity-rejecting parser and validate requested JSON
-  Schema, finalizing nonconformance as `SchemaViolation`.
-- `GET /v1/models?agent_backend=<id>` probes only the selected backend.
-- Agent discovery records both the native agent and ACP adapter versions; the
-  Brig Codex pairing is updated to CLI `0.137.0` plus `codex-acp` `0.16.0`.
-- Model selection follows the backend-advertised config option; legacy
-  `session/set_model` is used only for adapters that do not advertise one.
-- A timeout after answer text was emitted retains that text and records
-  `MissingTerminalEvent`, separating a terminal-protocol failure from ordinary
-  no-output latency.
-- ACP JSON-RPC error data is scrubbed and preserved in API failures, and the
-  terminal doctor probe prints that sanitized response instead of reducing all
-  HTTP failures to a status line.
-- ACP-reported token and reasoning usage is normalized into durable/OpenAI
-  usage fields. A local `codex-acp` change now forwards Codex core's exact
-  cumulative counters through ACP `PromptResponse.usage`; the local Brig build
-  workflow deploys that worktree directly, without requiring a registry release.
+- Apply structured redaction and the high-recall token/entropy scrubber to ACP error data
+  before it is concatenated, persisted, logged, or returned.
+- Retain useful non-secret text such as “refresh token was revoked.”
+- Do not create a second independent secret-pattern implementation; use the existing error
+  scrubbing boundary or factor one shared upstream-detail helper.
 
-The hard work-budget/synthesis contract and any missing reasoning-option facts
-remain backend/bridge capabilities. Until a backend implements the former,
-`/v1/models` explicitly reports `aitelier_capabilities.hardToolBudget: false`.
-Aitelier maps verifiable signals when Sandbox Agent/the selected ACP adapter
-exposes them; it does not estimate token spend or claim a hard limit from
-prompt-only tool guidance.
+### Acceptance criteria
 
-## P0: enforceable agent work budget with a synthesis reserve
+- Tests cover a bare `sk-*`/`sk-ant-oat*` marker, named refresh-token fields, nested/serialized
+  error data, authorization headers, and query-string credentials.
+- No tested secret appears in `error_msg`, stored run data, webhook payloads, doctor output,
+  or ordinary logs.
+- The non-secret backend diagnosis remains visible.
 
-Prompt-only tool limits are not reliable. The specialists were explicitly instructed to use
-at most ten tool invocations, but Aitelier retained more:
+## P1 — Streaming structured-output failure is emitted as success
 
-- `69495a3907fa5efc161ae7449440b647`: 15 `tool_call` events, then timeout at 360,097 ms.
-- `4ea6621848a9b6355d12ebd33bb133f6`: 14 `tool_call` events, then timeout at 360,101 ms.
-- `d5ea2e8c70ae018f86ec10b1af6390b1`: 17 `tool_call` events, success at 118,043 ms.
-- `4a70c5ebed864cadb2d9f1926f17ceb7`: 15 `tool_call` events, success at 121,609 ms.
+### Problem
 
-The timed-out pair reviewed an application-preflighted scope of six files and 547 changed
-lines. The successful pair reviewed one file and nine changed lines. A raw wall-clock timeout
-can discard a nearly complete review and gives consumers no way to reserve time for the final
-structured response.
-
-Suggested contract:
-
-- Add an advertised agent capability and request field such as `max_tool_calls` or a more
-  general work budget that Sandbox Agent/ACP can actually enforce.
-- On budget exhaustion, deny further tool work and give the agent one bounded synthesis turn.
-- Distinguish `budget_exhausted` with a final result from `timeout` with no result.
-- Retain the configured limit, observed count, and exhaustion reason in the run record.
-
-Acceptance criteria:
-
-- An agent requested with a ten-call limit never produces an eleventh `tool_call` event.
-- It gets a bounded opportunity to return its requested schema after the tenth result.
-- `/v1/models` advertises whether the selected agent backend supports the hard limit.
-
-## P0: timeout/cancellation leaves unobserved ACP task failures
-
-When the two specialist runs above timed out together, the Aitelier service logged two
-unhandled task failures:
+Structured-output validation can change a terminal aggregate to:
 
 ```text
-asyncio: Task exception was never retrieved
-... AcpClient.call() ... exception=ReadError('')
+status=error, finish_reason=error, error_type=SchemaViolation
 ```
 
-Both stacks ended in `httpx.ReadError` from `providers/acp_transport.py`. The durable run rows
-correctly reached `Timeout`, but pending ACP tasks were not consumed cleanly.
+`_build_done_event` still labels that aggregate as `type: done`. The SSE dispatcher sends
+every `done` event through `_stream_chunk_for_done`, which hard-codes the wire
+`finish_reason` to `stop`. The durable run therefore fails correctly while the streaming
+client receives a successful terminal chunk followed by `[DONE]`.
 
-Acceptance criteria:
+This violates the rule that wire outcome and durable outcome describe the same terminal
+result.
 
-- Timeout and cancellation cancel/await every owned ACP task and close the session best-effort.
-- Expected transport fallout from cancellation does not produce an unhandled asyncio error.
-- The durable terminal run state remains the authoritative outcome even if cleanup fails.
+### Verification
 
-## P1: `tool_call_count` counts tool results as calls
+A focused reproduction passed a `done` event with `status=error` and
+`error_type=SchemaViolation` to `_stream_chunk_for_done`. It produced:
 
-The aggregate field does not match the documented meaning "inner-agent tools that fired":
+```text
+wire finish_reason=stop
+durable status=error
+durable error_type=SchemaViolation
+```
 
-- `d5ea2e8c70ae018f86ec10b1af6390b1` reports `tool_call_count: 34`, while its event stream has
-  17 `tool_call` and 17 `tool_result` events.
-- `4a70c5ebed864cadb2d9f1926f17ceb7` reports `tool_call_count: 30`, while its event stream has
-  15 `tool_call` and 15 `tool_result` events.
+The event dispatcher has no branch that corrects this mismatch.
 
-Count calls, not both sides of the call/result pair. Add a regression test that compares the
-terminal aggregate with `run_events WHERE kind = 'tool_call'`.
+### Required change
 
-## P1: durable agent runs do not apply documented structured-output parsing
+Route an error-status terminal aggregate through the existing streaming error path, or emit
+an `error` event from the provider boundary when structured-output conformance fails. Do not
+send a success terminal chunk for the same result.
 
-Run `d50bf03c9765a30c6951d6175cb438f7` completed successfully with status prose followed by
-one valid JSON object. Its durable result retained `parsed: null`. The integration docs say
-that fenced or prose-prefixed JSON is parsed into `aitelier_parsed`; the async durable agent
-path should provide equivalent behavior.
+### Acceptance criteria
 
-Suggested behavior:
+- A streaming `json_schema` or `json_object` conformance failure emits a typed
+  `SchemaViolation` error frame and no `finish_reason: stop` success chunk.
+- The run finalizes once as `failed`, with its raw content and recoverable parsed value
+  retained for diagnosis.
+- Successful `done` events retain the current OpenAI-compatible terminal shape and usage
+  projection.
+- Regression tests cover both the SSE body and the durable run state.
 
-- Apply the same unique structured-value parser to terminal async agent results.
-- Populate `result.parsed` when exactly one value is recoverable.
-- If `json_schema` was requested, validate the parsed value and record a typed conformance
-  failure rather than returning provider success with nonconforming output.
-- Reject ambiguity; never choose between multiple JSON objects.
+## P1 — Claude setup-token behavior is inconsistent in host and Docker modes
 
-## P1: agent compatibility and terminal-turn probing
+### Problem
 
-Codex CLI 0.146.1 emitted useful output through the host ACP path but never produced the
-terminal event Aitelier needed. Run `c4358230830baff1735aa7a73edae716` was manually cancelled
-after 398,999 ms. Pinning Codex CLI 0.132.0 restored terminal completion, but consumers should
-not need trial-and-error version pinning.
+The quick-start contract says Claude agent and direct-model routes reuse the long-lived
+`claude-oauth-token`. `scripts/start.sh` reads that Brig secret and writes it to
+`docker/.env` as `ANTHROPIC_API_KEY`, which enables the direct LiteLLM route.
 
-Suggested improvements:
+When Sandbox Agent runs in host mode, a token loaded from the Brig secret is not exported as
+`CLAUDE_CODE_OAUTH_TOKEN` to the launched process. In Docker mode, the SA service mounts
+legacy `~/.claude` credentials but receives neither that variable nor a setup-token secret.
+Consequently direct Claude calls can work while `agent:claude/...` still depends on a
+different or stale login.
 
-- Publish or probe a supported Codex/Sandbox Agent compatibility matrix.
-- Make `doctor` perform a cheap terminal-turn handshake, not only process/capability discovery.
-- If an agent emits final content but never terminates, retain a diagnostic that distinguishes
-  missing terminal protocol from ordinary model latency.
+The active Brig deployment is not affected: its cell already mounts `claude-oauth-token`,
+and its live Claude terminal handshake passes.
 
-The same class of readiness failure was reproduced with Claude. Discovery advertised
-`agent:claude`, several models, reasoning levels, and approval modes, and session creation
-succeeded, but every actual prompt failed in about 2.2–2.6 seconds before a tool call with a
-long-context usage-credit error. This included a one-turn Haiku probe with no tools and no JSON
-Schema (`7777f7efa8ef918b07410803d2c6cdec`). Direct Claude CLI 2.1.221 worked with the same
-logged-in account. The managed route used `@agentclientprotocol/claude-agent-acp` 0.33.1 with
-Claude Agent SDK/Claude Code 2.1.132, while Aitelier's integration source expects at least 0.36.
+### Verification
 
-Backend discovery should therefore distinguish syntactic availability from execution readiness.
-For the selected agent, `doctor` or a strict readiness probe should perform a cheap terminal turn,
-report the adapter and embedded agent versions, and explain known incompatibilities. Process
-startup, capability advertisement, and `session/new` alone must not be reported as a usable
-backend.
+- The credential materialization block scopes `setup_token` inside Python and only writes
+  `ANTHROPIC_API_KEY` to `docker/.env`.
+- The host `sandbox-agent server` launch has no setup-token environment assignment.
+- The Docker Compose SA service has no Claude setup-token environment/secret mapping.
 
-## P1: usage and reasoning capability gaps
+### Required change
 
-Every successful Codex agent run in these trials returned `usage: null`, including all four
-stages of Trellis Run `74d45a05-0c44-47e8-a22b-c49d33cc6512`. The backend also advertised no
-reasoning levels, forcing consumers to omit `reasoning_effort` and record `backend-default`.
+Choose and implement one truthful cross-mode contract. The preferred shape is to materialize
+the setup token once and pass it to Sandbox Agent through a mode-appropriate secret boundary:
 
-`null` is preferable to invented usage, and Trellis correctly diagnoses missing coverage.
-If Codex ACP exposes actual input/output/inner token facts, Aitelier should map them. Context
-window `used` samples must not be relabeled as spend. Reasoning levels should be advertised
-only when the backend can prove it applies them.
+- host: `CLAUDE_CODE_OAUTH_TOKEN` scoped to the SA process;
+- Docker: a read-only secret/file consumed by the container entrypoint;
+- Brig: the existing `claude-oauth-token` secret mount.
 
-Implementation update: Codex core `0.137.0` already emits exact input, cached-input,
-output, reasoning-output, and total counters. The local `codex-acp` worktree now
-maps those counters to ACP's native `PromptResponse.usage`, and Aitelier preserves
-them (including OpenAI `completion_tokens_details.reasoning_tokens`). This is not
-an extrapolation from context-window occupancy. The deployed adapter must include
-that bridge change; `make brig-local` supplies it directly from the local worktree.
+If host or Docker intentionally continue to use their own Claude CLI login instead, narrow
+the quick-start and doctor claims and report the two credential domains separately.
 
-## P2: model discovery latency is dominated by unrelated backends
+### Acceptance criteria
 
-`GET /v1/models` took 10,084 ms in the latest run because an unavailable Cursor probe reached
-its timeout, even though Codex was healthy. Deployment checks for a selected backend should not
-regularly pay the slowest unrelated probe cost.
+- With only the documented setup token configured, direct Claude and `agent:claude/...`
+  terminal probes pass in each advertised local deployment mode.
+- No setup token is printed, copied into an image layer, or exposed in generated diagnostics.
+- Mode-specific tests or probes fail clearly when the credential required by that mode is
+  absent or stale.
 
-Possible shapes:
+## P2 — Inner-model discovery documentation contradicts the implementation
 
-- Add a backend-filtered discovery/probe endpoint.
-- Cache per-backend probe results independently and longer than the whole response cache.
-- Return known capability state plus per-backend staleness/errors without blocking on every
-  configured backend.
+### Problem
 
-## Reproduction and retained evidence
+`docs/INTEGRATION.md` first describes `aitelier_inner_llms` as the authoritative backend
+model list, then says it is not authoritative. Its backend table also says Codex and other
+non-Claude agents use `session/set_model`, while current code applies the backend-advertised
+model configuration option and uses `session/set_model` only as a legacy fallback.
 
-- Successful revised workflow correlation: Trellis Run
-  `74d45a05-0c44-47e8-a22b-c49d33cc6512`.
-- Timed-out revised workflow correlation: Trellis Run
-  `42d8faf1-352a-4513-8b68-f824f4098cca`.
-- Aitelier trace tag: `trellis.code-review/v1`.
-- Full evidence is available through `/v1/runs/{id}` and `/v1/runs/{id}/events` in the shared
-  development Postgres store.
+### Required change
 
-The Trellis-side fixes are in commit `3e38055`: deterministic preflight rejects oversized
-subjects before provider work, triage must use the verified file set, and parallel specialist
-failure is propagated only after both already-started branches reach terminal state.
+- State that `aitelier_inner_llms` is authoritative when the live probe provides it; omission
+  means capability state is unavailable, not that a hard-coded list becomes authoritative.
+- Describe advertised model configuration as the normal path and `session/set_model` as the
+  compatibility fallback.
+- Remove obsolete examples or warnings that imply a different routing path.
+
+### Acceptance criteria
+
+- The model-discovery overview, backend table, selection section, and doctor guidance express
+  one consistent contract.
+- Documentation examples match a live `GET /v1/models?agent_backend=codex` response and the
+  tested configuration method.
+
+## P2 — Brig deployment documentation describes the obsolete topology
+
+### Problem
+
+The integration guide recommends running Aitelier and Sandbox Agent in one Brig cell with
+ingress on port 7777. The implemented and tested deployment is different:
+
+- the Brig cell hosts only Sandbox Agent;
+- Aitelier runs outside the cell;
+- cell ingress forwards Sandbox Agent on port 2468; and
+- only agent-runtime credentials belong inside that cell.
+
+Following the obsolete text can expose the wrong service, mount unnecessary Aitelier secrets
+into the agent sandbox, and erase the intended ownership boundary.
+
+### Required change
+
+Rewrite the Brig deployment and deployment-test sections to match
+`docs/deploy/sandbox-agent.cell.yaml`, `scripts/cell-entrypoint.sh`, and the current shape
+tests. The guide should show Aitelier connecting to the cell's authenticated SA ingress,
+not running inside the cell.
+
+### Acceptance criteria
+
+- Every Brig example uses the SA-only cell, ingress port 2468, and external Aitelier service.
+- Secret and workspace mounts are assigned to the component that consumes them.
+- Narrative claims and deployment-shape tests agree on the same topology.
+
+## Verified non-findings
+
+### Immediate cancellation does not strand the acknowledged row
+
+The review claimed that a client could cancel the registered outer task before its coroutine
+started, leaving the precreated row `pending`. That scenario does not follow the public API
+scheduling boundary: the new task is queued before a client can receive the run ID and issue
+the follow-up request. Once the task begins, preparation and provider execution have terminal
+cancellation settlement.
+
+A live submit-immediate-cancel-wait reproduction reached `state=cancelled` in 192 ms with a
+canonical `Cancelled` result (run `d69e085a4f22a0c1f5cfd04ab0c9b8a1`). This finding is
+closed. A focused regression would still be useful protection, but there is no verified
+pending-row defect to fix.
+
+### Hard tool budgeting remains an advertised backend limitation
+
+Aitelier reports `aitelier_capabilities.hardToolBudget: false` because the selected backend
+does not expose an enforceable work budget or synthesis reserve. Prompt guidance is not
+misrepresented as enforcement. Implementing the backend capability remains useful future
+work, but it is not an unaddressed correctness claim in Aitelier.
