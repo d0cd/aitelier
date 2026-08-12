@@ -1563,6 +1563,48 @@ async def test_sse_consumer_auto_approves_permission_requests():
 
 
 @pytest.mark.asyncio
+async def test_permission_decider_exception_denies_permission_request():
+    """A broken configured policy must not turn into permission grant."""
+    fake_http = MagicMock()
+    posts: list[dict] = []
+
+    async def broken_decider(_params):
+        raise RuntimeError("policy unavailable")
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append({"url": url, "envelope": json})
+        response = MagicMock()
+        response.status_code = 202
+        response.raise_for_status = MagicMock()
+        return response
+
+    fake_http.post = AsyncMock(side_effect=fake_post)
+    client = AcpClient(
+        "http://x:2468",
+        "claude",
+        http_client=fake_http,
+        permission_decider=broken_decider,
+    )
+
+    await client._respond_to_agent_request({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "session/request_permission",
+        "params": {
+            "options": [
+                {"optionId": "allow", "kind": "allow_once"},
+                {"optionId": "deny", "kind": "deny"},
+            ],
+        },
+    })
+
+    body = posts[0]["envelope"]
+    assert body["id"] == 43
+    assert body["result"]["outcome"]["outcome"] == "selected"
+    assert body["result"]["outcome"]["optionId"] == "deny"
+
+
+@pytest.mark.asyncio
 async def test_sse_consumer_rejects_unsupported_agent_requests():
     """Anything other than permission_request gets -32601 so the agent
     can fall back instead of hanging."""

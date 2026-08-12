@@ -1,0 +1,28 @@
+{
+  "format": 1,
+  "policyFiles": [
+    "CLAUDE.md",
+    "CONTRIBUTING.md"
+  ],
+  "validationProfiles": {
+    "quick": [
+      {
+        "id": "permission-tests",
+        "argv": ["uv", "run", "--no-sync", "pytest", "core/tests/test_sandbox_agent.py", "-q"],
+        "timeoutSeconds": 600
+      },
+      {
+        "id": "permission-lint",
+        "argv": ["uv", "run", "--no-sync", "ruff", "check", "core/src/aitelier/providers/acp_transport.py", "core/tests/test_sandbox_agent.py"],
+        "timeoutSeconds": 300
+      }
+    ],
+    "permission-policy-regression": [
+      {
+        "id": "permission-decider-fail-closed",
+        "argv": ["uv", "run", "--no-sync", "pytest", "core/tests/test_sandbox_agent.py::test_permission_decider_exception_denies_permission_request", "-q"],
+        "timeoutSeconds": 120
+      }
+    ]
+  }
+}
