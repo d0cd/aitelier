@@ -39,9 +39,9 @@ def _require_database_url() -> str:
 
 
 _SEED = [
-    ("ct-a", "tagX", 100, 0.01),
-    ("ct-b", "tagX", 50, 0.005),
-    ("ct-c", "tagY", 10, 0.001),
+    ("ct-a", "ct-tagX", 100, 0.01),
+    ("ct-b", "ct-tagX", 50, 0.005),
+    ("ct-c", "ct-tagY", 10, 0.001),
 ]
 _SEED_IDS = [rid for rid, *_ in _SEED]
 
@@ -79,12 +79,61 @@ async def test_aggregate_runs_rollup_inmemory():
     await _seed_contract_runs(store)
     agg = await store.aggregate_runs(group_by="trace_tag")
     norm = _norm_agg(agg)
-    assert norm["groups"]["tagX"] == {"count": 2, "total_tokens": 150, "error_count": 0}
-    assert norm["groups"]["tagY"] == {"count": 1, "total_tokens": 10, "error_count": 0}
+    assert norm["groups"]["ct-tagX"] == {"count": 2, "total_tokens": 150, "error_count": 0}
+    assert norm["groups"]["ct-tagY"] == {"count": 1, "total_tokens": 10, "error_count": 0}
     assert norm["total_count"] == 3
     assert norm["total_tokens"] == 160
-    listed = sorted(r.run_id for r in await store.list_runs(RunFilter(trace_tag="tagX")))
+    listed = sorted(r.run_id for r in await store.list_runs(RunFilter(trace_tag="ct-tagX")))
     assert listed == ["ct-a", "ct-b"]
+
+
+async def _seed_contract_scores(store) -> None:
+    """Two runs graded `helpfulness`, one graded `accuracy`; `ct-a` is graded
+    twice under the same name so the run-vs-score counting is observable."""
+    for run_id, name, value in (
+        ("ct-a", "helpfulness", 1.0),
+        ("ct-a", "helpfulness", 0.5),
+        ("ct-b", "helpfulness", 0.6),
+        ("ct-c", "accuracy", 0.8),
+    ):
+        await store.add_run_score(RunScore(
+            run_id=run_id, name=name, value=value, evaluator="grader-v1",
+        ))
+
+
+@pytest.mark.asyncio
+async def test_aggregate_by_score_name_inmemory():
+    """Grouping by score name counts distinct graded runs, averages over every
+    score row, and rolls the graded runs' usage up alongside."""
+    store = InMemoryStore()
+    await _seed_contract_runs(store)
+    await _seed_contract_scores(store)
+
+    agg = await store.aggregate_runs(group_by="score_name")
+    groups = {g["key"]: g for g in agg["groups"]}
+
+    assert groups["helpfulness"]["count"] == 2
+    assert groups["helpfulness"]["total_tokens"] == 150
+    assert groups["helpfulness"]["avg_value"] == pytest.approx(0.7)
+    assert groups["accuracy"]["count"] == 1
+    assert groups["accuracy"]["avg_value"] == pytest.approx(0.8)
+    assert agg["total"]["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_aggregate_by_score_name_ignores_ungraded_runs():
+    """A run with no score contributes to no group and to no total."""
+    store = InMemoryStore()
+    await _seed_contract_runs(store)
+    await store.add_run_score(RunScore(
+        run_id="ct-c", name="accuracy", value=0.8, evaluator="grader-v1",
+    ))
+
+    agg = await store.aggregate_runs(group_by="score_name")
+
+    assert [g["key"] for g in agg["groups"]] == ["accuracy"]
+    assert agg["total"]["count"] == 1
+    assert agg["total"]["total_tokens"] == 10
 
 
 @pytest.mark.asyncio
@@ -99,13 +148,37 @@ async def test_aggregate_and_list_parity_across_stores():
     await pg.connect()
     try:
         await _seed_contract_runs(pg)
-        assert _norm_agg(await mem.aggregate_runs(group_by="trace_tag")) == \
-            _norm_agg(await pg.aggregate_runs(group_by="trace_tag"))
-        mem_x = sorted(r.run_id for r in await mem.list_runs(RunFilter(trace_tag="tagX")))
-        pg_x = sorted(r.run_id for r in await pg.list_runs(RunFilter(trace_tag="tagX")))
+        # Scoped per seeded tag: an unfiltered aggregate rolls up every row in
+        # the target database, so the two stores could only agree on an empty
+        # one. The filtered comparison still exercises both rollup impls.
+        for tag in ("ct-tagX", "ct-tagY"):
+            assert _norm_agg(
+                await mem.aggregate_runs(group_by="trace_tag", trace_tag=tag)
+            ) == _norm_agg(
+                await pg.aggregate_runs(group_by="trace_tag", trace_tag=tag)
+            )
+        mem_x = sorted(r.run_id for r in await mem.list_runs(RunFilter(trace_tag="ct-tagX")))
+        pg_x = sorted(r.run_id for r in await pg.list_runs(RunFilter(trace_tag="ct-tagX")))
         assert mem_x == pg_x == ["ct-a", "ct-b"]
+
+        # score_name has a second SQL shape (join + dedupe) with no attribute
+        # equivalent, so it needs its own parity leg.
+        await _seed_contract_scores(mem)
+        await _seed_contract_scores(pg)
+        for tag in ("ct-tagX", "ct-tagY"):
+            mem_scores = await mem.aggregate_runs(
+                group_by="score_name", trace_tag=tag)
+            pg_scores = await pg.aggregate_runs(
+                group_by="score_name", trace_tag=tag)
+            assert _norm_agg(mem_scores) == _norm_agg(pg_scores)
+            assert (
+                [(g["key"], round(g["avg_value"], 6)) for g in mem_scores["groups"]]
+                == [(g["key"], round(g["avg_value"], 6)) for g in pg_scores["groups"]]
+            )
     finally:
         async with pg._pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM run_scores WHERE run_id = ANY($1)", _SEED_IDS)
             await conn.execute("DELETE FROM runs WHERE run_id = ANY($1)", _SEED_IDS)
         await pg.close()
 

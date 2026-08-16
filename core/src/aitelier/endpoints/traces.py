@@ -60,7 +60,9 @@ async def traces_aggregates_endpoint(
 ) -> dict:
     """Roll up run stats.
 
-    `group_by` ∈ {trace_tag, kind, model, agent_id, status, error_type, day}.
+    `group_by` ∈ {trace_tag, kind, model, agent_id, status, error_type, day,
+    score_name}. `score_name` rolls up only *graded* runs and adds `avg_value`
+    per group — see `AGGREGATE_GROUP_KEYS`.
     """
     from aitelier.server import _parse_iso_param
 

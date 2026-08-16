@@ -23,16 +23,22 @@ def _max_metadata_bytes() -> int:
     return get_config().storage.max_metadata_bytes
 
 RunState = Literal["pending", "running", "completed", "failed", "cancelled", "orphaned"]
+"""Valid states for a run. State machine enforced by `update_run_state`."""
 
 
 # Valid `group_by` values for aggregate_runs. Both PostgresStore (which maps
 # them to SQL expressions) and InMemoryStore (which maps them to attribute
 # lookups) reference this single set so the two impls can't drift.
+#
+# All but `score_name` group the run rows themselves. `score_name` groups the
+# *graded* runs by the names attached via `run_scores`: `count` is the number
+# of distinct runs carrying that name, the usage counters roll up those runs,
+# and `avg_value` averages every score row behind them. Ungraded runs appear
+# in no group and in no total.
 AGGREGATE_GROUP_KEYS = frozenset({
     "trace_tag", "kind", "model", "agent_id",
-    "status", "error_type", "day",
+    "status", "error_type", "day", "score_name",
 })
-"""Valid states for a run. State machine enforced by `update_run_state`."""
 
 RunKind = Literal["complete", "embed", "agent"]
 """Wire-format kinds for the three primitives."""

@@ -155,7 +155,7 @@ async def check_idempotency(
 
     rec = await store.get_idempotent(key)
     if rec is not None:
-        _enforce_body_hash_match(key, rec.body_hash, body_hash)
+        _enforce_same_operation(key, rec, body_hash, endpoint)
         return IdempotencyContext(key, body_hash, endpoint,
                                   cached=rec.response, _lock=None)
 
@@ -166,7 +166,7 @@ async def check_idempotency(
     try:
         rec = await store.get_idempotent(key)
         if rec is not None:
-            _enforce_body_hash_match(key, rec.body_hash, body_hash)
+            _enforce_same_operation(key, rec, body_hash, endpoint)
             _release_idempotency_lock(key, lock)
             return IdempotencyContext(key, body_hash, endpoint,
                                       cached=rec.response, _lock=None)
@@ -180,13 +180,30 @@ async def check_idempotency(
         raise
 
 
-def _enforce_body_hash_match(key: str, stored: str, incoming: str) -> None:
-    if stored != incoming:
+def _enforce_same_operation(
+    key: str, rec, incoming_hash: str, endpoint: str,
+) -> None:
+    """A key identifies one operation. Replaying it against a different one is
+    a consumer bug and must be loud, never a cached response for the wrong work.
+
+    The body hash alone can't decide this: an operation identified partly by its
+    URL (replay, whose body is empty and whose target is a path segment) hashes
+    the same for every target, so the endpoint scope has to be compared too.
+    """
+    if rec.body_hash != incoming_hash:
         raise HTTPException(
             status_code=422,
             detail=(
                 f"Idempotency-Key {key!r} was already used for a different "
                 f"request body. Use a fresh UUID for distinct requests."
+            ),
+        )
+    if rec.endpoint and rec.endpoint != endpoint:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Idempotency-Key {key!r} was already used for {rec.endpoint!r}, "
+                f"not {endpoint!r}. Use a fresh UUID for distinct requests."
             ),
         )
 

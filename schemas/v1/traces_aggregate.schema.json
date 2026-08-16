@@ -9,7 +9,7 @@
   "properties": {
     "group_by": {
       "type": "string",
-      "enum": ["trace_tag", "kind", "model", "agent_id", "status", "error_type", "day"]
+      "enum": ["trace_tag", "kind", "model", "agent_id", "status", "error_type", "day", "score_name"]
     },
     "groups": {
       "type": "array",
@@ -24,10 +24,11 @@
       "required": ["key", "count", "total_tokens", "cost_usd", "error_count"],
       "properties": {
         "key":          { "type": "string", "description": "The group value (e.g. trace_tag name, model id, or YYYY-MM-DD day)." },
-        "count":        { "type": "integer" },
+        "count":        { "type": "integer", "description": "Runs in this group. Under group_by=score_name, distinct *graded* runs." },
         "total_tokens": { "type": "integer" },
         "cost_usd":     { "type": "number" },
-        "error_count":  { "type": "integer" }
+        "error_count":  { "type": "integer" },
+        "avg_value":    { "type": ["number", "null"], "description": "Mean of every score row behind this group. Null or absent for every group_by other than score_name." }
       }
     },
     "Totals": {

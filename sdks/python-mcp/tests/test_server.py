@@ -171,7 +171,7 @@ async def test_tool_catalog_complete(server):
     names = {t.name for t in tools}
     assert names == {
         "submit_run", "get_run", "list_runs", "list_run_events",
-        "cancel_run", "wait_for_run", "get_my_run_id",
+        "cancel_run", "wait_for_run", "get_my_run_id", "replay_run",
         "add_run_score", "list_run_scores",
         "recent_traces", "aggregate_traces", "list_active_runs", "discovery",
     }
@@ -189,3 +189,21 @@ async def test_get_my_run_id_returns_none_when_unset(server, monkeypatch):
     monkeypatch.delenv("AITELIER_RUN_ID", raising=False)
     out = await _call_tool(server, "get_my_run_id")
     assert out == {"run_id": None}
+
+
+@pytest.mark.asyncio
+async def test_replay_run_forwards_model_override(server, fake_client):
+    """An inner agent can re-run a finished sibling against another model
+    without rebuilding the request body."""
+    fake_client.replay_run = AsyncMock(return_value={
+        "run_id": "new-1", "status": "accepted", "parent_run_id": "old-1",
+        "model": "agent:codex/gpt-5.4",
+    })
+
+    out = await _call_tool(
+        server, "replay_run", run_id="old-1", model="agent:codex/gpt-5.4",
+    )
+
+    assert out["parent_run_id"] == "old-1"
+    fake_client.replay_run.assert_awaited_once_with(
+        "old-1", model="agent:codex/gpt-5.4")

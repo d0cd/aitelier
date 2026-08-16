@@ -17,6 +17,8 @@ export type {
   // Cancellation
   ActiveRuns,
   CancelAck,
+  // Replay
+  ReplayAck,
   // Durable runs + events
   Run,
   RunState,

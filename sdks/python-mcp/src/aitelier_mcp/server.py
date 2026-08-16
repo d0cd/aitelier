@@ -171,6 +171,21 @@ def create_server(client: Aitelier | None = None) -> FastMCP:
         return _as_dict(run)
 
     @server.tool()
+    async def replay_run(
+        run_id: str, model: str | None = None,
+    ) -> dict[str, Any]:
+        """Re-dispatch a finalized run from its captured request body.
+
+        The replay is that body verbatim apart from an optional `model`
+        override, so an orchestrator can re-run the same input against a
+        different model and compare. Returns immediately with `{run_id,
+        status, parent_run_id, model}`; the replay is a normal async run.
+        Raises on 404 (unknown), 409 (not finalized yet), or 422 (run
+        predates request-body capture)."""
+        ack = await client.replay_run(run_id, model=model)
+        return _as_dict(ack)
+
+    @server.tool()
     async def add_run_score(
         run_id: str, name: str, value: float, evaluator: str,
         comment: str | None = None,

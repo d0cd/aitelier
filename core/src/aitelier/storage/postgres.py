@@ -296,7 +296,6 @@ class PostgresStore:
                 f"group_by must be one of: "
                 f"{', '.join(sorted(AGGREGATE_GROUP_KEYS))}"
             )
-        expr = self._AGGREGATE_GROUP_EXPRS[group_by]
         where: list[str] = []
         params: list[Any] = []
         if since:
@@ -309,6 +308,11 @@ class PostgresStore:
             params.append(trace_tag)
             where.append(f"trace_tag = ${len(params)}")
         where_clause = (" WHERE " + " AND ".join(where)) if where else ""
+
+        if group_by == "score_name":
+            return await self._aggregate_by_score_name(where_clause, params)
+
+        expr = self._AGGREGATE_GROUP_EXPRS[group_by]
 
         group_sql = f"""
             SELECT
@@ -335,6 +339,65 @@ class PostgresStore:
         return {
             "group_by": group_by,
             "groups": [dict(r) for r in rows],
+            "total": dict(total) if total else {
+                "count": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "error_count": 0,
+            },
+        }
+
+    async def _aggregate_by_score_name(
+        self, where_clause: str, params: list[Any],
+    ) -> dict:
+        """Roll graded runs up by score name — see AGGREGATE_GROUP_KEYS.
+
+        `graded` dedupes to one row per (name, run) so a run scored twice under
+        the same name is counted once; `averages` keeps every score row so the
+        mean reflects all of them.
+        """
+        scoped = f"SELECT run_id, total_tokens, cost_usd, status FROM runs{where_clause}"
+        group_sql = f"""
+            WITH scoped AS ({scoped}),
+            graded AS (
+              SELECT DISTINCT s.name, r.run_id, r.total_tokens, r.cost_usd, r.status
+              FROM run_scores s JOIN scoped r ON r.run_id = s.run_id
+            ),
+            averages AS (
+              SELECT s.name, AVG(s.value) AS avg_value
+              FROM run_scores s JOIN scoped r ON r.run_id = s.run_id
+              GROUP BY s.name
+            )
+            SELECT
+              g.name AS key,
+              COUNT(*) AS count,
+              COALESCE(SUM(g.total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(g.cost_usd), 0.0) AS cost_usd,
+              SUM(CASE WHEN g.status = 'error' THEN 1 ELSE 0 END) AS error_count,
+              a.avg_value
+            FROM graded g JOIN averages a ON a.name = g.name
+            GROUP BY g.name, a.avg_value
+            ORDER BY count DESC
+        """
+        total_sql = f"""
+            WITH scoped AS ({scoped}),
+            graded AS (
+              SELECT DISTINCT r.run_id, r.total_tokens, r.cost_usd, r.status
+              FROM run_scores s JOIN scoped r ON r.run_id = s.run_id
+            )
+            SELECT
+              COUNT(*) AS count,
+              COALESCE(SUM(total_tokens), 0) AS total_tokens,
+              COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+              COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) AS error_count
+            FROM graded
+        """
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(group_sql, *params)
+            total = await conn.fetchrow(total_sql, *params)
+        return {
+            "group_by": "score_name",
+            "groups": [
+                {**dict(r), "avg_value": float(r["avg_value"])} for r in rows
+            ],
             "total": dict(total) if total else {
                 "count": 0, "total_tokens": 0,
                 "cost_usd": 0.0, "error_count": 0,

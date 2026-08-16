@@ -332,3 +332,77 @@ async def test_export_runs_omits_unset_filters():
     async for _ in sdk.export_runs():
         pass
     assert set(captured["params"].keys()) == {"limit"}
+
+
+# --- Replay + score-name aggregate ------------------------------------------
+
+@pytest.mark.asyncio
+async def test_replay_run_posts_to_replay_endpoint_without_model_param():
+    """No model override means no `model` query param — the replay is the
+    captured body verbatim."""
+    sdk = Aitelier()
+    fake = _stub_http(sdk, {
+        "run_id": "new-1", "status": "accepted", "parent_run_id": "old-1",
+        "model": "agent:claude/claude-sonnet-4-5", "correlation_id": "cid",
+        "webhook_url": None,
+    })
+
+    result = await sdk.replay_run("old-1")
+
+    assert result["run_id"] == "new-1"
+    assert result["parent_run_id"] == "old-1"
+    args, kwargs = fake.post.call_args
+    assert args[0] == "/v1/runs/old-1/replay"
+    assert kwargs.get("params") in (None, {})
+
+
+@pytest.mark.asyncio
+async def test_replay_run_passes_model_override():
+    sdk = Aitelier()
+    fake = _stub_http(sdk, {
+        "run_id": "new-2", "status": "accepted", "parent_run_id": "old-2",
+        "model": "agent:codex/gpt-5.4", "correlation_id": "cid",
+        "webhook_url": None,
+    })
+
+    await sdk.replay_run("old-2", model="agent:codex/gpt-5.4")
+
+    _, kwargs = fake.post.call_args
+    assert kwargs["params"] == {"model": "agent:codex/gpt-5.4"}
+
+
+@pytest.mark.asyncio
+async def test_aggregate_traces_by_score_name_parses_avg_value():
+    """`avg_value` only appears under group_by=score_name, so the generated
+    Bucket must carry it as optional rather than drop it."""
+    sdk = Aitelier()
+    _stub_http(sdk, {
+        "group_by": "score_name",
+        "groups": [{
+            "key": "helpfulness", "count": 2, "total_tokens": 150,
+            "cost_usd": 0.015, "error_count": 0, "avg_value": 0.7,
+        }],
+        "total": {"count": 2, "total_tokens": 150, "cost_usd": 0.015,
+                   "error_count": 0},
+    })
+
+    agg = await sdk.aggregate_traces(group_by="score_name")
+
+    assert agg.groups[0].avg_value == pytest.approx(0.7)
+    assert agg.groups[0].key == "helpfulness"
+
+
+@pytest.mark.asyncio
+async def test_aggregate_traces_leaves_avg_value_unset_for_run_dimensions():
+    sdk = Aitelier()
+    _stub_http(sdk, {
+        "group_by": "model",
+        "groups": [{"key": "claude-sonnet", "count": 1, "total_tokens": 10,
+                     "cost_usd": 0.001, "error_count": 0}],
+        "total": {"count": 1, "total_tokens": 10, "cost_usd": 0.001,
+                   "error_count": 0},
+    })
+
+    agg = await sdk.aggregate_traces(group_by="model")
+
+    assert agg.groups[0].avg_value is None

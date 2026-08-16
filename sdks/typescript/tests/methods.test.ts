@@ -352,3 +352,68 @@ describe(".openai()", () => {
     vi.doUnmock("openai");
   });
 });
+
+describe("replayRun (POST /v1/runs/{id}/replay)", () => {
+  it("posts without a model param when no override is given", async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          run_id: "new-1", status: "accepted", parent_run_id: "old-1",
+          model: "agent:claude/claude-sonnet-4-5",
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://aitelier.test" });
+    const ack = await c.replayRun("old-1");
+
+    expect(ack.runId).toBe("new-1");
+    expect(ack.parentRunId).toBe("old-1");
+    expect(calls[0].url).toBe("http://aitelier.test/v1/runs/old-1/replay");
+    expect(calls[0].init?.method).toBe("POST");
+  });
+
+  it("passes the model override as a query param", async () => {
+    globalThis.fetch = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      calls.push({ url: String(url), init });
+      return {
+        ok: true, status: 200,
+        json: async () => ({
+          run_id: "new-2", status: "accepted", parent_run_id: "old-2",
+          model: "agent:codex/gpt-5.4",
+        }),
+        text: async () => "",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    const c = new Aitelier({ baseUrl: "http://aitelier.test" });
+    await c.replayRun("old-2", { model: "agent:codex/gpt-5.4" });
+
+    expect(calls[0].url).toContain("model=agent%3Acodex%2Fgpt-5.4");
+  });
+});
+
+describe("aggregateTraces by score name", () => {
+  it("surfaces avgValue on each bucket", async () => {
+    globalThis.fetch = mockFetch({
+      ok: true,
+      json: {
+        group_by: "score_name",
+        groups: [{
+          key: "helpfulness", count: 2, total_tokens: 150,
+          cost_usd: 0.015, error_count: 0, avg_value: 0.7,
+        }],
+        total: { count: 2, total_tokens: 150, cost_usd: 0.015, error_count: 0 },
+      },
+    });
+
+    const c = new Aitelier({ baseUrl: "http://example" });
+    const agg = await c.aggregateTraces({ groupBy: "score_name" });
+
+    expect(agg.groups[0].avgValue).toBeCloseTo(0.7);
+    expect(agg.groups[0].key).toBe("helpfulness");
+  });
+});

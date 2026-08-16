@@ -544,6 +544,17 @@ def test_validate_workspace_path_rejects_dotdot():
         validate_workspace_path("/tmp/foo/../bar", roots=None)
 
 
+def test_validate_workspace_path_rejects_relative_paths():
+    """A relative agent path has no declared base: aitelier's own cwd is not
+    the cwd Sandbox Agent resolves against, so neither the symlink walk nor
+    the allowlist can produce a meaningful answer. Refuse instead of guessing.
+    """
+    from aitelier.security import validate_workspace_path
+    for value in ("workspace", "./workspace", "nested/dir"):
+        with pytest.raises(Exception, match="absolute"):
+            validate_workspace_path(value, roots=None)
+
+
 def test_validate_workspace_path_allowlist_enforced(tmp_path):
     """When roots is set, the resolved path must be a descendant."""
     from aitelier.security import validate_workspace_path
@@ -2298,6 +2309,258 @@ def test_async_run_returns_run_id_immediately(client):
     run_resp = client.get(f"/v1/runs/{data['run_id']}")
     assert run_resp.status_code == 200
     assert run_resp.json()["run_id"] == data["run_id"]
+
+
+async def capture_ok(req, *args, **kwargs):
+    """Stand-in for the agent dispatch so a replay test exercises the endpoint
+    contract, not a live Sandbox Agent."""
+    return {"status": "ok", "content": "done", "usage": {},
+            "finish_reason": "stop"}
+
+
+async def _finalized_agent_run(run_id: str, *, request_body: dict | None,
+                                state: str = "completed") -> None:
+    """Put a terminal run row with a captured request body in the store."""
+    from aitelier.storage import RunSpec, get_store
+
+    store = await get_store()
+    await store.create_run(RunSpec(
+        run_id=run_id, kind="agent", agent_id="claude",
+        model="agent:claude/claude-sonnet-4-5", request_body=request_body,
+    ))
+    await store.update_run_state(run_id, "running")
+    if state != "running":
+        await store.update_run_state(run_id, state)
+
+
+def test_replay_redispatches_captured_body_under_new_parent(client):
+    """The captured request_body IS the replay input: the new run carries the
+    same messages, links back via parent_run_id, and keeps the original model
+    when none is requested."""
+    import asyncio
+
+    body = {
+        "model": "agent:claude/claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "audit this repo"}],
+    }
+    asyncio.new_event_loop().run_until_complete(
+        _finalized_agent_run("replay-src-1", request_body=body))
+
+    seen: dict = {}
+
+    async def capture(req, *args, **kwargs):
+        seen["model"] = req.model
+        seen["messages"] = req.messages
+        seen["aitelier"] = req.aitelier
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        resp = client.post("/v1/runs/replay-src-1/replay")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "accepted"
+    assert data["run_id"] != "replay-src-1"
+    assert data["parent_run_id"] == "replay-src-1"
+    # The docstring's claim is about what was dispatched, so assert on it.
+    assert seen["messages"] == [{"role": "user", "content": "audit this repo"}]
+    assert seen["model"] == "agent:claude/claude-sonnet-4-5"
+    assert seen["aitelier"].parent_run_id == "replay-src-1"
+
+
+def test_replay_overrides_only_the_model(client):
+    """?model=X swaps the model and nothing else — that's what makes the
+    comparison against the parent run controlled."""
+    import asyncio
+
+    body = {
+        "model": "agent:claude/claude-sonnet-4-5",
+        "messages": [{"role": "user", "content": "same prompt"}],
+        "aitelier": {"trace_tag": "eval-round-1", "max_turns": 5},
+    }
+    asyncio.new_event_loop().run_until_complete(
+        _finalized_agent_run("replay-src-2", request_body=body))
+
+    seen: dict = {}
+
+    async def capture(req, *args, **kwargs):
+        seen["model"] = req.model
+        seen["messages"] = [dict(m) for m in req.messages]
+        seen["trace_tag"] = req.aitelier.trace_tag
+        seen["max_turns"] = req.aitelier.max_turns
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        resp = client.post(
+            "/v1/runs/replay-src-2/replay?model=agent:claude/claude-haiku-4-5")
+
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "agent:claude/claude-haiku-4-5"
+    assert seen["model"] == "agent:claude/claude-haiku-4-5"
+    assert seen["messages"] == [{"role": "user", "content": "same prompt"}]
+    assert seen["trace_tag"] == "eval-round-1"
+    assert seen["max_turns"] == 5
+
+
+def test_replay_with_same_idempotency_key_against_another_parent_is_refused(client):
+    """A replay carries no request body, so two replays of *different* runs hash
+    identically. Without scoping by source run the second caller silently gets
+    the first replay's run id back and its own replay never dispatches. A key
+    names one operation, so reusing it for a different target must be loud."""
+    import asyncio
+
+    for run_id, content in (("idem-src-a", "AAA"), ("idem-src-b", "BBB")):
+        asyncio.new_event_loop().run_until_complete(_finalized_agent_run(
+            run_id,
+            request_body={
+                "model": "agent:claude/claude-sonnet-4-5",
+                "messages": [{"role": "user", "content": content}],
+            },
+        ))
+
+    dispatched = []
+
+    async def capture(req, *args, **kwargs):
+        dispatched.append(req.messages[0]["content"])
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        first = client.post("/v1/runs/idem-src-a/replay",
+                            headers={"Idempotency-Key": "shared-key"})
+        second = client.post("/v1/runs/idem-src-b/replay",
+                             headers={"Idempotency-Key": "shared-key"})
+
+    assert first.status_code == 200
+    assert first.json()["parent_run_id"] == "idem-src-a"
+    assert second.status_code == 422, second.text
+    assert "idem-src-a" in second.json()["detail"]
+    # Critically: the second caller was never handed the first replay's run.
+    assert dispatched == ["AAA"]
+
+
+def test_replay_key_reused_with_a_different_model_is_refused(client):
+    """`?model=` is the second URL-borne identifier of a replay. If the scope
+    ignores it, an eval sweep reusing one key per parent gets the first run back
+    labelled with a model it never ran."""
+    import asyncio
+
+    asyncio.new_event_loop().run_until_complete(_finalized_agent_run(
+        "model-src",
+        request_body={
+            "model": "agent:claude/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "x"}],
+        },
+    ))
+
+    dispatched = []
+
+    async def capture(req, *args, **kwargs):
+        dispatched.append(req.model)
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        first = client.post("/v1/runs/model-src/replay",
+                            headers={"Idempotency-Key": "sweep-key"})
+        second = client.post(
+            "/v1/runs/model-src/replay?model=agent:claude/claude-haiku-4-5",
+            headers={"Idempotency-Key": "sweep-key"})
+
+    assert first.status_code == 200
+    assert second.status_code == 422, second.text
+    assert dispatched == ["agent:claude/claude-sonnet-4-5"]
+
+
+def test_replay_is_idempotent_for_the_same_parent(client):
+    """Same key, same source run: still exactly one dispatch."""
+    import asyncio
+
+    asyncio.new_event_loop().run_until_complete(_finalized_agent_run(
+        "idem-src-c",
+        request_body={
+            "model": "agent:claude/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "once"}],
+        },
+    ))
+
+    dispatched = []
+
+    async def capture(req, *args, **kwargs):
+        dispatched.append(req.messages[0]["content"])
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        first = client.post("/v1/runs/idem-src-c/replay",
+                            headers={"Idempotency-Key": "repeat-key"})
+        second = client.post("/v1/runs/idem-src-c/replay",
+                             headers={"Idempotency-Key": "repeat-key"})
+
+    assert first.json()["run_id"] == second.json()["run_id"]
+    assert dispatched == ["once"]
+
+
+def test_replay_does_not_carry_stream_from_the_captured_body(client):
+    """`stream` describes how the original response was delivered, not the run.
+    A replay dispatches on the async path, so carrying it through would hand the
+    async runner a request shaped for SSE."""
+    import asyncio
+
+    asyncio.new_event_loop().run_until_complete(_finalized_agent_run(
+        "stream-src",
+        request_body={
+            "model": "agent:claude/claude-sonnet-4-5",
+            "stream": True,
+            "messages": [{"role": "user", "content": "x"}],
+        },
+    ))
+
+    seen = []
+
+    async def capture(req, *args, **kwargs):
+        seen.append(req.stream)
+        return {"status": "ok", "content": "done", "usage": {},
+                "finish_reason": "stop"}
+
+    with patch("aitelier.server._agent_chat_completion", side_effect=capture):
+        resp = client.post("/v1/runs/stream-src/replay")
+
+    assert resp.status_code == 200
+    assert seen == [False]
+
+
+def test_replay_rejects_run_still_in_flight(client):
+    """Replaying a run that hasn't finalized would compare against a moving
+    target."""
+    import asyncio
+
+    body = {"model": "agent:claude/claude-sonnet-4-5",
+            "messages": [{"role": "user", "content": "x"}]}
+    asyncio.new_event_loop().run_until_complete(
+        _finalized_agent_run("replay-src-3", request_body=body, state="running"))
+
+    resp = client.post("/v1/runs/replay-src-3/replay")
+
+    assert resp.status_code == 409
+
+
+def test_replay_rejects_run_without_captured_body(client):
+    """Rows written before the request-body capture can't be replayed."""
+    import asyncio
+
+    asyncio.new_event_loop().run_until_complete(
+        _finalized_agent_run("replay-src-4", request_body=None))
+
+    resp = client.post("/v1/runs/replay-src-4/replay")
+
+    assert resp.status_code == 422
+
+
+def test_replay_unknown_run_is_404(client):
+    assert client.post("/v1/runs/replay-nope/replay").status_code == 404
 
 
 def test_async_run_rejects_non_agent_model(client):

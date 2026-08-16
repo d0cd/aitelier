@@ -25,6 +25,7 @@ import type {
   HealthResponse,
   Run,
   RunEvent,
+  ReplayAck,
   RunScore,
   Schedule,
   TraceRecord,
@@ -291,6 +292,32 @@ export class Aitelier {
     });
     if (!resp.ok) throw new Error(`cancelRun failed: ${resp.status} ${await resp.text()}`);
     return snakeToCamelDeep(await resp.json()) as CancelAck;
+  }
+
+  /**
+   * Re-dispatch a finalized run from its captured request body.
+   *
+   * Resolves as soon as the replay is accepted — it runs on the same async
+   * path as `submitRun`. `model` is the only field a replay may change, so a
+   * comparison against the parent run isolates one variable.
+   *
+   * Throws for 404 (unknown run), 409 (not yet finalized), or 422 (no
+   * captured request body — the run predates storage migration v4).
+   */
+  async replayRun(
+    runId: string,
+    opts: { model?: string } = {},
+  ): Promise<ReplayAck> {
+    const query = opts.model
+      ? `?${new URLSearchParams({ model: opts.model }).toString()}`
+      : "";
+    const resp = await fetch(`${this.baseUrl}/v1/runs/${runId}/replay${query}`, {
+      method: "POST",
+      headers: { ...this.authHeader() },
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!resp.ok) throw new Error(`replayRun failed: ${resp.status} ${await resp.text()}`);
+    return snakeToCamelDeep(await resp.json()) as ReplayAck;
   }
 
   // --- Run scores (eval framework write-back) -----------------------------

@@ -595,6 +595,7 @@ class GroupBy(StrEnum):
     status = 'status'
     error_type = 'error_type'
     day = 'day'
+    score_name = 'score_name'
 
 
 class Bucket(BaseModel):
@@ -607,10 +608,21 @@ class Bucket(BaseModel):
             description='The group value (e.g. trace_tag name, model id, or YYYY-MM-DD day).'
         ),
     ]
-    count: int
+    count: Annotated[
+        int,
+        Field(
+            description='Runs in this group. Under group_by=score_name, distinct *graded* runs.'
+        ),
+    ]
     total_tokens: int
     cost_usd: float
     error_count: int
+    avg_value: Annotated[
+        float | None,
+        Field(
+            description='Mean of every score row behind this group. Null or absent for every group_by other than score_name.'
+        ),
+    ] = None
 
 
 class Totals(BaseModel):

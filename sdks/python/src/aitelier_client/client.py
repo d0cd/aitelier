@@ -218,6 +218,25 @@ class Aitelier:
         resp.raise_for_status()
         return CancelAck(**resp.json())
 
+    async def replay_run(self, run_id: str, *, model: str | None = None) -> dict:
+        """Re-dispatch a finalized run from its captured request body.
+
+        Returns immediately with `{run_id, status: "accepted", parent_run_id,
+        model}` — the replay runs on the same async path as `submit_run`.
+        `model` is the only field a replay may change, so a comparison against
+        the parent run isolates one variable.
+
+        Raises `httpx.HTTPStatusError` for 404 (unknown run), 409 (not yet
+        finalized), or 422 (no captured request body — the run predates
+        storage migration v4).
+        """
+        params = {"model": model} if model is not None else None
+        resp = await self._ensure_client().post(
+            f"/v1/runs/{run_id}/replay", params=params,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def add_run_score(
         self, run_id: str, *,
         name: str, value: float, evaluator: str,

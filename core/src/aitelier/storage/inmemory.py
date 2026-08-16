@@ -206,6 +206,9 @@ class InMemoryStore:
                 return r.started_at.strftime("%Y-%m-%d")
             return getattr(r, group_by) or "<none>"
 
+        if group_by == "score_name":
+            return self._aggregate_by_score_name(_matches)
+
         groups: dict[str, dict] = {}
         total = {"count": 0, "total_tokens": 0,
                   "cost_usd": 0.0, "error_count": 0}
@@ -228,6 +231,50 @@ class InMemoryStore:
             total["error_count"] += err
         return {
             "group_by": group_by,
+            "groups": sorted(groups.values(),
+                              key=lambda g: g["count"], reverse=True),
+            "total": total,
+        }
+
+    def _aggregate_by_score_name(self, matches) -> dict:
+        """Roll graded runs up by score name — see AGGREGATE_GROUP_KEYS."""
+        groups: dict[str, dict] = {}
+        values: dict[str, list[float]] = {}
+        seen: dict[str, set[str]] = {}
+        scored_runs: set[str] = set()
+
+        for score in self._scores:
+            run = self._runs.get(score.run_id)
+            if run is None or not matches(run):
+                continue
+            values.setdefault(score.name, []).append(score.value)
+            runs_for_name = seen.setdefault(score.name, set())
+            if score.run_id in runs_for_name:
+                continue
+            runs_for_name.add(score.run_id)
+            scored_runs.add(score.run_id)
+            group = groups.setdefault(score.name, {
+                "key": score.name, "count": 0, "total_tokens": 0,
+                "cost_usd": 0.0, "error_count": 0, "avg_value": 0.0,
+            })
+            group["count"] += 1
+            group["total_tokens"] += run.total_tokens or 0
+            group["cost_usd"] += run.cost_usd or 0.0
+            group["error_count"] += 1 if run.status == "error" else 0
+
+        for name, group in groups.items():
+            group["avg_value"] = sum(values[name]) / len(values[name])
+
+        total = {"count": 0, "total_tokens": 0, "cost_usd": 0.0, "error_count": 0}
+        for run_id in scored_runs:
+            run = self._runs[run_id]
+            total["count"] += 1
+            total["total_tokens"] += run.total_tokens or 0
+            total["cost_usd"] += run.cost_usd or 0.0
+            total["error_count"] += 1 if run.status == "error" else 0
+
+        return {
+            "group_by": "score_name",
             "groups": sorted(groups.values(),
                               key=lambda g: g["count"], reverse=True),
             "total": total,

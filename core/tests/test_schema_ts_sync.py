@@ -17,7 +17,7 @@ import hashlib
 import pathlib
 
 # sha256 over each schemas/v1/*.json (name + bytes), files sorted by name.
-_EXPECTED_SCHEMAS_HASH = "80c627c2f169b5b0bbf4163345920d6cd43fc25e88a14d959f15bc3e3a4e7f02"
+_EXPECTED_SCHEMAS_HASH = "91710cb7a2fd53e2ddaf03ea417c04f360b087919b2941f169c2b310126946d2"
 
 _SCHEMAS_DIR = pathlib.Path(__file__).resolve().parents[2] / "schemas" / "v1"
 

@@ -215,10 +215,13 @@ export interface TraceRecord {
 
 export interface TracesAggregateBucket {
   key: string;
+  /** Runs in this group. Under groupBy "score_name", distinct *graded* runs. */
   count: number;
   totalTokens: number;
   costUsd: number;
   errorCount: number;
+  /** Mean of every score row behind this group. Null or absent for every groupBy other than "score_name". */
+  avgValue?: number | null;
 }
 
 export interface TracesAggregateTotals {
@@ -232,4 +235,14 @@ export interface TracesAggregate {
   groupBy: string;
   groups: TracesAggregateBucket[];
   total: TracesAggregateTotals;
+}
+
+/** Acknowledgement from POST /v1/runs/{id}/replay. */
+export interface ReplayAck {
+  runId: string;
+  status: string;
+  parentRunId: string;
+  model: string;
+  correlationId?: string;
+  webhookUrl?: string | null;
 }

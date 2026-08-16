@@ -12,6 +12,7 @@ module-init time).
 
 Endpoints surfaced here:
 - POST   /v1/runs                            — submit async agent run
+- POST   /v1/runs/{run_id}/replay            — re-dispatch a finalized run
 - GET    /v1/runs                            — list runs (filtered)
 - GET    /v1/runs/active                     — in-flight registry
 - GET    /v1/runs/{run_id}                   — get one run + on-disk artifacts
@@ -30,6 +31,7 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import ValidationError
 
 from aitelier.config import get_config
 from aitelier.errors import classify_error, scrub_error_text
@@ -45,12 +47,22 @@ _TERMINAL_STATES_FOR_WAIT = frozenset({"completed", "failed", "cancelled", "orph
 
 
 @router.post("/v1/runs")
-async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
+async def submit_async_run(
+    req: AsyncRunRequest, request: Request, *,
+    idempotency_scope: str = "/v1/runs",
+) -> dict:
     """Async agent run: returns immediately with a run_id; the final
     ChatCompletion (or error) is delivered via webhook when ready.
 
     LLM-path async isn't supported — LLM calls are short and stream-capable;
     use /v1/chat/completions. Async exists for long-running agent runs.
+
+    `idempotency_scope` namespaces the `Idempotency-Key` lookup. It defaults to
+    this route, which is right when the whole operation is described by the
+    request body. Callers whose operation is partly identified by the URL —
+    replay, whose body is empty and whose target is a path segment — must pass
+    their own scope, or two different operations would hash identically and the
+    second would silently receive the first one's run.
     """
     from aitelier.server import (
         _active_runs,
@@ -80,7 +92,7 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
     _reject_if_saturated()
 
     cid = request.state.correlation_id
-    idem = await _check_idempotency(request, "/v1/runs")
+    idem = await _check_idempotency(request, idempotency_scope)
     if idem and idem.cached is not None:
         return idem.cached
 
@@ -158,6 +170,70 @@ async def submit_async_run(req: AsyncRunRequest, request: Request) -> dict:
         _release_idempotency_ctx(idem)
         raise
     return accepted
+
+
+@router.post("/v1/runs/{run_id}/replay")
+async def replay_run_endpoint(
+    run_id: str, request: Request, model: str | None = None,
+) -> dict:
+    """Re-dispatch a finalized run from its captured request body.
+
+    The captured `request_body` IS the replay input — it is replayed verbatim
+    apart from an optional `?model=` override, so a comparison against the
+    parent run isolates one variable. The new run links back via
+    `aitelier.parent_run_id` and is dispatched on the same async path as
+    POST /v1/runs (agent runs are long; the caller gets an id, not a block).
+    """
+    validate_path_component(run_id, "run_id")
+    store = await get_store()
+    run = await store.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if run.state not in _TERMINAL_STATES_FOR_WAIT:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Run {run_id} is {run.state}; only a finalized run can be "
+                "replayed. Wait for it via POST /v1/runs/{id}/wait."
+            ),
+        )
+    if not run.request_body:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Run {run_id} has no captured request body — it predates "
+                "request-body capture (storage migration v4) and cannot be "
+                "replayed."
+            ),
+        )
+
+    body = dict(run.request_body)
+    if model:
+        body["model"] = model
+    body["aitelier"] = {**(body.get("aitelier") or {}), "parent_run_id": run_id}
+    # `stream` describes how the original response was delivered, not the run.
+    # A replay always dispatches on the async path, so carrying it through would
+    # hand the async runner a request shaped for SSE.
+    body.pop("stream", None)
+    body.pop("stream_options", None)
+
+    try:
+        replay_req = AsyncRunRequest.model_validate(body)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Captured request body is no longer a valid run request: {exc}",
+        ) from None
+
+    # Scope the idempotency lookup to the whole operation: the replay body is
+    # empty, so both URL-borne identifiers — the source run and the model
+    # override — have to be in the scope. Otherwise a shared key hands back
+    # another replay's run, labelled with a model that run never used.
+    scope = f"/v1/runs/{run_id}/replay?model={replay_req.model}"
+    accepted = await submit_async_run(
+        replay_req, request, idempotency_scope=scope,
+    )
+    return {**accepted, "parent_run_id": run_id, "model": replay_req.model}
 
 
 @router.get("/v1/runs")
