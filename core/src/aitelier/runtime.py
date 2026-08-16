@@ -40,11 +40,95 @@ _active_runs: dict[str, asyncio.Task] = {}
 _pending_finalize_tasks: set[asyncio.Task] = set()
 
 
+# Set once shutdown begins. New work is refused from that moment so in-flight
+# runs can finish, while `/v1/livez` keeps answering — a draining process is
+# alive and must not be restarted out from under its own runs. Held in a dict
+# so importers observe mutations rather than a copied bool.
+_shutdown = {"draining": False}
+
+
+def begin_draining() -> None:
+    """Stop accepting new work. Idempotent."""
+    _shutdown["draining"] = True
+
+
+def end_draining() -> None:
+    """Resume accepting work. Exists for tests and for a cancelled shutdown."""
+    _shutdown["draining"] = False
+
+
+def is_draining() -> bool:
+    return _shutdown["draining"]
+
+
+async def drain_active_runs(timeout: float) -> None:
+    """Wait up to `timeout` for in-flight runs to finish, then cancel the rest.
+
+    A rolling deploy wants in-flight agent runs to complete rather than be
+    cancelled; a stuck run must not hold the process open forever, so the
+    grace period is bounded and anything still running past it is cancelled
+    the way shutdown always did it.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    logged = False
+    # Re-derive the set each pass: a background producer can register a run
+    # after any single snapshot is taken, and a run abandoned that way is never
+    # awaited nor cancelled — it lands as a stuck `running` row that the next
+    # startup sweep flips to `orphaned`, which is the exact failure draining
+    # exists to prevent.
+    while True:
+        tasks = [t for t in _active_runs.values() if not t.done()]
+        if not tasks:
+            return
+        if not logged:
+            logger.info("Draining %d in-flight run(s), up to %.1fs",
+                        len(tasks), timeout)
+            logged = True
+        remaining_time = deadline - asyncio.get_running_loop().time()
+        if remaining_time <= 0:
+            break
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=remaining_time,
+            )
+        except TimeoutError:
+            break
+
+    remaining = [t for t in _active_runs.values() if not t.done()]
+    if not remaining:
+        return
+    logger.warning(
+        "Drain grace period elapsed with %d run(s) still active; cancelling",
+        len(remaining),
+    )
+    for task in remaining:
+        task.cancel()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*remaining, return_exceptions=True), timeout=2.0,
+        )
+    except TimeoutError:
+        logger.warning("Some runs did not cleanly cancel within 2s")
+
+
 def _reject_if_saturated() -> None:
     """Cap concurrent inference. Beyond `service.max_in_flight_runs`,
     return 503 typed as `ProviderUnavailable` so SDK retry policies
     treat overload as a transient failure rather than crashing the
-    consumer. Cap of 0 disables the check (single-tenant dev)."""
+    consumer. Cap of 0 disables the check (single-tenant dev).
+
+    Also the single gate where a draining process refuses new work — every
+    inference entry point already calls this.
+    """
+    if is_draining():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "aitelier is draining for shutdown and is not accepting new "
+                "runs. Retry against another instance or after restart."
+            ),
+        )
     cap = get_config().service.max_in_flight_runs
     if cap and len(_active_runs) >= cap:
         raise HTTPException(

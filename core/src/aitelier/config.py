@@ -80,6 +80,11 @@ class ServiceConfig:
     """Per-process cap on concurrent agent + LLM runs. Requests beyond
     this return HTTP 503 with `error.type: "ProviderUnavailable"`. Set
     to 0 to disable the cap (single-tenant dev deployments)."""
+    drain_timeout_s: float = 30.0
+    """How long shutdown waits for in-flight runs to finish before
+    cancelling them. New work is refused as soon as draining starts, and
+    `/v1/readyz` reports 503 so a load balancer stops routing here. Set to
+    0 to cancel immediately."""
     allow_loopback_webhooks: bool = False
     """When false (default), aitelier refuses to connect to loopback /
     private / link-local addresses — independent of `api_key`. This one

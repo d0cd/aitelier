@@ -20,3 +20,18 @@ def _fresh_store():
     yield fresh
     # Reset back to None so the next test re-initializes.
     _set_store_for_tests(None)  # type: ignore[arg-type]
+
+
+@pytest.fixture(autouse=True)
+def _not_draining():
+    """Clear the shutdown flag around every test.
+
+    Any test that exercises the app through `with TestClient(app)` runs the
+    lifespan's shutdown half, which puts the process into draining state. That
+    is process-global, so without this reset the first such test would make
+    every later test's inference call 503.
+    """
+    from aitelier import runtime
+    runtime.end_draining()
+    yield
+    runtime.end_draining()

@@ -37,11 +37,33 @@ for p in [Path("aitelier.toml"), Path.home()/".config"/"aitelier"/"config.toml"]
 print("host")
 ' 2>/dev/null || echo "host")"
 
+_shutdown_grace_tenths() {
+    # How long to wait for SIGTERM before escalating, in tenths of a second.
+    #
+    # On SIGTERM the service drains: it stops accepting work and gives
+    # in-flight runs up to `[service] drain_timeout_s` to finish. Escalating to
+    # SIGKILL before that window closes would defeat draining entirely and
+    # strand the port, so the grace here is derived from the same config value
+    # rather than being a second constant that silently drifts from it.
+    local drain
+    drain="$(
+        "$REPO_ROOT/.venv/bin/python3" -c \
+            'from aitelier.config import get_config; print(get_config().service.drain_timeout_s)' \
+            2>/dev/null
+    )" || drain=""
+    python3 -c "
+value = ${drain:-0} if '${drain}' else 0.0
+print(max(50, int((value + 5) * 10)))
+" 2>/dev/null || echo 50
+}
+
 _kill_pid_file() {
     # $1 = pid file path, $2 = label, $3 = literal command fragment.
     # Never fall back to pkill: a broad process-name match can terminate a
     # service owned by another checkout or by the user directly.
     local pid_file="$1" label="$2" expected_command="$3"
+    local grace_tenths
+    grace_tenths="$(_shutdown_grace_tenths)"
     if [ -f "$pid_file" ]; then
         local pid
         pid="$(cat "$pid_file")"
@@ -49,9 +71,9 @@ _kill_pid_file() {
             kill "$pid" 2>/dev/null || true
             # Confirm exit before removing the PID file — otherwise a process
             # that ignores SIGTERM keeps running while we drop its PID file,
-            # orphaning it. Wait ~5s, then escalate to SIGKILL.
+            # orphaning it. Wait out the drain window, then escalate to SIGKILL.
             local waited=0
-            while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt 50 ]; do
+            while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$grace_tenths" ]; do
                 sleep 0.1
                 waited=$((waited + 1))
             done

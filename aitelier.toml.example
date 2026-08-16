@@ -58,6 +58,7 @@ host = "127.0.0.1"
 port = 7777
 log_format = "human"             # "json" for one-line-per-record aggregator-friendly logs
 max_in_flight_runs = 32          # 503 when exceeded; 0 disables the cap
+drain_timeout_s = 30.0           # shutdown grace for in-flight runs; 0 cancels at once
 allow_loopback_webhooks = false  # opt-in for dev when webhook target is on localhost
 max_request_body_bytes = 4194304 # 4 MiB; 413 above this. 0 disables (only safe behind a proxy)
 rate_limit_per_minute = 0        # 0 = disabled. Set to e.g. 600 for hosted mode

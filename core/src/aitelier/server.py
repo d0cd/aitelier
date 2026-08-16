@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import (
     HTMLResponse,
     RedirectResponse,
@@ -79,6 +79,10 @@ from aitelier.runtime import (  # noqa: F401  (re-exported for endpoints)
     _sse_event,
     _sse_response,
     _track_inflight_run,
+    begin_draining,
+    drain_active_runs,
+    end_draining,
+    is_draining,
 )
 from aitelier.security import validate_path_component
 from aitelier.serializers import (  # noqa: F401  (re-exported for endpoints/tests)
@@ -291,6 +295,10 @@ async def lifespan(app: FastAPI):
     # *after* this module is imported, so the import-time tag misses them.
     _retag_uvicorn_handlers()
 
+    # A freshly started process accepts work, even if this module object
+    # previously served an app that drained (tests, dev reload).
+    end_draining()
+
     # Open the durable store (Postgres if [database] url is set, in-memory otherwise)
     store = await get_store()
 
@@ -428,26 +436,21 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # Graceful shutdown: cancel any in-flight runs so SSE consumers see a
-    # clean run.cancelled rather than a dropped connection. Best-effort —
-    # we don't wait long for cleanup since the process is about to exit.
-    if _active_runs:
-        logger.info("Cancelling %d in-flight run(s) on shutdown", len(_active_runs))
-        for task in list(_active_runs.values()):
-            if not task.done():
-                task.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*_active_runs.values(), return_exceptions=True),
-                timeout=2.0,
-            )
-        except TimeoutError:
-            logger.warning("Some runs did not cleanly cancel within 2s")
+    # Graceful shutdown: stop accepting new work, let in-flight runs finish
+    # inside the configured grace period, then cancel whatever is left so an
+    # SSE consumer sees a clean run.cancelled rather than a dropped connection.
+    begin_draining()
 
-    # Stop the schedule tick loop + webhook worker + purge worker.
+    # Silence the background producers BEFORE draining. The schedule tick
+    # dispatches inference directly and never passes the saturation/drain gate,
+    # so leaving it running for the drain window lets it register fresh runs
+    # that the drain then abandons — manufacturing the orphans draining exists
+    # to prevent.
     stop_tick_loop()
     stop_webhook_worker()
     stop_purge_worker()
+
+    await drain_active_runs(get_config().service.drain_timeout_s)
 
     # Flush + shut down the OpenTelemetry tracer provider so the last
     # batch of spans reaches the collector. No-op when OTel wasn't
@@ -497,6 +500,60 @@ _KNOWN_LIMITATIONS = [
     "(default 30); events and terminal webhook deliveries age out via "
     "the background purge worker",
 ]
+
+
+@app.get("/v1/livez")
+async def livez() -> dict:
+    """Liveness: is this process alive? Never fails for a dependency outage or
+    during drain — both are conditions a restart makes worse, not better.
+    Use `/v1/readyz` to decide whether to send traffic here."""
+    return {"status": "ok", "draining": is_draining()}
+
+
+async def _probe_dependencies() -> dict:
+    """Reachability of the tracked dependencies, honouring the discovery cache.
+
+    Readiness has to be answered from a real probe, so this falls through to
+    the live probes when the cache is cold or older than `_DISCOVERY_TTL_SECONDS`
+    — reading the cache alone would let a process that has never checked
+    anything report ready. The shared TTL keeps a polling probe cheap.
+    """
+    cached = _discovery_cache["value"]
+    if (isinstance(cached, dict)
+            and time.monotonic() - _discovery_cache["at"] < _DISCOVERY_TTL_SECONDS):
+        return cached.get("dependencies") or {}
+
+    cfg = get_config()
+    litellm_info, sandbox_info = await asyncio.gather(
+        _probe_litellm(cfg), _probe_sandbox_agent(cfg),
+    )
+    return {"litellm": litellm_info, "sandbox_agent": sandbox_info}
+
+
+@app.get("/v1/readyz")
+async def readyz(response: Response) -> dict:
+    """Readiness: should this process receive traffic?
+
+    503 while a tracked dependency is unreachable, and while draining. The
+    draining branch is defence in depth rather than the main signal: by the
+    time the lifespan shutdown hook runs, the server has already stopped
+    accepting connections, so a peer sees the socket close first.
+    """
+    if is_draining():
+        response.status_code = 503
+        return {"status": "draining", "ready": False}
+
+    deps = await _probe_dependencies()
+    unreachable = sorted(
+        name for name, info in deps.items()
+        if isinstance(info, dict) and not info.get("reachable")
+    )
+    if unreachable:
+        response.status_code = 503
+        return {"status": "degraded", "ready": False,
+                "unreachable": unreachable}
+
+    return {"status": "ok", "ready": True}
 
 
 @app.get("/v1/health")
