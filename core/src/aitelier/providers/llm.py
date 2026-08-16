@@ -141,20 +141,25 @@ def _apply_response_format_gates(
     return new_body
 
 
-# Shared HTTP client for LiteLLM calls — pooled connections cut TLS/connect
-# overhead off every request. Initialized lazily on first use; closed on
-# server shutdown via close_shared_client().
-#
-# httpx.AsyncClient binds its connection pool to the event loop that created
-# it; sharing across loops is unsafe (see
-# https://www.python-httpx.org/async/#async-environments). Production runs
-# one loop so we never hit this, but pytest-asyncio gives each test a fresh
-# loop. We track the originating loop and rebuild the client when the loop
-# changes — that way the production singleton property holds AND test
-# isolation works without per-test cleanup hooks.
-_shared_client: httpx.AsyncClient | None = None
-_shared_client_loop: asyncio.AbstractEventLoop | None = None
+# Outbound HTTP clients, built lazily and closed on server shutdown via
+# close_shared_client(). Two pools with different reuse policies — pooling is
+# right for inference and wrong for webhook delivery; see the limits below.
+_clients: dict[str, httpx.AsyncClient] = {}
+_client_loops: dict[str, asyncio.AbstractEventLoop | None] = {}
 _client_lock = asyncio.Lock()
+
+# LiteLLM and friends: pooled, since inference is the hot path.
+_SHARED_LIMITS = httpx.Limits(max_keepalive_connections=20, max_connections=40)
+
+# Webhook delivery: no connection reuse. Delivery connects to an address that
+# resolution validated for that attempt, which collapses every hostname behind
+# that address into one httpcore pool origin (`can_handle_request` compares
+# origins alone) — and the `sni_hostname` extension is applied only when a
+# connection is opened. A kept connection would therefore let a request for one
+# host ride a TLS session whose certificate was verified for another. Delivery
+# is queued, durable, and retried with backoff, so a handshake per attempt is
+# the cheap side of that trade.
+_WEBHOOK_LIMITS = httpx.Limits(max_keepalive_connections=0, max_connections=10)
 
 
 def _client_is_stale(client: httpx.AsyncClient | None,
@@ -170,46 +175,54 @@ def _client_is_stale(client: httpx.AsyncClient | None,
     return loop is not current
 
 
-async def get_shared_client() -> httpx.AsyncClient:
-    global _shared_client, _shared_client_loop
-    if not _client_is_stale(_shared_client, _shared_client_loop):
-        return _shared_client  # type: ignore[return-value]
+async def _get_client(name: str, limits: httpx.Limits) -> httpx.AsyncClient:
+    """Lazily build (or rebuild) the named client.
+
+    httpx.AsyncClient binds its connection pool to the event loop that created
+    it; sharing across loops is unsafe (see
+    https://www.python-httpx.org/async/#async-environments). Production runs one
+    loop so we never hit this, but pytest-asyncio gives each test a fresh loop.
+    Tracking the originating loop and rebuilding when it changes keeps the
+    production singleton property AND test isolation without cleanup hooks.
+    """
+    if not _client_is_stale(_clients.get(name), _client_loops.get(name)):
+        return _clients[name]
     async with _client_lock:
-        if _client_is_stale(_shared_client, _shared_client_loop):
-            # Drop the prior client without awaiting aclose: its sockets
-            # belong to a loop we no longer have. Garbage collection will
-            # release the underlying fds.
-            _shared_client = httpx.AsyncClient(
-                timeout=httpx.Timeout(60, connect=10),
-                limits=httpx.Limits(
-                    max_keepalive_connections=20,
-                    max_connections=40,
-                ),
+        if _client_is_stale(_clients.get(name), _client_loops.get(name)):
+            # Drop the prior client without awaiting aclose: its sockets belong
+            # to a loop we no longer have. GC releases the underlying fds.
+            _clients[name] = httpx.AsyncClient(
+                timeout=httpx.Timeout(60, connect=10), limits=limits,
             )
-            _shared_client_loop = asyncio.get_running_loop()
-    return _shared_client
+            _client_loops[name] = asyncio.get_running_loop()
+    return _clients[name]
+
+
+async def get_shared_client() -> httpx.AsyncClient:
+    return await _get_client("shared", _SHARED_LIMITS)
+
+
+async def get_webhook_client() -> httpx.AsyncClient:
+    """Client for outbound webhook delivery — see `_WEBHOOK_LIMITS`."""
+    return await _get_client("webhook", _WEBHOOK_LIMITS)
 
 
 async def close_shared_client() -> None:
-    """Close the module-level client. Call from server lifespan shutdown.
+    """Close every module-level client. Call from server lifespan shutdown.
 
-    No-op when the client is from a different event loop — aclose() would
-    raise `Event loop is closed` since httpx tries to close sockets via the
-    original loop. Letting GC reclaim the fds is the documented safe path.
+    No-op for a client from a different event loop — aclose() would raise
+    `Event loop is closed` since httpx tries to close sockets via the original
+    loop. Letting GC reclaim the fds is the documented safe path.
     """
-    global _shared_client, _shared_client_loop
-    if _shared_client is None or _shared_client.is_closed:
-        _shared_client = None
-        _shared_client_loop = None
-        return
     try:
         current = asyncio.get_running_loop()
     except RuntimeError:
         current = None
-    if _shared_client_loop is current:
-        await _shared_client.aclose()
-    _shared_client = None
-    _shared_client_loop = None
+    for name, client in list(_clients.items()):
+        if not client.is_closed and _client_loops.get(name) is current:
+            await client.aclose()
+        _clients.pop(name, None)
+        _client_loops.pop(name, None)
 
 
 class LLMError(Exception):

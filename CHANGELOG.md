@@ -16,7 +16,12 @@ relevant section.
   now returns a validated literal address; delivery connects to it and carries
   the original name in the `Host` header and TLS SNI so virtual hosting and
   certificate verification are unaffected. A mixed public/private answer set
-  fails closed.
+  fails closed. Webhook delivery moved to its own connection pool with reuse
+  disabled: pinning collapses every hostname behind an address into one pool
+  origin, and the SNI hostname is applied only when a connection is opened, so
+  a kept connection would let a request for one host ride a TLS session
+  verified for another. Delivery is queued and retried, so a handshake per
+  attempt is the cheap side of that trade.
 - **A configured permission policy that cannot decide now denies.** An
   exception inside a `tool_allowlist` decider previously fell through to
   *allow*. Because the ask is agent-controlled, a malformed tool name (any

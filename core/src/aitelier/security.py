@@ -161,6 +161,12 @@ class PinnedTarget:
     connection cannot land somewhere else via a second DNS answer. `host_header`
     and `sni_hostname` carry the original name so virtual hosting and
     certificate verification still work.
+
+    Pinning collapses every hostname behind an address into one connection-pool
+    origin, and `sni_hostname` is applied only when a connection is opened — so
+    a caller that reuses connections would let a request for one host ride a
+    session verified for another. Callers must not pool: webhook delivery uses
+    a client with keepalive disabled (`_WEBHOOK_LIMITS`).
     """
 
     url: str

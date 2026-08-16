@@ -45,7 +45,7 @@ def _next_attempt_at(attempts: int) -> datetime | None:
 async def _deliver_once(delivery) -> None:
     """Try one delivery. Updates state via store.record_webhook_attempt."""
     from aitelier.config import get_config
-    from aitelier.providers.llm import get_shared_client
+    from aitelier.providers.llm import get_webhook_client
     from aitelier.security import resolve_public_target
     from aitelier.storage import get_store
 
@@ -102,7 +102,7 @@ async def _deliver_once(delivery) -> None:
         extensions["sni_hostname"] = target.sni_hostname
 
     try:
-        client = await get_shared_client()
+        client = await get_webhook_client()
         resp = await client.post(
             post_url,
             content=body_bytes,

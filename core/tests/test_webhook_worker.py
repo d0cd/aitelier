@@ -36,11 +36,11 @@ async def test_worker_delivers_2xx_and_marks_delivered():
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(200))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client",
+                side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     # Should have been called once with the right body
@@ -57,11 +57,11 @@ async def test_worker_schedules_retry_on_5xx():
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(500, "boom"))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client",
+                side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     delivery = store._webhooks[wid]
@@ -84,11 +84,11 @@ async def test_worker_marks_failed_after_max_attempts():
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(500))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client",
+                side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     assert store._webhooks[wid].state == "failed"
@@ -102,11 +102,11 @@ async def test_worker_handles_network_error():
     fake_client = MagicMock()
     fake_client.post = AsyncMock(side_effect=ConnectionError("refused"))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client",
-                side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client",
+                side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     delivery = store._webhooks[wid]
@@ -184,10 +184,10 @@ async def test_worker_attaches_bearer_header_the_sdk_verifier_accepts(monkeypatc
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(200))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client", side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     posted = [c for c in fake_client.post.await_args_list if c.args and c.args[0] == url]
@@ -223,10 +223,10 @@ async def test_delivery_posts_to_validated_address_not_the_hostname(monkeypatch)
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(200))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client", side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     call = fake_client.post.await_args
@@ -260,10 +260,10 @@ async def test_mixed_public_and_private_dns_answers_fail_closed(monkeypatch):
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(200))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client", side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     assert fake_client.post.await_count == 0
@@ -296,10 +296,10 @@ async def test_delivery_time_ssrf_rejection_marks_failed(monkeypatch):
     fake_client = MagicMock()
     fake_client.post = AsyncMock(return_value=_mock_http_response(200))
 
-    async def fake_get_shared():
+    async def fake_get_webhook():
         return fake_client
 
-    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+    with patch("aitelier.providers.llm.get_webhook_client", side_effect=fake_get_webhook):
         await wh._worker_tick()
 
     # No request fired for this URL, delivery terminally failed (no retry).
@@ -310,3 +310,49 @@ async def test_delivery_time_ssrf_rejection_marks_failed(monkeypatch):
     assert d.state == "failed"
     assert d.next_attempt_at is None
     assert "SSRF" in (d.last_error or "")
+
+
+@pytest.mark.asyncio
+async def test_webhook_client_does_not_reuse_connections():
+    """Delivery pins to a validated IP literal, which collapses every hostname
+    on that address into one httpcore pool origin — and `sni_hostname` is only
+    applied when a connection is opened. Keeping connections would let a
+    request for one host ride a TLS session verified for another, so webhook
+    delivery gets its own pool with reuse disabled."""
+    from aitelier.providers.llm import get_shared_client, get_webhook_client
+
+    client = await get_webhook_client()
+    shared = await get_shared_client()
+
+    assert client is not shared, "webhook delivery must not share the pool"
+    assert client._transport._pool._max_keepalive_connections == 0
+    assert shared._transport._pool._max_keepalive_connections > 0
+
+
+@pytest.mark.asyncio
+async def test_deliver_once_uses_the_webhook_client(monkeypatch):
+    """The no-reuse guarantee is only worth anything if delivery actually
+    goes through that client."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "aitelier.config.get_config",
+        lambda: SimpleNamespace(service=SimpleNamespace(
+            webhook_secret=None, allow_loopback_webhooks=False)),
+    )
+
+    store = await get_store()
+    wid = await store.enqueue_webhook("https://receiver.test/hook", {"x": 1})
+
+    used = MagicMock()
+    used.post = AsyncMock(return_value=_mock_http_response(200))
+
+    async def fake_webhook_client():
+        return used
+
+    with patch("aitelier.providers.llm.get_webhook_client",
+               side_effect=fake_webhook_client):
+        await wh._worker_tick()
+
+    used.post.assert_awaited_once()
+    assert store._webhooks[wid].state == "delivered"

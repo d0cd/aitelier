@@ -30,7 +30,7 @@ def test_webhook_fires_and_carries_run_payload(
     r = httpx.post(
         f"{aitelier.base_url}/v1/runs",
         json={
-            "model": "agent:claude",
+            "model": "agent:claude/default",
             "messages": [{"role": "user", "content": "ack"}],
             "timeout": 240,
             "webhook_url": webhook_receiver.url,
@@ -65,7 +65,7 @@ def test_webhook_authenticated_when_secret_configured(
     r = httpx.post(
         f"{aitelier.base_url}/v1/runs",
         json={
-            "model": "agent:claude",
+            "model": "agent:claude/default",
             "messages": [{"role": "user", "content": "ack"}],
             "timeout": 240,
             "webhook_url": webhook_receiver.url,
@@ -97,7 +97,7 @@ def test_webhook_loopback_rejected_when_safety_on(isolated_aitelier):
     r = httpx.post(
         f"{aitelier.base_url}/v1/runs",
         json={
-            "model": "agent:claude",
+            "model": "agent:claude/default",
             "messages": [{"role": "user", "content": "ack"}],
             "timeout": 240,
             "webhook_url": "http://127.0.0.1:9/will-not-be-hit",
