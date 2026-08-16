@@ -13,7 +13,7 @@
       },
       {
         "id": "permission-lint",
-        "argv": ["uv", "run", "--no-sync", "ruff", "check", "core/src/aitelier/providers/acp_transport.py", "core/tests/test_sandbox_agent.py"],
+        "argv": ["uv", "run", "--no-sync", "ruff", "check", "core/src/aitelier/providers/acp_transport.py", "core/src/aitelier/providers/sandbox_agent.py", "core/tests/test_sandbox_agent.py"],
         "timeoutSeconds": 300
       }
     ],

@@ -597,6 +597,7 @@ async def test_postgres_update_run_sandbox_and_orphan_sweep():
     and the startup orphan sweep — these don't exercise on InMemoryStore."""
     store = PostgresStore(_require_database_url())
     await store.connect()
+    bystanders: list[tuple] = []
     try:
         # Partial updates: only url first, then only server_id; both should
         # be present afterward thanks to COALESCE.
@@ -615,6 +616,23 @@ async def test_postgres_update_run_sandbox_and_orphan_sweep():
 
         # Orphan sweep: a row in `running` from a notional prior process
         # flips to `orphaned`.
+        #
+        # The sweep is deliberately global — that's the production contract,
+        # and it's why exactly one aitelier process may own a database. Against
+        # a shared dev database that also means it flips rows this test doesn't
+        # own, including runs a locally-running service has in flight. Capture
+        # those first and put them back, or `make test-py` silently kills live
+        # work. Restoring needs raw SQL: `orphaned` is a terminal state with no
+        # legal transition out of it.
+        async with store._pool.acquire() as conn:
+            bystanders = [
+                (r["run_id"], r["state"], r["ended_at"])
+                for r in await conn.fetch(
+                    "SELECT run_id, state, ended_at FROM runs "
+                    "WHERE state IN ('pending', 'running')"
+                )
+            ]
+
         await store.create_run(RunSpec(run_id="pg-orphan-1", kind="agent"))
         await store.update_run_state("pg-orphan-1", "running")
         swept = await store.mark_orphaned_running_runs()
@@ -624,6 +642,16 @@ async def test_postgres_update_run_sandbox_and_orphan_sweep():
         assert run.ended_at is not None
     finally:
         async with store._pool.acquire() as conn:
+            for run_id, state, ended_at in bystanders:
+                # Only undo rows this test's sweep actually flipped. A run that
+                # finalized on its own between the capture and here is in a real
+                # terminal state; restoring it to `running` would be the very
+                # corruption this restore exists to prevent.
+                await conn.execute(
+                    "UPDATE runs SET state = $2, ended_at = $3 "
+                    "WHERE run_id = $1 AND state = 'orphaned'",
+                    run_id, state, ended_at,
+                )
             await conn.execute(
                 "DELETE FROM runs WHERE run_id IN ($1, $2)",
                 "pg-sandbox-1", "pg-orphan-1",
