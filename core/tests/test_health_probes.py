@@ -52,11 +52,19 @@ def test_readyz_reports_not_ready_while_draining(client):
     assert resp.json()["status"] == "draining"
 
 
-def test_readyz_ok_when_not_draining(client):
-    resp = client.get("/v1/readyz")
+def test_readyz_ok_when_dependencies_are_reachable(client):
+    """Readiness is decided by a live probe, so the probe has to be controlled
+    here — asserting a bare 200 would only pass on a machine that happens to
+    have LiteLLM and Sandbox Agent running."""
+    async def all_up():
+        return {"litellm": {"reachable": True},
+                "sandbox_agent": {"reachable": True}}
+
+    with patch("aitelier.server._probe_dependencies", side_effect=all_up):
+        resp = client.get("/v1/readyz")
 
     assert resp.status_code == 200
-    assert resp.json()["status"] == "ok"
+    assert resp.json() == {"status": "ok", "ready": True}
 
 
 def test_new_work_is_refused_while_draining():
