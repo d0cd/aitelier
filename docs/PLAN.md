@@ -3,6 +3,9 @@
 Snapshot of what's built and what's deliberately out of scope. For
 phase-by-phase history, read the code or `git log`.
 
+Storage is at migration v8 (`008_cache_token_columns`); prompt-cache read/write
+tokens feed the estimated `cost_usd`.
+
 ## Built
 
 ### OpenAI-shape inference
@@ -20,7 +23,11 @@ phase-by-phase history, read the code or `git log`.
 - `POST /v1/runs` — async agent submission with webhook delivery.
 - `GET /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/events`,
   `GET /v1/runs/{id}/events/stream`, `GET /v1/runs/active`,
-  `POST /v1/runs/{id}/cancel`.
+  `POST /v1/runs/{id}/cancel`, `POST /v1/runs/{id}/wait`.
+- `POST /v1/runs/{id}/replay[?model=X]` — re-dispatch a finalized run from
+  its captured `request_body`, verbatim apart from an optional model
+  override, linked back via `aitelier.parent_run_id`. Async, like
+  `POST /v1/runs`.
 - State machine: `pending → running → {completed | failed | cancelled | orphaned}`.
 - Append-only `run_events` timeline.
 - `mark_orphaned_running_runs()` startup sweep — prevents ghost rows after a crash.
@@ -55,6 +62,9 @@ phase-by-phase history, read the code or `git log`.
     captured `request_body`) for backfill grading. Filters mirror
     `GET /v1/runs`.
   - SDKs surface `add_run_score` / `list_run_scores` / `export_runs`.
+  - `GET /v1/traces/aggregates?group_by=score_name` — rolls up *graded*
+    runs by score name with `avg_value` per group, so a dashboard can ask
+    "average helpfulness across runs in trace X" in one query.
 
 ### Schedules + webhooks
 
@@ -75,9 +85,31 @@ phase-by-phase history, read the code or `git log`.
 
 ### Discovery + capability surface
 
-- `GET /v1/health` — cheap liveness.
+- `GET /v1/health` — cheap liveness + opportunistic dependency summary.
+- `GET /v1/livez` — process liveness only; never fails for a dependency
+  outage or during drain (a restart fixes neither).
+- `GET /v1/readyz` — 503 when a tracked dependency is unreachable (probed
+  live, behind the discovery TTL cache) and while draining.
 - `GET /v1/discovery` — endpoint inventory + dependency probes + per-model
   `response_format` capabilities.
+- `GET /v1/metrics` — runtime counters.
+- `GET /v1/schemas/{name}` — control-plane JSON Schema by name.
+
+### Agent tool policy
+
+- `aitelier.tool_allowlist` is enforced at the ACP permission hook
+  (`_make_permission_decider`): each `session/request_permission` emits a
+  `permission_request` run-event, and an ask outside the allowlist is denied
+  with a `tool_denied` event. A configured policy that cannot produce a
+  decision — raising, cancelled, or handed an unnameable tool ask — denies.
+  Coarse by design (base tool name), complementing the backend's own
+  enforcement rather than reimplementing its pattern syntax.
+
+### Static dashboard
+
+- `GET /ui` (+ `/` redirect) — read-only browser over `/v1/runs*` and
+  `/v1/traces/aggregates`. Vanilla HTML, no build step. Public path; the
+  data calls behind it stay gated.
 
 ### Config
 
@@ -85,11 +117,19 @@ phase-by-phase history, read the code or `git log`.
   → `runs/.session.toml` (start.sh-managed runtime overlay).
 - No `os.environ` reads in app code — single principled load path.
 
-### Tooling
+### Tooling + deployment
 
 - `make start/stop/restart/logs/status/doctor/reset/test/test-live`.
 - `scripts/doctor.sh` — preflight checks (ports, tools, creds, docker).
 - Live test suite (`core/tests/live/`) — gated on `AITELIER_LIVE_URL`.
+- `make backup` / `make restore` + the `docs/deploy/backup-restore.md`
+  runbook (pg_dump, retention pruning, restore confirmation).
+- `docs/deploy/process-compose.md` — supervised foreground deployment via
+  `scripts/supervise.sh`.
+- `docs/deploy/sandbox-agent.cell.yaml` — Brig cell hosting Sandbox Agent
+  alone, with authenticated port-2468 ingress and aitelier outside the cell.
+- Credential materialization (`scripts/materialize_credentials.py`) writes a
+  mode-600 runtime secret per deployment mode; nothing prints a token.
 
 ## 1.0 readiness — packaging gaps
 
@@ -110,24 +150,36 @@ architectural decision; they require a release cadence.
   the public API surface (`/v1/*` shapes + SDK method signatures) and
   document a deprecation policy for breaking changes.
 
-- **Documented deployment shapes.** `make start` is dev-only. Producing
-  one reference compose stack (Postgres + LiteLLM + aitelier + optional
-  Ollama) under `docs/deploy/` lets a consumer run aitelier in 5
-  minutes without reverse-engineering the Makefile. K8s is not required
-  for the single-user-scale ceiling; compose is enough.
+## Instance model — single-instance, by commitment
 
-- **Backup / restore runbook.** Postgres holds every run, event,
-  schedule, webhook, and idempotency key. A 1-page doc under
-  `docs/deploy/` covering `pg_dump`, point-in-time recovery, and
-  migration between aitelier versions is the smallest viable answer.
-  No tooling required; just the prose.
+**Exactly one aitelier process owns a database.** This is a supported
+contract, not an unexamined default.
 
-- **Multi-instance contract.** Either commit explicitly to
-  single-instance (and document why — the `_active_runs` and idempotency
-  lock dicts are process-local) OR document the sticky-routing pattern
-  for horizontal scale. The DB layer already supports it via the
-  `idempotency_keys` table's `ON CONFLICT` claim and the `orphaned`
-  state for crash recovery; the missing piece is operator guidance.
+Process-local state that a second instance would not see:
+
+- `runtime._active_runs` — the in-flight registry behind
+  `POST /v1/runs/{id}/cancel`, `GET /v1/runs/active`, the
+  `service.max_in_flight_runs` cap, and shutdown draining. An instance can
+  only cancel a run it is itself executing.
+- `idempotency.py`'s per-key lock dict — the fast path for concurrent
+  duplicate requests. The `idempotency_keys` table's `ON CONFLICT` claim is
+  the cross-process safety net, so correctness survives a second instance;
+  the lock is what keeps the common case cheap.
+- The startup `orphaned` sweep flips *every* non-terminal row, so a second
+  instance starting up would orphan the first instance's live runs.
+
+That last point is the reason this is a commitment rather than a caveat: two
+instances against one database actively corrupt each other's run state. The
+scaling ceiling is deliberate — single-developer use is the positioning, and
+the ceiling is the feature.
+
+If horizontal scale is ever wanted, the missing pieces are known: sticky
+routing by `Idempotency-Key`, moving `_active_runs` and the lock dict to
+Redis, and scoping the orphan sweep to an instance id.
+
+For availability rather than throughput, run one instance under a supervisor
+(`docs/deploy/process-compose.md`) and let `/v1/readyz` gate traffic during
+restarts.
 
 ## Directions worth exploring
 
@@ -171,22 +223,6 @@ real consumer needs it, not speculatively.
 
 ### Tier 1 — leans into aitelier's unique position
 
-- **Agent trace observability + replay** (the "Phase H" idea, now
-  unblocked by the request-body capture under "Built" above).
-  Existing observability platforms (LangSmith, Langfuse, Phoenix)
-  instrument from the application; aitelier intercepts at the HTTP
-  edge and already stores rich per-run data including the captured
-  request body. Two small additions left:
-  - `POST /v1/runs/{id}/replay?model=X` — re-dispatch a finalized run
-    with one field changed; new run linked via `parent_run_id`. The
-    captured `request_body` IS the replay input.
-  - Static web UI at `/ui` — read-only browser over `/v1/runs`,
-    `/v1/runs/{id}/events`, `/v1/traces/aggregates`. No build step.
-    Renders `rendered_messages` as the conversation the model saw.
-  Pays off as both an observability tool *and* the foundation for
-  evals (`trace_tag` + replay + aggregates cover the eval workflow
-  pattern; no DSL needed).
-
 - **Agent behavior graphs (multi-resolution).**
   Compute prefix trees / process-discovery graphs from `run_events`
   joined by `trace_tag` or `system_prompt_hash`. Multiple resolutions
@@ -206,8 +242,10 @@ real consumer needs it, not speculatively.
   actively expanding (Browserbase, Stagehand, etc.).
 
 - **Human-in-the-loop approval gates.** ACP's
-  `session/request_permission` is auto-approved today
-  (`acp_transport.py:191`). Surfacing it as a `POST
+  `session/request_permission` is decided in-process today: the
+  `tool_allowlist` policy answers immediately, and every ask is already
+  recorded as a `permission_request` run-event. What's missing is
+  *suspending* on the ask instead of answering it. Surfacing it as a `POST
   /v1/runs/{id}/approvals?decision=…` API + a webhook fire to a
   consumer-configured URL would let an external app (Slack bot,
   approval dashboard, on-call paging) gate destructive tool calls
@@ -233,11 +271,6 @@ real consumer needs it, not speculatively.
   reconnects with `Idempotency-Key + Range: chunks=N-` and gets
   N+1 onward — is the missing piece. Same storage; one new endpoint
   shape. Closes the practical gap between "SSE" and "reliable SSE."
-
-- **`group_by=score_name` aggregate.** Built scoring sink lets graders
-  write back, but `/v1/traces/aggregates` doesn't yet group by score
-  name. Adding it lets a dashboard show "avg helpfulness across runs
-  in trace X" in one query. Pure SQL change; no new storage.
 
 ### Tier 2 — table stakes; ship when pain forces it
 
@@ -303,17 +336,6 @@ If any flip, aitelier becomes a worse version of something else.
 Below the directional roadmap: items a tooling-savvy operator will
 eventually need. Each is small in scope; they accumulate.
 
-- **`/livez` vs `/readyz` split.** `/v1/health` today returns `ok` or
-  `degraded`. Kubernetes-style probes want two distinct semantics:
-  `livez` (process is alive — never fails unless aitelier itself is
-  hung) and `readyz` (process can serve traffic — fails when LiteLLM
-  or SA is unreachable, so the load balancer pulls the pod). One new
-  cheap handler each.
-- **Drain mode on SIGTERM.** Today SIGTERM cancels in-flight runs.
-  Production rolling deploys want: stop accepting new runs, let
-  in-flight finish, exit cleanly. `_active_runs` is the registry to
-  drain against; add a `shutting_down` flag that `_reject_if_saturated`
-  honors and a bounded grace period in the lifespan.
 - **Audit log separate from `runs` / `run_events`.** Operator actions
   (API-key rotation, schedule create/delete, policy change) are not
   inference events. A separate `audit_log` table with a strict shape
@@ -329,11 +351,6 @@ eventually need. Each is small in scope; they accumulate.
   job that exercises "fresh checkout, fresh Postgres, fresh LiteLLM,
   full e2e" on every PR — catches integration regressions that the
   unit suite misses by construction.
-- **Multi-instance shared-state story.** If single-instance is the
-  commitment, document that. If horizontal scale is worth supporting,
-  the missing pieces are: sticky routing by `Idempotency-Key` (the DB
-  claim already exists), or moving the lock dict + `_active_runs` to
-  Redis. The decision is the scarce resource here, not the code.
 
 ## Deliberately out of scope
 

@@ -73,13 +73,15 @@ transports that emit a global toolset they can't suppress per-request.
 
 - `POST /v1/runs` — submit a long-running async agent; webhook on completion
 - `GET  /v1/runs[/{id}[/events[/stream]]]` — durable runs + append-only event timeline
+- `POST /v1/runs/{id}/replay[?model=X]` — re-dispatch a finalized run from its captured request body
 - `GET  /v1/runs/active`, `POST /v1/runs/{id}/cancel` — in-flight registry + cancel
 - `POST /v1/runs/{id}/wait` — block until a run reaches a terminal state
 - `POST /v1/runs/{id}/scores`, `GET /v1/runs/{id}/scores` — eval-framework scoring sink
 - `GET  /v1/runs/export` — NDJSON stream of full runs (with captured request_body) for backfill grading
 - `GET  /v1/traces[/{id}|/aggregates]` — trace queries + aggregates
 - `GET/POST/DELETE /v1/schedules*` — recurring or one-shot jobs
-- `GET  /v1/health`, `GET /v1/discovery`, `GET /v1/metrics` — liveness + endpoint inventory + dependency probes + runtime counters
+- `GET  /v1/health`, `GET /v1/livez`, `GET /v1/readyz` — dependency summary + process liveness + traffic readiness (503 when a dependency is unreachable, or while draining)
+- `GET  /v1/discovery`, `GET /v1/metrics` — endpoint inventory + dependency probes + runtime counters
 - `GET  /v1/schemas/{name}` — fetch a control-plane JSON Schema by name (also surfaced in `/v1/discovery`)
 - `GET  /ui` (+ `/` redirect) — read-only static dashboard over `/v1/runs*` + `/v1/traces/aggregates` (no build step; public path, data calls still gated)
 

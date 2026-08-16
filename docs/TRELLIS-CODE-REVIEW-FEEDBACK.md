@@ -1,242 +1,125 @@
 # Trellis code-review resolution record for Aitelier
 
-Date: 2026-08-07
+Date: 2026-08-15
 
-Verified against Aitelier `9ed53231842636285c24ad33401efcb6e33a233a`
+Findings raised against `da36c4b247d256b47d8ec44c4f6f2c246b905312`; resolutions verified
+independently against the working tree.
 
-Status: all five findings recorded below are resolved in the current code and
-covered by focused regressions. They are retained here as review/acceptance
-history rather than as an active backlog. The findings were independently
-checked after two retained Trellis persistent-lead reviews:
+Status: all three findings are resolved, each with a regression that fails before its fix.
+Two were re-scoped during independent verification — see the severity notes below. Retained
+as acceptance history rather than an active backlog.
 
-- `755ebd4b-7bfa-4692-a5fa-4df063de28ed` reviewed the main hardening commit
-  (27 files, 1,194 changed lines).
-- `d509c4f9-739b-407f-a297-7ae72486af3d` reviewed its follow-ups
-  (15 files, 393 changed lines).
+Review evidence:
 
-Both current Brig terminal handshakes pass: Claude Code `2.1.144` through adapter `0.36.1`,
-and Codex CLI `0.137.0` through `codex-acp` `0.16.0`. The active runtime defects below do
-not mean that those basic terminal turns are unavailable.
+- Trellis Run `e7aedf70-bc90-427b-ab29-171fec5da2ed` audited `core`, `docs`, and `sdks` read-only.
+- Three independent claim-verifier calls confirmed the findings below against immutable source
+  receipts.
+- The six-call Run exhausted its soft call budget before lead settlement. These are verified
+  partial findings, not a complete repository verdict.
 
-## Resolved P0 — ACP error detail could disclose an unlabelled credential
-
-### Problem
-
-`_acp_exception_text` appends `AcpError.data` to the consumer-visible error message. The
-three caller paths apply `scrub_error_text`, whose intentionally conservative contract only
-redacts named credentials and recognizable headers/query parameters. It does not redact a
-bare setup token, refresh token, or other high-entropy credential included in free-form ACP
-error data.
-
-That message can be persisted in the run row and returned through API errors, webhooks, and
-the terminal doctor probe. Preserving the backend diagnosis is useful, but JSON-RPC error
-data is an upstream trust boundary and needs the stronger treatment used for upstream
-provider bodies.
-
-### Verification
-
-A fake marker shaped as `sk-ant-oat01-...` was placed in `AcpError.data.message` and passed
-through `_error_result`. The complete marker survived in `error_msg`. The existing regression
-only covers `Authorization: Bearer ...`, so it does not exercise this path.
-
-### Required change
-
-- Apply structured redaction and the high-recall token/entropy scrubber to ACP error data
-  before it is concatenated, persisted, logged, or returned.
-- Retain useful non-secret text such as “refresh token was revoked.”
-- Do not create a second independent secret-pattern implementation; use the existing error
-  scrubbing boundary or factor one shared upstream-detail helper.
-
-### Acceptance criteria
-
-- Tests cover a bare `sk-*`/`sk-ant-oat*` marker, named refresh-token fields, nested/serialized
-  error data, authorization headers, and query-string credentials.
-- No tested secret appears in `error_msg`, stored run data, webhook payloads, doctor output,
-  or ordinary logs.
-- The non-secret backend diagnosis remains visible.
-
-Resolution: ACP errors now cross the shared `scrub_upstream_body` boundary before
-rendering. Regressions cover bare setup tokens, named refresh tokens, nested
-authorization data, and query credentials while retaining diagnosis text.
-
-## Resolved P1 — Streaming structured-output failure was emitted as success
+## Resolved (filed P0, assessed P2) — Webhook SSRF validation was disconnected from the connection
 
 ### Problem
 
-Structured-output validation can change a terminal aggregate to:
-
-```text
-status=error, finish_reason=error, error_type=SchemaViolation
-```
-
-`_build_done_event` still labels that aggregate as `type: done`. The SSE dispatcher sends
-every `done` event through `_stream_chunk_for_done`, which hard-codes the wire
-`finish_reason` to `stop`. The durable run therefore fails correctly while the streaming
-client receives a successful terminal chunk followed by `[DONE]`.
-
-This violates the rule that wire outcome and durable outcome describe the same terminal
-result.
-
-### Verification
-
-A focused reproduction passed a `done` event with `status=error` and
-`error_type=SchemaViolation` to `_stream_chunk_for_done`. It produced:
-
-```text
-wire finish_reason=stop
-durable status=error
-durable error_type=SchemaViolation
-```
-
-The event dispatcher has no branch that corrects this mismatch.
+`is_public_url` resolves the webhook hostname and checks those addresses. `_deliver_once` then asks
+the shared `httpx` client to post the original hostname, causing a separate DNS resolution. An
+attacker-controlled hostname can return a public address during validation and a private,
+loopback, link-local, or metadata-service address when the HTTP client connects. Revalidating at
+delivery time narrows the window but does not bind validation to the connection it authorizes.
 
 ### Required change
 
-Route an error-status terminal aggregate through the existing streaming error path, or emit
-an `error` event from the provider boundary when structured-output conformance fails. Do not
-send a success terminal chunk for the same result.
+Make the outbound connection use an address set that was validated for that attempt, while
+preserving the original hostname for TLS SNI and the HTTP Host header. Alternatively use a transport
+whose resolver rejects non-public connection targets at connect time. Keep redirects disabled, or
+validate and bind every redirect hop through the same mechanism.
 
 ### Acceptance criteria
 
-- A streaming `json_schema` or `json_object` conformance failure emits a typed
-  `SchemaViolation` error frame and no `finish_reason: stop` success chunk.
-- The run finalizes once as `failed`, with its raw content and recoverable parsed value
-  retained for diagnosis.
-- Successful `done` events retain the current OpenAI-compatible terminal shape and usage
-  projection.
-- Regression tests cover both the SSE body and the durable run state.
+- A test makes validation DNS return a public address and connection DNS return a private address;
+  no request reaches the private target.
+- Mixed public/private DNS answers fail closed.
+- HTTPS hostname verification and the original Host header remain correct.
+- Retry attempts repeat the complete resolution-and-connect policy rather than reusing stale trust.
 
-Resolution: structured-output aggregation now promotes conformance failures to
-typed `error` events. SSE emits `SchemaViolation` without a success terminal
-chunk, while durable results retain content, parsed data, and usage.
+Resolution: `security.resolve_public_target` resolves once per attempt and returns a validated
+literal address; `_deliver_once` connects to that address and carries the original name in the
+`Host` header and TLS SNI, so virtual hosting and certificate verification are unaffected. A mixed
+public/private answer set fails closed. Redirect following stays off by default.
 
-## Resolved P1 — Claude setup-token behavior was inconsistent across modes
+Severity note: filed P0, assessed P2 for this deployment model. Exploitation needs an
+authenticated caller *and* attacker-controlled low-TTL DNS, and yields a blind POST — the response
+body is never returned, only a status code is persisted, and no endpoint exposes
+`webhook_deliveries`. Worth fixing on the merits; not a P0 against a single-tenant gateway.
+
+## Resolved P1 — Relative workspace paths bypassed symlink-component validation
 
 ### Problem
 
-The quick-start contract says Claude agent and direct-model routes reuse the long-lived
-`claude-oauth-token`. `scripts/start.sh` reads that Brig secret and writes it to
-`docker/.env` as `ANTHROPIC_API_KEY`, which enables the direct LiteLLM route.
-
-When Sandbox Agent runs in host mode, a token loaded from the Brig secret is not exported as
-`CLAUDE_CODE_OAUTH_TOKEN` to the launched process. In Docker mode, the SA service mounts
-legacy `~/.claude` credentials but receives neither that variable nor a setup-token secret.
-Consequently direct Claude calls can work while `agent:claude/...` still depends on a
-different or stale login.
-
-The active Brig deployment is not affected: its cell already mounts `claude-oauth-token`,
-and its live Claude terminal handshake passes.
-
-### Verification
-
-- The credential materialization block scopes `setup_token` inside Python and only writes
-  `ANTHROPIC_API_KEY` to `docker/.env`.
-- The host `sandbox-agent server` launch has no setup-token environment assignment.
-- The Docker Compose SA service has no Claude setup-token environment/secret mapping.
+`validate_workspace_path` calls `_has_symlinked_component` only for absolute paths. Relative paths
+therefore skip the symlink walk entirely. With the default empty `allowed_workspace_roots`, a
+relative workspace, artifact fetch, or prepare-file path containing a symlinked component is handed
+to the agent even though the documented boundary says symlink-bearing prefixes are refused.
 
 ### Required change
 
-Choose and implement one truthful cross-mode contract. The preferred shape is to materialize
-the setup token once and pass it to Sandbox Agent through a mode-appropriate secret boundary:
-
-- host: `CLAUDE_CODE_OAUTH_TOKEN` scoped to the SA process;
-- Docker: a read-only secret/file consumed by the container entrypoint;
-- Brig: the existing `claude-oauth-token` secret mount.
-
-If host or Docker intentionally continue to use their own Claude CLI login instead, narrow
-the quick-start and doctor claims and report the two credential domains separately.
+Either reject relative agent paths, or resolve them against one explicit trusted base before applying
+the same component-by-component no-follow check and optional allowlist. Do not resolve relative
+paths against ambient process working directory without declaring that directory as authority.
 
 ### Acceptance criteria
 
-- With only the documented setup token configured, direct Claude and `agent:claude/...`
-  terminal probes pass in each advertised local deployment mode.
-- No setup token is printed, copied into an image layer, or exposed in generated diagnostics.
-- Mode-specific tests or probes fail clearly when the credential required by that mode is
-  absent or stale.
+- Relative paths with a symlinked prefix are rejected when the allowlist is empty and when it is set.
+- Ordinary relative paths have one documented, deterministic base or are rejected uniformly.
+- Workspace, artifact-fetch, and prepare-file inputs use the same rule.
+- Documentation does not imply protection against filesystem races or later agent-created symlinks.
 
-Resolution: `start.sh` materializes a mode-600 runtime secret. Host SA receives
-it only in its process environment, Docker SA through a read-only Compose secret
-and entrypoint, and Brig keeps its existing secret mount. Fingerprints trigger
-credential-aware host/Docker recreation without exposing the token.
+Resolution: relative agent paths are refused outright. The "resolve against a trusted base" option
+was discarded during verification: with `roots` set, the old code resolved relative paths against
+*aitelier's* working directory while Sandbox Agent resolves against its own, so the allowlist could
+both wrongly admit and wrongly reject. Absolute-only is the single rule that either check can
+actually answer for.
 
-## Resolved P2 — Inner-model discovery documentation contradicted the implementation
+## Resolved (filed P1, assessed P0) — Permission-policy exceptions failed open
 
 ### Problem
 
-`docs/INTEGRATION.md` first describes `aitelier_inner_llms` as the authoritative backend
-model list, then says it is not authoritative. Its backend table also says Codex and other
-non-Claude agents use `session/set_model`, while current code applies the backend-advertised
-model configuration option and uses `session/set_model` only as a legacy fallback.
+`AcpClient._respond_to_agent_request` defaults permission requests to allow. When a configured
+`permission_decider` raises, the exception handler logs the error and explicitly sets `allow = True`.
+A policy outage or bug therefore grants the tool action the policy was installed to control.
 
 ### Required change
 
-- State that `aitelier_inner_llms` is authoritative when the live probe provides it; omission
-  means capability state is unavailable, not that a hard-coded list becomes authoritative.
-- Describe advertised model configuration as the normal path and `session/set_model` as the
-  compatibility fallback.
-- Remove obsolete examples or warnings that imply a different routing path.
+When a configured decider fails, select a deny outcome and retain a bounded diagnostic. The existing
+default behavior when no decider is configured is a separate deployment-policy choice; it does not
+justify overriding a present but failed policy.
 
 ### Acceptance criteria
 
-- The model-discovery overview, backend table, selection section, and doctor guidance express
-  one consistent contract.
-- Documentation examples match a live `GET /v1/models?agent_backend=codex` response and the
-  tested configuration method.
+- A raising or cancelled permission decider returns a deny outcome and never an allow outcome.
+- The failure remains visible without leaking sensitive request data.
+- Explicit allow and explicit deny results remain unchanged.
+- Tests exercise the actual JSON-RPC permission response, not only a helper return value.
 
-Resolution: the guide now treats live `aitelier_inner_llms` as authoritative
-when present, documents advertised model configuration as the normal path, and
-uses the current live Codex model list.
+Resolution: an exception in a configured decider selects deny; cancellation answers the ask and
+then propagates; `_permission_tool_name` type-checks every candidate field so a malformed ask
+yields None; and an unnameable ask is denied whenever an allowlist is configured. Regressions cover
+the wire-level JSON-RPC response for all four paths, including the case where no reject option is
+offered and the outcome must be `cancelled` rather than a silent allow.
 
-## Resolved P2 — Brig deployment documentation described the obsolete topology
+Severity note: filed P1 as a policy-outage concern, assessed P0. The ask is agent-controlled, so a
+non-string tool name (`{"toolCall": {"name": 123}}`) reached `.split()` and the fail-open handler
+turned the resulting AttributeError into a grant — a `tool_allowlist` bypass reachable from the
+untrusted side, not merely a degraded-policy case.
 
-### Problem
+Correction to the filed acceptance criteria: the baseline test committed with this finding asserted
+`optionId == "deny"` against option fixtures using `kind: "deny"`. The selector matches ACP's real
+reject kinds (`reject_once` / `reject_always`), so that assertion could not have passed even after a
+correct fix. Fixtures now use ACP kinds.
 
-The integration guide recommends running Aitelier and Sandbox Agent in one Brig cell with
-ingress on port 7777. The implemented and tested deployment is different:
+## Rejected candidate
 
-- the Brig cell hosts only Sandbox Agent;
-- Aitelier runs outside the cell;
-- cell ingress forwards Sandbox Agent on port 2468; and
-- only agent-runtime credentials belong inside that cell.
-
-Following the obsolete text can expose the wrong service, mount unnecessary Aitelier secrets
-into the agent sandbox, and erase the intended ownership boundary.
-
-### Required change
-
-Rewrite the Brig deployment and deployment-test sections to match
-`docs/deploy/sandbox-agent.cell.yaml`, `scripts/cell-entrypoint.sh`, and the current shape
-tests. The guide should show Aitelier connecting to the cell's authenticated SA ingress,
-not running inside the cell.
-
-### Acceptance criteria
-
-- Every Brig example uses the SA-only cell, ingress port 2468, and external Aitelier service.
-- Secret and workspace mounts are assigned to the component that consumes them.
-- Narrative claims and deployment-shape tests agree on the same topology.
-
-Resolution: the guide now documents `mode = "brig"` as an SA-only cell with
-authenticated port-2468 ingress and host-side Aitelier; shape tests prevent the
-obsolete co-located topology from returning.
-
-## Verified non-findings
-
-### Immediate cancellation does not strand the acknowledged row
-
-The review claimed that a client could cancel the registered outer task before its coroutine
-started, leaving the precreated row `pending`. That scenario does not follow the public API
-scheduling boundary: the new task is queued before a client can receive the run ID and issue
-the follow-up request. Once the task begins, preparation and provider execution have terminal
-cancellation settlement.
-
-A live submit-immediate-cancel-wait reproduction reached `state=cancelled` in 192 ms with a
-canonical `Cancelled` result (run `d69e085a4f22a0c1f5cfd04ab0c9b8a1`). This finding is
-closed. A focused regression would still be useful protection, but there is no verified
-pending-row defect to fix.
-
-### Hard tool budgeting remains an advertised backend limitation
-
-Aitelier reports `aitelier_capabilities.hardToolBudget: false` because the selected backend
-does not expose an enforceable work budget or synthesis reserve. Prompt guidance is not
-misrepresented as enforcement. Implementing the backend capability remains useful future
-work, but it is not an unaddressed correctness claim in Aitelier.
+The discovery lead also proposed redirect-based webhook SSRF. The shared `httpx.AsyncClient` does
+not enable redirect following, so the current source does not establish that defect. Keep redirect
+following disabled explicitly or apply the connection-bound SSRF policy to every hop if redirects
+are introduced; no separate open finding is recorded here.

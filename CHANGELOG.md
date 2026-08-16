@@ -7,7 +7,114 @@ relevant section.
 
 ## Unreleased
 
-_Nothing yet._
+### Security
+
+- **Webhook delivery is bound to the address it validated.** The SSRF guard
+  used to resolve the hostname, then hand that same hostname to the HTTP
+  client, which resolved it again — a DNS-rebinding window where the check
+  and the connection could land on different addresses. `resolve_public_target`
+  now returns a validated literal address; delivery connects to it and carries
+  the original name in the `Host` header and TLS SNI so virtual hosting and
+  certificate verification are unaffected. A mixed public/private answer set
+  fails closed.
+- **A configured permission policy that cannot decide now denies.** An
+  exception inside a `tool_allowlist` decider previously fell through to
+  *allow*. Because the ask is agent-controlled, a malformed tool name (any
+  non-string) reached a `.split()` and turned into a grant — an allowlist
+  bypass rather than only a policy-outage concern. Exceptions deny, cancellation
+  answers the ask and then propagates, and an unnameable ask is denied whenever
+  an allowlist is configured.
+- **Relative agent paths are refused.** `aitelier.workspace`,
+  `aitelier.artifacts.fetch[*]`, and `aitelier.prepare.files[*].path` skipped
+  the symlink walk when relative, and the allowlist check resolved them against
+  aitelier's working directory rather than the agent's. Both checks now have a
+  declared base or the path is rejected.
+- **ACP error detail is scrubbed before truncation.** The ACP path truncated
+  upstream detail at 2000 characters and scrubbed afterwards, leaving a
+  plaintext credential prefix when a secret straddled the cutoff. Both upstream
+  boundaries now share `errors.scrubbed_preview`, which scans past the emitted
+  cutoff.
+
+### Added
+
+- **`POST /v1/runs/{id}/replay[?model=X]`** — re-dispatch a finalized run from
+  its captured `request_body`. Replayed verbatim apart from an optional model
+  override, so a comparison against the parent isolates one variable. Links
+  back via `aitelier.parent_run_id` and dispatches on the same async path as
+  `POST /v1/runs`. 404 unknown run, 409 not yet finalized, 422 no captured body
+  (rows predating storage migration v4).
+- **`GET /v1/traces/aggregates?group_by=score_name`** — rolls up graded runs by
+  score name with `avg_value` per group. `count` is distinct graded runs;
+  ungraded runs appear in no group and no total. Implemented in both stores with
+  a cross-store parity test.
+- **`GET /v1/livez` and `GET /v1/readyz`** — Kubernetes-style probe split.
+  `livez` answers for the process alone and never fails for a dependency outage
+  or during drain. `readyz` returns 503 when a tracked dependency is
+  unreachable, probing live and reusing the discovery TTL cache so polling stays
+  cheap. Its draining branch is defence in depth rather than the main signal:
+  the lifespan shutdown hook runs after the server has stopped accepting
+  connections, so a peer sees the socket close first. `/v1/health` is unchanged.
+- **Drain on shutdown.** Shutdown stops the schedule/webhook/purge workers,
+  refuses new work, waits up to `service.drain_timeout_s` (default 30s) for
+  in-flight runs to finish, then cancels whatever remains. The wait re-derives
+  the in-flight set each pass rather than reusing one snapshot, so a run
+  registered mid-drain is still awaited instead of being abandoned as a stuck
+  `running` row. Previously every in-flight run was cancelled immediately.
+- SDK parity for both additions: `replay_run` / `replayRun` / the `replay_run`
+  MCP tool, and `avg_value` on aggregate buckets (`traces_aggregate.schema.json`
+  gained `score_name` and the optional field; Python models regenerated,
+  TypeScript types updated by hand).
+- Supervised deployment via process-compose (`scripts/supervise.sh` +
+  `docs/deploy/process-compose.md`), replacing the launchd story.
+- `make backup` / `make restore` with a retention-pruned dump directory and the
+  `docs/deploy/backup-restore.md` runbook.
+- Brig deployment shape: a Sandbox-Agent-only cell with authenticated port-2468
+  ingress (`docs/deploy/sandbox-agent.cell.yaml`), aitelier running outside it.
+- `AGENTS.md` contributor guidance and a `trellis.project.json` validation
+  profile.
+
+### Changed
+
+- Claude credentials are materialized once by `scripts/materialize_credentials.py`
+  into a mode-600 runtime secret, delivered per deployment mode (host process
+  env, Docker read-only secret, Brig secret mount). Nothing prints a token.
+- Inner-agent session config follows the backend-advertised configuration
+  option; `session/set_model` is now only a compatibility fallback.
+- Upstream error redaction is bounded: previews scan a fixed window past their
+  cutoff instead of scrubbing an unbounded provider body.
+- `/v1/discovery` enumerates router endpoints under newer FastAPI's
+  `_IncludedRouter`.
+- `aitelier-mcp` constrains the compatible MCP SDK major version.
+
+### Fixed
+
+- Streaming structured-output conformance failures emit a typed
+  `SchemaViolation` error frame instead of a `finish_reason: stop` success
+  chunk that contradicted the durable run state.
+- LLM-stream saturation-cap bypass and the async-run registry leak.
+- `make status` probes the real Sandbox Agent endpoint and reports agent login
+  health.
+- Agent readiness errors surface the actionable cause rather than a generic
+  failure.
+- The cross-store aggregate parity test scopes its comparison to the rows it
+  seeds; it previously compared global rollups and failed against any populated
+  database.
+- **The Postgres-gated test suite no longer orphans live runs.**
+  `test_postgres_update_run_sandbox_and_orphan_sweep` exercises the startup
+  sweep, which is global by design — so running `make test-py` against the same
+  database as a running service silently flipped that service's in-flight runs
+  to `orphaned` mid-execution. The test now captures and restores rows it
+  doesn't own.
+- Reusing an `Idempotency-Key` for a *different* operation is now refused with
+  422 instead of silently returning the first operation's response. The record's
+  `endpoint` was written but never compared, so only a differing request body was
+  caught — and a replay carries no body, which made two replays of different
+  runs (or of the same run with different `?model=`) hash identically.
+- `scripts/stop.sh` derives its SIGTERM grace period from
+  `[service] drain_timeout_s` instead of a fixed 5s. With the drain window at
+  30s the old constant escalated to SIGKILL mid-drain, which defeated draining
+  and could strand a process holding port 7777 with its PID file already
+  removed.
 
 ## 0.1.0 — 2026-06-23
 

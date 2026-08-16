@@ -622,6 +622,38 @@ SDK methods: `Aitelier.wait_for_run(run_id, timeout=…)` (Python) and
 you submitted async via `POST /v1/runs` and don't want to stand up a
 webhook receiver.
 
+### `POST /v1/runs/{run_id}/replay[?model=…]`
+
+Re-dispatch a finalized run from the `request_body` captured on it. The
+captured body *is* the replay input, replayed verbatim apart from an
+optional `?model=` override, so a comparison against the parent isolates
+exactly one variable. That is the eval workflow: run once, grade, replay
+against another model, compare by `parent_run_id`.
+
+```bash
+curl -X POST "$AITELIER/v1/runs/$RUN_ID/replay?model=agent:codex/gpt-5.4"
+# {"run_id": "...", "status": "accepted", "parent_run_id": "<RUN_ID>",
+#  "model": "agent:codex/gpt-5.4", "correlation_id": "..."}
+```
+
+Dispatch is async, on the same path as `POST /v1/runs` — agent runs are
+long, so you get an id rather than a blocked connection. The new run
+links back via `aitelier.parent_run_id`, so
+`GET /v1/runs?parent_run_id=<id>` lists every replay of a run.
+
+`stream` and `stream_options` are dropped from the captured body: they
+describe how the original response was delivered, not the run itself,
+and a replay always dispatches asynchronously.
+
+Failure modes:
+
+| Status | Meaning |
+|---|---|
+| 404 | No such run. |
+| 409 | The run hasn't finalized. Replaying it would compare against a moving target — wait via `POST /v1/runs/{id}/wait`. |
+| 422 | No captured request body. The run predates storage migration v4, or its captured body is no longer a valid run request. |
+| 400 | The captured body names a non-agent model. `/v1/runs` is agent-only. |
+
 ### `POST /v1/runs/{run_id}/cancel`
 
 Cancel an in-flight run by ID. Returns `{run_id, cancelled: true}` on
@@ -709,8 +741,16 @@ Filters mirror `GET /v1/runs` (`since`, `until`, `trace_tag`, `kind`,
 
 Trace-record summaries of runs (a narrower projection focused on
 observability: model, kind, tokens, cost, status, error_type). The
-`aggregates` endpoint groups by model, kind, or status for at-a-glance
-dashboards.
+`aggregates` endpoint groups by `trace_tag`, `kind`, `model`,
+`agent_id`, `status`, `error_type`, or `day` for at-a-glance dashboards.
+
+`group_by=score_name` is the odd one out: it rolls up only the runs that
+carry a score, keyed by score name, and adds `avg_value` to each bucket.
+`count` is the number of distinct *graded* runs, while `avg_value`
+averages every score row behind them — so a run graded twice under one
+name counts once but contributes both values. Ungraded runs appear in no
+bucket and in no total. This is the one query behind "average
+helpfulness across runs in trace X".
 
 ### `/v1/schedules*`
 
@@ -747,6 +787,20 @@ Failures route through the durable webhook worker (see
 `/v1/health` is liveness only — does the process answer HTTP. No
 dependency probing, no caching needed. Cheap enough for k8s liveness
 probes on a tight cadence. Public (no auth required even in hosted mode).
+
+`/v1/livez` and `/v1/readyz` are the Kubernetes-style split, for
+orchestrators that want the two semantics separately:
+
+- **`/v1/livez`** answers for the process alone. It never fails for a
+  dependency outage or during drain — a restart fixes neither, so
+  failing here would only make things worse. Point your liveness probe
+  at it.
+- **`/v1/readyz`** answers "should this process receive traffic". 503
+  when a tracked dependency is unreachable, probed live and sharing the
+  discovery TTL cache so a polling probe stays cheap. It also 503s while
+  draining, though that is defence in depth rather than the main signal:
+  by the time shutdown begins the server has stopped accepting
+  connections, so a peer sees the socket close first.
 
 `/v1/discovery` is the runtime source of truth: endpoint inventory, live
 dependency probes (LiteLLM, Sandbox Agent, traces), per-model
@@ -1248,10 +1302,20 @@ re-submissions safe.
 
 ## Idempotency
 
-`POST /v1/chat/completions` (agent path) and `POST /v1/runs` accept
-`Idempotency-Key: <uuid>` headers. On replay with the same key + body,
-aitelier returns the cached response (24h window). On the same key with a
-different body, 422.
+`POST /v1/chat/completions` (agent path), `POST /v1/runs`, and
+`POST /v1/runs/{id}/replay` accept `Idempotency-Key: <uuid>` headers. On
+retry with the same key for the same operation, aitelier returns the
+cached response (24h window).
+
+**A key names one operation.** Reusing it for a different one is 422,
+never a cached response for work you didn't ask for. Two things define
+the operation: the request body, and the endpoint scope. The scope
+matters because an operation can be identified by its URL rather than
+its body — a replay carries no body at all, so without it every replay
+would hash identically and the second caller would receive the first
+caller's run. A replay's scope covers both the source run and the
+`?model=` override, so sweeping one parent across models needs a fresh
+key per model.
 
 **Streaming is covered.** When `stream: true` plus an `Idempotency-Key`
 header, aitelier records the SSE chunks on successful completion and
@@ -1401,11 +1465,15 @@ allowed_workspace_roots = ["/var/lib/aitelier/workspaces"]
 on every agent-path call:
 
 - **`..` components are refused** regardless of resolved location.
-- **Symlinked components are refused** when the path is absolute.
-  Stops the trivial "consumer hands aitelier a workspace that points
-  through a symlink to `/etc`" vector. Once the path is resolved on
-  dispatch, every component (including the leaf) must be a real
-  directory or file.
+- **Relative paths are refused.** A relative path would be resolved
+  against aitelier's working directory, which is not the directory
+  Sandbox Agent resolves against, so neither the symlink walk nor the
+  allowlist could answer for the path the agent actually opens. Pass an
+  absolute path.
+- **Symlinked components are refused.** Stops the trivial "consumer
+  hands aitelier a workspace that points through a symlink to `/etc`"
+  vector. Once the path is resolved on dispatch, every component
+  (including the leaf) must be a real directory or file.
 - **Allowlist** (`service.allowed_workspace_roots`) — when set, the
   resolved path must be a descendant of one of the listed roots. For
   brig-cell deployments, set this to the cell's workspace mount root
@@ -1648,6 +1716,7 @@ tool semantics, embeddings, model listing.
 | `list_run_events` / `listRunEvents` | `GET /v1/runs/{id}/events` |
 | `stream_run_events` / `streamRunEvents` | `GET /v1/runs/{id}/events/stream` (SSE) |
 | `wait_for_run` / `waitForRun` | `POST /v1/runs/{id}/wait` |
+| `replay_run` / `replayRun` | `POST /v1/runs/{id}/replay` |
 | `add_run_score` / `addRunScore` | `POST /v1/runs/{id}/scores` |
 | `list_run_scores` / `listRunScores` | `GET /v1/runs/{id}/scores` |
 | `export_runs` / `exportRuns` | `GET /v1/runs/export` (NDJSON) |
