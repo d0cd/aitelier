@@ -23,7 +23,12 @@ import time
 from typing import Any
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error, scrub_error_text, scrub_upstream_body
+from aitelier.errors import (
+    classify_error,
+    scrub_error_text,
+    scrub_upstream_body,
+    scrubbed_preview,
+)
 from aitelier.openai_compat import parse_unique_json
 from aitelier.pricing import compute_cost
 from aitelier.providers.acp_transport import (
@@ -39,6 +44,8 @@ from aitelier.providers.acp_transport import (
 )
 
 logger = logging.getLogger("aitelier.sandbox_agent")
+
+_ACP_DETAIL_PREVIEW_LIMIT = 2000
 
 # Transport layer (AcpClient, AcpError, url scrubber, preflight warnings,
 # run-row stamping) lives in `acp_transport.py`. Imported above so existing
@@ -66,7 +73,8 @@ def _acp_exception_text(exc: Exception) -> str:
         detail = exc.data["message"]
     else:
         detail = json.dumps(exc.data, default=str, sort_keys=True)
-    return scrub_upstream_body(f"{text}: {detail[:2000]}")
+    preview = scrubbed_preview(detail, limit=_ACP_DETAIL_PREVIEW_LIMIT)
+    return f"{scrub_upstream_body(text)}: {preview}"
 
 
 class _RunEventEmitter:
@@ -99,13 +107,21 @@ class _RunEventEmitter:
 
 
 def _permission_tool_name(params: dict) -> str | None:
-    """Extract the requested tool's name from a `session/request_permission`."""
+    """Extract the requested tool's name from a `session/request_permission`.
+
+    The ask is agent-controlled, so every candidate field is type-checked: a
+    non-string name yields None (unnameable) rather than a value the allowlist
+    comparison would choke on."""
     tc = params.get("toolCall") or params.get("tool_call") or {}
     if isinstance(tc, dict):
         name = tc.get("title") or tc.get("name") or tc.get("toolName") or tc.get("kind")
-        if name:
+        if isinstance(name, str) and name:
             return name
-    return params.get("tool") or params.get("name")
+    for key in ("tool", "name"):
+        value = params.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
 
 
 def _tool_base_name(name: str) -> str:
@@ -122,16 +138,22 @@ def _make_permission_decider(tool_allowlist: list[str] | None, emitter):
     isn't on the list is denied and a `tool_denied` event emitted. Matching is
     deliberately coarse (base name, not claude's full arg patterns) — a
     defense-in-depth gate complementing the backend's own enforcement, not a
-    re-implementation of its pattern syntax. A tool we can't name is allowed
-    (we won't block what we can't identify)."""
+    re-implementation of its pattern syntax. With no allowlist configured a
+    tool we can't name is allowed; with one configured it is denied, since an
+    unnameable ask cannot be shown to be on the list and the ask itself is
+    agent-controlled."""
     allowed = ({_tool_base_name(t) for t in tool_allowlist}
                if tool_allowlist else None)
 
     async def decide(params: dict) -> bool:
         tool = _permission_tool_name(params)
         await emitter.emit("permission_request", {"tool": tool})
-        if allowed is None or tool is None:
+        if allowed is None:
             return True
+        if tool is None:
+            await emitter.emit("tool_denied",
+                               {"tool": None, "reason": "unnameable tool ask"})
+            return False
         if _tool_base_name(tool) in allowed:
             return True
         await emitter.emit("tool_denied",

@@ -159,3 +159,37 @@ def test_bearer_compare_is_timing_safe(client):
         assert good.status_code == 200
     finally:
         cfg.service.api_key = None
+
+
+def test_pinned_target_brackets_ipv6_host_header(monkeypatch):
+    """RFC 7230 requires an IPv6 host to be bracketed in the Host header.
+    `parsed.hostname` has already stripped them, so rebuilding from it alone
+    yields an address whose port is ambiguous with its own colons."""
+    from aitelier.security import _pinned_target_sync
+
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [(30, 1, 6, "", ("2606:4700::1111", port or 443))],
+    )
+
+    target = _pinned_target_sync("https://[2606:4700:4700::1111]:8443/hook")
+
+    assert target is not None
+    assert target.host_header == "[2606:4700:4700::1111]:8443"
+
+
+def test_pinned_target_preserves_url_userinfo(monkeypatch):
+    """httpx derives Basic auth from the URL's userinfo, so dropping it when
+    rebuilding the netloc silently sends credentialed webhooks unauthenticated."""
+    from aitelier.security import _pinned_target_sync
+
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [(2, 1, 6, "", ("93.184.216.34", port or 443))],
+    )
+
+    target = _pinned_target_sync("https://svc:s3cret@hooks.example.com/aitelier")
+
+    assert target is not None
+    assert target.url.startswith("https://svc:s3cret@93.184.216.34/")
+    assert target.host_header == "hooks.example.com"

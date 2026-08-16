@@ -46,19 +46,19 @@ async def _deliver_once(delivery) -> None:
     """Try one delivery. Updates state via store.record_webhook_attempt."""
     from aitelier.config import get_config
     from aitelier.providers.llm import get_shared_client
-    from aitelier.security import is_public_url
+    from aitelier.security import resolve_public_target
     from aitelier.storage import get_store
 
     status_code: int | None = None
     error: str | None = None
 
-    # Re-validate the URL at delivery time, not just at enqueue time.
-    # An operator may have flipped `allow_loopback_webhooks` off after
-    # the row was queued, or DNS may have rebinding-shifted what the
-    # hostname resolves to. If the URL no longer passes the SSRF guard,
-    # mark this delivery failed instead of firing the request.
+    # Resolve once per attempt and connect to the address that resolution
+    # approved. Re-checking at delivery time also catches an operator flipping
+    # `allow_loopback_webhooks` off after the row was queued.
+    target = None
     if not get_config().service.allow_loopback_webhooks:
-        if not await is_public_url(delivery.url):
+        target = await resolve_public_target(delivery.url)
+        if target is None:
             store = await get_store()
             await store.record_webhook_attempt(
                 delivery.id, status_code=None,
@@ -92,12 +92,22 @@ async def _deliver_once(delivery) -> None:
     if secret:
         headers["Authorization"] = f"Bearer {secret}"
 
+    # Preserve the original name for virtual hosting and TLS verification even
+    # though the connection is aimed at the validated literal address.
+    post_url = delivery.url
+    extensions: dict[str, str] = {}
+    if target is not None:
+        post_url = target.url
+        headers["Host"] = target.host_header
+        extensions["sni_hostname"] = target.sni_hostname
+
     try:
         client = await get_shared_client()
         resp = await client.post(
-            delivery.url,
+            post_url,
             content=body_bytes,
             headers=headers,
+            extensions=extensions,
             timeout=10.0,
         )
         status_code = resp.status_code

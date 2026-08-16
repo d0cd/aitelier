@@ -247,6 +247,9 @@ def scrub_error_text(message: str) -> str:
 _ENTROPY_MIN_LEN = 16
 _ENTROPY_MIN_BITS = 4.0
 
+# How far past an emitted preview's cutoff `scrubbed_preview` keeps scanning.
+_SECRET_SCAN_PADDING = 4096
+
 # A token-ish run in free text: starts alnum, ≥12 chars of credential charset.
 _TOKEN_RUN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_\-+/=.]{11,}")
 
@@ -282,6 +285,18 @@ def _looks_secret(token: str) -> bool:
         return True
     return (len(token) >= _ENTROPY_MIN_LEN
             and _shannon_entropy(token) >= _ENTROPY_MIN_BITS)
+
+
+def scrubbed_preview(detail: str, *, limit: int) -> str:
+    """Return a bounded, scrubbed prefix of an upstream detail string.
+
+    Scans past the emitted cutoff so a credential straddling `limit` is still
+    recognized before truncation; bounding the scan keeps a hostile
+    multi-megabyte body from turning error rendering into avoidable latency.
+    Every upstream boundary that emits a preview goes through here so there is
+    one credential-pattern implementation, not one per transport.
+    """
+    return scrub_upstream_body(detail[:limit + _SECRET_SCAN_PADDING])[:limit]
 
 
 def scrub_upstream_body(body: str) -> str:

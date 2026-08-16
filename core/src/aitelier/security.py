@@ -7,8 +7,9 @@ import ipaddress
 import os
 import re
 import socket
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from fastapi import HTTPException
 
@@ -75,11 +76,15 @@ def validate_workspace_path(
 
       1. `..` ban — refuses relative traversal regardless of resolved
          location.
-      2. Symlink check — if any component of the path is a symlink, the
+      2. Absolute-only — a relative path would be resolved against aitelier's
+         working directory, which is not the directory Sandbox Agent resolves
+         against, so neither of the checks below could answer for the path the
+         agent actually opens. Refused rather than silently reinterpreted.
+      3. Symlink check — if any component of the path is a symlink, the
          path is refused. brig's mount-side `nosymfollow` will eventually
          close this at the kernel level; until then, this is the consumer-
          side defense that brig's safe_open API expects.
-      3. Allowlist — when `roots` is set (`service.allowed_workspace_roots`),
+      4. Allowlist — when `roots` is set (`service.allowed_workspace_roots`),
          the resolved path must be a descendant of one of them. Empty list
          = no allowlist (current behavior).
 
@@ -97,7 +102,16 @@ def validate_workspace_path(
             detail=f"Invalid {label}: '..' path components not allowed",
         )
     path = Path(value)
-    if path.is_absolute() and _has_symlinked_component(path):
+    if not path.is_absolute():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {label}: must be an absolute path. Relative paths "
+                "resolve against aitelier's working directory, not the "
+                "agent's, so they cannot be validated."
+            ),
+        )
+    if _has_symlinked_component(path):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -139,23 +153,97 @@ def _is_public_addr(addr: str) -> bool:
     )
 
 
-def _public_url_sync(url: str) -> bool:
-    """Synchronous version. Performs blocking DNS — see `is_public_url`
+@dataclass(frozen=True)
+class PinnedTarget:
+    """A validated connection target for one outbound attempt.
+
+    `url` addresses a literal IP that passed the public-address check, so the
+    connection cannot land somewhere else via a second DNS answer. `host_header`
+    and `sni_hostname` carry the original name so virtual hosting and
+    certificate verification still work.
+    """
+
+    url: str
+    host_header: str
+    sni_hostname: str
+
+
+def _pinned_target_sync(url: str) -> PinnedTarget | None:
+    """Synchronous version. Performs blocking DNS — see `resolve_public_target`
     for the async wrapper that callers in an event loop should use."""
     try:
         parsed = urlparse(url)
     except ValueError:
-        return False
+        return None
     if parsed.scheme not in ("http", "https"):
-        return False
+        return None
     host = parsed.hostname
     if not host:
-        return False
+        return None
     try:
-        infos = socket.getaddrinfo(host, None)
+        port = parsed.port
+    except ValueError:
+        return None
+    try:
+        infos = socket.getaddrinfo(host, port)
     except OSError:
-        return False
-    return all(_is_public_addr(info[4][0]) for info in infos)
+        return None
+
+    addresses = [info[4][0] for info in infos]
+    if not addresses or not all(_is_public_addr(addr) for addr in addresses):
+        return None
+
+    literal = addresses[0]
+    if ipaddress.ip_address(literal).version == 6:
+        literal = f"[{literal}]"
+
+    # `parsed.hostname` lowercases and strips IPv6 brackets, so the Host header
+    # is rebuilt with brackets restored — RFC 7230 requires them, and without
+    # them the port is ambiguous with the address's own colons.
+    display_host = host
+    try:
+        if ipaddress.ip_address(host).version == 6:
+            display_host = f"[{host}]"
+    except ValueError:
+        pass
+    original = display_host if port is None else f"{display_host}:{port}"
+
+    # Userinfo has to survive the rewrite: httpx derives Basic auth solely from
+    # the URL's username/password, so dropping it sends a credentialed webhook
+    # unauthenticated.
+    authority = literal if port is None else f"{literal}:{port}"
+    if parsed.username is not None:
+        credentials = parsed.username
+        if parsed.password is not None:
+            credentials = f"{credentials}:{parsed.password}"
+        authority = f"{credentials}@{authority}"
+
+    return PinnedTarget(
+        url=urlunparse(parsed._replace(netloc=authority)),
+        host_header=original,
+        sni_hostname=host,
+    )
+
+
+async def resolve_public_target(url: str) -> PinnedTarget | None:
+    """Resolve `url` to a connection target whose address is known public.
+
+    Returns None when the scheme is unsupported, resolution fails, or *any*
+    resolved address is non-public — a mixed answer set fails closed rather
+    than cherry-picking the public entry.
+
+    Callers must connect to the returned `url` rather than the original one.
+    Validating a hostname and then handing that same hostname to an HTTP client
+    leaves a window where DNS answers public for the check and private for the
+    connect.
+    """
+    return await asyncio.to_thread(_pinned_target_sync, url)
+
+
+def _public_url_sync(url: str) -> bool:
+    """Synchronous version. Performs blocking DNS — see `is_public_url`
+    for the async wrapper that callers in an event loop should use."""
+    return _pinned_target_sync(url) is not None
 
 
 async def is_public_url(url: str) -> bool:

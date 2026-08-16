@@ -8,13 +8,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from aitelier.errors import scrubbed_preview
 from aitelier.providers.llm import (
     LLMError,
     UnsupportedResponseFormat,
     _apply_response_format_gates,
     _safe_connect_message,
     _safe_upstream_message,
-    _scrubbed_preview,
     _wants_anthropic_prompt_caching,
     chat_completion,
     chat_completion_stream,
@@ -92,19 +92,19 @@ def test_safe_connect_message_scrubs_warning_log(caplog):
 def test_scrubbed_preview_catches_boundary_secret_without_scanning_full_body(
     monkeypatch,
 ):
-    import aitelier.providers.llm as llm
+    import aitelier.errors as errors
 
     secret = "sk-proj-AB12CD34EF56GH78IJ90KL12MN34OP56"
     body = "x" * 475 + " key " + secret + "z" * 1_000_000
     scanned_lengths = []
-    real_scrubber = llm.scrub_upstream_body
+    real_scrubber = errors.scrub_upstream_body
 
     def capture_scan(value):
         scanned_lengths.append(len(value))
         return real_scrubber(value)
 
-    monkeypatch.setattr(llm, "scrub_upstream_body", capture_scan)
-    preview = _scrubbed_preview(body, limit=500)
+    monkeypatch.setattr(errors, "scrub_upstream_body", capture_scan)
+    preview = scrubbed_preview(body, limit=500)
 
     assert secret not in preview
     assert "[redacted]" in preview

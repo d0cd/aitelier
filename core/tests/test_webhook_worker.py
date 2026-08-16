@@ -21,11 +21,11 @@ def _bypass_ssrf_check(monkeypatch):
     """Webhook-worker tests target delivery logic (retry, signing,
     state-machine transitions) rather than the SSRF guard's behavior.
     Force the guard to pass so the placeholder `https://example/` URLs
-    these tests use don't get rejected for DNS-resolution failure."""
-    async def _always_public(_url):
-        return True
-    monkeypatch.setattr("aitelier.webhook_worker.is_public_url", _always_public, raising=False)
-    monkeypatch.setattr("aitelier.security.is_public_url", _always_public)
+    these tests use resolve to a public address instead of failing DNS."""
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [(2, 1, 6, "", ("93.184.216.34", port or 443))],
+    )
 
 
 @pytest.mark.asyncio
@@ -201,6 +201,76 @@ async def test_worker_attaches_bearer_header_the_sdk_verifier_accepts(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_delivery_posts_to_validated_address_not_the_hostname(monkeypatch):
+    """The connection target must be an address that was validated for this
+    attempt. Posting the hostname would let DNS answer differently between the
+    check and the connect."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "aitelier.config.get_config",
+        lambda: SimpleNamespace(service=SimpleNamespace(
+            webhook_secret=None, allow_loopback_webhooks=False)),
+    )
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 443))],
+    )
+
+    store = await get_store()
+    wid = await store.enqueue_webhook("https://receiver.test/hook", {"x": 1})
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=_mock_http_response(200))
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+        await wh._worker_tick()
+
+    call = fake_client.post.await_args
+    assert call.args[0] == "https://93.184.216.34/hook"
+    assert call.kwargs["headers"]["Host"] == "receiver.test"
+    assert call.kwargs["extensions"]["sni_hostname"] == "receiver.test"
+    assert store._webhooks[wid].state == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_mixed_public_and_private_dns_answers_fail_closed(monkeypatch):
+    """One private address in the answer set poisons the whole resolution."""
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "aitelier.config.get_config",
+        lambda: SimpleNamespace(service=SimpleNamespace(
+            webhook_secret=None, allow_loopback_webhooks=False)),
+    )
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("169.254.169.254", 443)),
+        ],
+    )
+
+    store = await get_store()
+    wid = await store.enqueue_webhook("https://rebind.test/hook", {"x": 1})
+
+    fake_client = MagicMock()
+    fake_client.post = AsyncMock(return_value=_mock_http_response(200))
+
+    async def fake_get_shared():
+        return fake_client
+
+    with patch("aitelier.providers.llm.get_shared_client", side_effect=fake_get_shared):
+        await wh._worker_tick()
+
+    assert fake_client.post.await_count == 0
+    assert store._webhooks[wid].state == "failed"
+
+
+@pytest.mark.asyncio
 async def test_delivery_time_ssrf_rejection_marks_failed(monkeypatch):
     """If the URL no longer resolves public at delivery time (DNS rebinding, or
     the operator flipped allow_loopback_webhooks off after enqueue), the
@@ -213,11 +283,11 @@ async def test_delivery_time_ssrf_rejection_marks_failed(monkeypatch):
             webhook_secret=None, allow_loopback_webhooks=False)),
     )
 
-    async def _not_public(_url):
-        return False
-
-    # Override the autouse bypass for this test only.
-    monkeypatch.setattr("aitelier.security.is_public_url", _not_public)
+    # Override the autouse public answer for this test only.
+    monkeypatch.setattr(
+        "aitelier.security.socket.getaddrinfo",
+        lambda host, port, *a, **k: [(2, 1, 6, "", ("127.0.0.1", port or 443))],
+    )
 
     store = await get_store()
     url = "https://internal-after-rebind/hook"

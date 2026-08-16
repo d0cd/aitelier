@@ -26,13 +26,12 @@ from typing import Any
 import httpx
 
 from aitelier.config import get_config
-from aitelier.errors import classify_error, scrub_upstream_body
+from aitelier.errors import classify_error, scrubbed_preview
 
 logger = logging.getLogger("aitelier.llm")
 
 _UPSTREAM_BODY_PREVIEW_LIMIT = 500
 _TRANSPORT_DETAIL_PREVIEW_LIMIT = 2000
-_SECRET_SCAN_PADDING = 4096
 
 # Per-provider response_format support. Used to soft-fall-back for `json_object`
 # (intent: "give me JSON" — a system-prompt directive substitutes well) and to
@@ -235,18 +234,6 @@ def _classify_llm_status(status: int) -> str:
     return "ProviderError"
 
 
-def _scrubbed_preview(detail: str, *, limit: int) -> str:
-    """Return a bounded, scrubbed prefix suitable for ordinary logs.
-
-    Scan beyond the emitted prefix so a credential crossing ``limit`` is
-    still recognized before truncation. Bounding the scan prevents a hostile
-    multi-megabyte provider body from turning error rendering into avoidable
-    latency; the shared scrubber remains the only credential-pattern source.
-    """
-    scan_limit = limit + _SECRET_SCAN_PADDING
-    return scrub_upstream_body(detail[:scan_limit])[:limit]
-
-
 def _safe_connect_message(exc: BaseException) -> str:
     """Sanitize a transport-layer failure (DNS, connect, read timeout).
 
@@ -256,7 +243,7 @@ def _safe_connect_message(exc: BaseException) -> str:
     operator log keeps the scrubbed diagnosis, never the raw exception.
     """
     cls = type(exc).__name__
-    safe_detail = _scrubbed_preview(
+    safe_detail = scrubbed_preview(
         str(exc), limit=_TRANSPORT_DETAIL_PREVIEW_LIMIT,
     )
     logger.warning("LLM transport failure: %s: %s", cls, safe_detail)
@@ -283,7 +270,7 @@ def _safe_upstream_message(status: int, resp: httpx.Response) -> str:
         return f"{canonical} (HTTP {status})"
     # Scan past the emitted cutoff before truncating so a credential crossing
     # the preview boundary cannot leave a short, unrecognizable fragment.
-    body_preview = _scrubbed_preview(
+    body_preview = scrubbed_preview(
         resp.text, limit=_UPSTREAM_BODY_PREVIEW_LIMIT,
     )
     logger.warning(

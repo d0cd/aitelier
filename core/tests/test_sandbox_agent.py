@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,6 +12,8 @@ from aitelier.providers.sandbox_agent import (
     AcpError,
     _adapt_mcp_servers,
     _aggregate_result,
+    _make_permission_decider,
+    _RunEventEmitter,
     _translate_note,
     call_via_sandbox,
 )
@@ -152,6 +155,20 @@ def test_error_result_aggressively_scrubs_all_acp_error_data(data):
     assert "Internal error" in result["error_msg"]
     assert "revoked" in result["error_msg"] or "[redacted]" in result["error_msg"]
     assert all(fragment not in result["error_msg"] for fragment in marker_fragments)
+
+
+def test_error_result_scrubs_secret_straddling_the_detail_cutoff():
+    """A credential that crosses the detail truncation point must not leave a
+    plaintext prefix behind — scrubbing has to see past the emitted cutoff."""
+    from aitelier.providers.sandbox_agent import _error_result
+
+    secret = "FAKE9Qx7Lm2Vn8Rk4Wp6Zt3Hs5Jc"
+    prose = ("upstream said the session failed and then " * 60)[:1994]
+    exc = AcpError(-32603, "Internal error", {"message": prose + secret})
+
+    result = _error_result("claude", "r1", exc, 1.0)
+
+    assert secret[:6] not in result["error_msg"]
 
 
 @pytest.mark.asyncio
@@ -1593,7 +1610,7 @@ async def test_permission_decider_exception_denies_permission_request():
         "params": {
             "options": [
                 {"optionId": "allow", "kind": "allow_once"},
-                {"optionId": "deny", "kind": "deny"},
+                {"optionId": "reject", "kind": "reject_once"},
             ],
         },
     })
@@ -1601,7 +1618,109 @@ async def test_permission_decider_exception_denies_permission_request():
     body = posts[0]["envelope"]
     assert body["id"] == 43
     assert body["result"]["outcome"]["outcome"] == "selected"
-    assert body["result"]["outcome"]["optionId"] == "deny"
+    assert body["result"]["outcome"]["optionId"] == "reject"
+
+
+@pytest.mark.asyncio
+async def test_permission_decider_exception_cancels_when_no_reject_offered():
+    """With only an allow option on the table, a failed policy still must not
+    select it — the ask is cancelled instead."""
+    fake_http = MagicMock()
+    posts: list[dict] = []
+
+    async def broken_decider(_params):
+        raise RuntimeError("policy unavailable")
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append({"url": url, "envelope": json})
+        response = MagicMock()
+        response.status_code = 202
+        response.raise_for_status = MagicMock()
+        return response
+
+    fake_http.post = AsyncMock(side_effect=fake_post)
+    client = AcpClient(
+        "http://x:2468",
+        "claude",
+        http_client=fake_http,
+        permission_decider=broken_decider,
+    )
+
+    await client._respond_to_agent_request({
+        "jsonrpc": "2.0",
+        "id": 45,
+        "method": "session/request_permission",
+        "params": {"options": [{"optionId": "allow", "kind": "allow_once"}]},
+    })
+
+    outcome = posts[0]["envelope"]["result"]["outcome"]
+    assert outcome["outcome"] == "cancelled"
+    assert "optionId" not in outcome
+
+
+@pytest.mark.asyncio
+async def test_permission_decider_cancellation_denies_and_propagates():
+    """Cancellation still answers the agent, then keeps unwinding."""
+    fake_http = MagicMock()
+    posts: list[dict] = []
+
+    async def cancelled_decider(_params):
+        raise asyncio.CancelledError()
+
+    async def fake_post(url, json=None, headers=None, timeout=None):
+        posts.append({"url": url, "envelope": json})
+        response = MagicMock()
+        response.status_code = 202
+        response.raise_for_status = MagicMock()
+        return response
+
+    fake_http.post = AsyncMock(side_effect=fake_post)
+    client = AcpClient(
+        "http://x:2468",
+        "claude",
+        http_client=fake_http,
+        permission_decider=cancelled_decider,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await client._respond_to_agent_request({
+            "jsonrpc": "2.0",
+            "id": 44,
+            "method": "session/request_permission",
+            "params": {
+                "options": [
+                    {"optionId": "allow", "kind": "allow_once"},
+                    {"optionId": "reject", "kind": "reject_once"},
+                ],
+            },
+        })
+
+    body = posts[0]["envelope"]
+    assert body["id"] == 44
+    assert body["result"]["outcome"]["optionId"] == "reject"
+
+
+@pytest.mark.asyncio
+async def test_unnameable_tool_denied_when_allowlist_configured():
+    """An ask whose tool name isn't a usable string can't be matched against
+    the allowlist, so a configured policy must refuse it rather than crash
+    into the caller's failure path."""
+    decide = _make_permission_decider(["Read"], _RunEventEmitter("run-x"))
+
+    for params in (
+        {"toolCall": {"name": 123}},
+        {"tool": {"nested": "object"}},
+        {"toolCall": {"title": ["Bash"]}},
+    ):
+        assert await decide(params) is False
+
+
+@pytest.mark.asyncio
+async def test_unnameable_tool_allowed_without_allowlist():
+    """With no allowlist configured the default stays permissive."""
+    decide = _make_permission_decider(None, _RunEventEmitter("run-y"))
+
+    assert await decide({"toolCall": {"name": 123}}) is True
 
 
 @pytest.mark.asyncio

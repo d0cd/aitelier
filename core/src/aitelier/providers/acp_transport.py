@@ -240,18 +240,24 @@ class AcpClient:
 
         result: Any = None
         error: dict | None = None
+        cancelled = False
 
         if method == "session/request_permission":
             allow = True
             if self._permission_decider is not None:
                 try:
                     allow = await self._permission_decider(params)
+                except asyncio.CancelledError:
+                    # Still answer the ask so the agent isn't left hanging on
+                    # a half-torn-down session, then keep unwinding.
+                    cancelled = True
+                    allow = False
                 except Exception as exc:
-                    # A policy bug must never hang the agent: fail open, but
-                    # log at WARNING so a misbehaving policy is visible.
-                    logger.warning("permission decider errored (%s: %s); allowing",
+                    # A configured policy that cannot produce a decision denies.
+                    # Logged at WARNING so a misbehaving policy stays visible.
+                    logger.warning("permission decider errored (%s: %s); denying",
                                    type(exc).__name__, exc)
-                    allow = True
+                    allow = False
             result = _select_permission_outcome(params.get("options") or [], allow)
         else:
             # Anything else (fs.*, terminal/*, session/*) — politely refuse.
@@ -278,6 +284,9 @@ class AcpClient:
                 "agent-response POST failed: %s: %s",
                 type(exc).__name__, exc,
             )
+
+        if cancelled:
+            raise asyncio.CancelledError()
 
     def start_stream(self) -> None:
         """Begin background SSE consumption. Call after first POST has bound
