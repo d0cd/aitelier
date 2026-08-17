@@ -458,11 +458,12 @@ class _IsolatedAitelier:
     """
 
     def __init__(self, *, service_overrides: dict | None = None,
-                 extra_toml: str = ""):
+                 extra_toml: str = "", needs_sandbox_agent: bool = False):
         self.port = _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
         self.service_overrides = dict(service_overrides or {})
         self.extra_toml = extra_toml
+        self.needs_sandbox_agent = needs_sandbox_agent
         self._proc = None
         self._config_path: str | None = None
         self._log_path: str | None = None
@@ -482,12 +483,35 @@ class _IsolatedAitelier:
                 service_lines.append(f"{k} = {v}")
             else:
                 service_lines.append(f'{k} = "{v}"')
-        # `[sandbox_agent].base_url` — the host machine's SA may be on a
-        # dynamic port (`make start` writes the chosen port to
-        # `runs/.session.toml`). The isolated aitelier runs in a temp
-        # cwd, so we have to read that file ourselves and embed the
-        # discovered URL directly.
+        # Everything the isolated instance needs from the host deployment is
+        # embedded here explicitly, because both of aitelier's ambient config
+        # layers are deliberately out of reach:
+        #
+        #   - the session overlay (`runs/.session.toml`) is resolved relative
+        #     to cwd, and we run in a temp cwd so a test can't inherit whatever
+        #     `make start` last wrote;
+        #   - the secrets overlay (`aitelier.secrets.toml`) is resolved next to
+        #     the *base config file*, and this config lives in a temp dir.
+        #
+        # Do not "simplify" this by writing the config into the repo root to
+        # pick up the secrets overlay for free. Secrets override the base
+        # layer, so the repo's file would outrank the per-test `[service]`
+        # knobs below — an ambient `api_key` or `webhook_secret` would silently
+        # overrule the very thing the test is trying to configure.
         sa_url = _discover_host_sa_url()
+        sa_lines = [f'base_url = "{sa_url}"']
+        # Brig's SA ingress is authenticated, so a test that actually dispatches
+        # an agent run needs the token. It is opt-in rather than default for two
+        # reasons: least privilege, and cost — with a working token a cold
+        # instance's first `/v1/models` genuinely probes each backend's inner
+        # models (which opens ACP sessions) instead of failing fast on 401, and
+        # that exceeds the tight timeouts in tests that only care about config.
+        # Omit the key entirely when unset: host/docker run an unauthenticated
+        # local SA, and an empty token would be sent as a real (wrong) one.
+        if self.needs_sandbox_agent:
+            sa_token = _read_sa_token_from_repo_config()
+            if sa_token:
+                sa_lines.append(f'token = "{sa_token}"')
         return f"""\
 [database]
 url = "postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier"
@@ -496,7 +520,7 @@ url = "postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier"
 base_url = "http://127.0.0.1:4000"
 
 [sandbox_agent]
-base_url = "{sa_url}"
+{chr(10).join(sa_lines)}
 
 [service]
 {chr(10).join(service_lines)}
@@ -579,13 +603,19 @@ base_url = "{sa_url}"
 def isolated_aitelier():
     """Factory fixture. Tests call `isolated_aitelier(service={...})` to
     get a fresh aitelier subprocess with the given [service] overrides.
-    Auto-torn-down at test end."""
+    Auto-torn-down at test end.
+
+    Pass `needs_sandbox_agent=True` when the test dispatches a real agent run —
+    that hands the instance the SA credential, which it otherwise does without.
+    """
     instances: list[_IsolatedAitelier] = []
 
     def _factory(service: dict | None = None,
-                 extra_toml: str = "") -> _IsolatedAitelier:
+                 extra_toml: str = "",
+                 needs_sandbox_agent: bool = False) -> _IsolatedAitelier:
         inst = _IsolatedAitelier(service_overrides=service,
-                                  extra_toml=extra_toml)
+                                  extra_toml=extra_toml,
+                                  needs_sandbox_agent=needs_sandbox_agent)
         inst.start()
         instances.append(inst)
         return inst

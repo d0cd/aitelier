@@ -24,7 +24,7 @@ def test_webhook_fires_and_carries_run_payload(
     aitelier_run_id in the body."""
     aitelier = isolated_aitelier(service={
         "allow_loopback_webhooks": True,
-    })
+    }, needs_sandbox_agent=True)
     webhook_receiver.clear()
 
     r = httpx.post(
@@ -59,7 +59,7 @@ def test_webhook_authenticated_when_secret_configured(
     aitelier = isolated_aitelier(service={
         "allow_loopback_webhooks": True,
         "webhook_secret": secret,
-    })
+    }, needs_sandbox_agent=True)
     webhook_receiver.clear()
 
     r = httpx.post(
