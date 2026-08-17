@@ -79,9 +79,9 @@ def test_agent_run_persists_agent_id_and_inner_model(
 ):
     """The run row records agent_id=<backend> and model=<inner LLM>
     distinctly, not collapsed."""
-    inner = "local"
+    inner = agent_model.split("/", 1)[1]
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(f"agent:{agent_backend}/{inner}",
+        **_agent_body(agent_model,
                       aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     })
@@ -197,11 +197,11 @@ def test_agent_prepare_files_round_trip(
 
     r = http.post("/v1/chat/completions", json={
         **_agent_body(agent_model, content="ok",
-                      aitelier_opts={
-                          "max_turns": 1, "trace_tag": trace_tag,
-                          "prepare": {"files": [{"path": fname, "content": content}]},
-                          "artifacts": {"fetch": [fname]},
-                      }),
+                      aitelier_opts=agent_opts(
+                          trace_tag=trace_tag,
+                          prepare={"files": [{"path": fname, "content": content}]},
+                          artifacts={"fetch": [fname]},
+                      )),
         "timeout": 240,
     })
 

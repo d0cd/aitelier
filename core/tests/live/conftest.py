@@ -556,10 +556,17 @@ class _IsolatedAitelier:
             sa_token = _read_sa_token_from_repo_config()
             if sa_token:
                 sa_lines.append(f'token = "{sa_token}"')
+        # No [database] — the instance falls back to InMemoryStore.
+        #
+        # Sharing the host's Postgres would put two aitelier processes on one
+        # database, which the single-instance contract forbids for good reason:
+        # the workers compete for the same queues. Concretely, the main
+        # deployment's webhook worker would claim a delivery addressed to this
+        # test's loopback receiver and refuse it (`allow_loopback_webhooks` is
+        # off there), so the receiver would wait out its timeout. Nothing here
+        # needs durable state — these tests only ever query the instance they
+        # started.
         return f"""\
-[database]
-url = "postgresql://aitelier:aitelier_local@127.0.0.1:5433/aitelier"
-
 [litellm]
 base_url = "http://127.0.0.1:4000"
 

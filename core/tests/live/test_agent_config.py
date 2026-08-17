@@ -128,17 +128,33 @@ def test_agent_tool_allowlist_is_recorded_on_the_run(
     """Aitelier records the tool_allowlist passed in the request body so
     operators can audit what the agent was permitted to do. The actual
     enforcement is the agent CLI's job (claude-code reads the policy at
-    boot); we test the recording, not the enforcement."""
+    boot); we test the recording, not the enforcement.
+
+    `tool_allowlist` is claude-only, so the contract has two halves and both
+    are asserted: claude records it, every other backend refuses it outright
+    rather than accepting and ignoring it.
+    """
     allowlist = ["Read", "Bash"]
+    # Sent directly, not via `agent_opts`, because the point here is what the
+    # server does with the option — the fixture would strip it first.
     r = http.post("/v1/chat/completions", json={
         "model": agent_model,
         "messages": [{"role": "user", "content": "ack"}],
         "timeout": 240,
-        "aitelier": agent_opts(
-            trace_tag=trace_tag,
-            tool_allowlist=allowlist,
-        ),
+        "aitelier": {
+            **agent_opts(trace_tag=trace_tag),
+            "tool_allowlist": allowlist,
+        },
     })
+
+    if agent_backend != "claude":
+        assert r.status_code == 400, (
+            f"{agent_backend} should refuse the claude-only tool_allowlist "
+            f"rather than silently drop it; got {r.status_code}: {r.text}"
+        )
+        assert "claude-only" in r.text
+        return
+
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
 
