@@ -215,6 +215,50 @@ def trace_tag() -> str:
     return f"live-{uuid.uuid4().hex[:8]}"
 
 
+@pytest.fixture
+def agent_model(http, agent_backend) -> str:
+    """`agent:<backend>/<inner-llm>` for the parameterized backend.
+
+    A bare `agent:<backend>` is rejected — the inner model must be named so the
+    run records what it actually used and can be priced. Read it from what the
+    backend advertises rather than pinning an id, which drifts as providers
+    rename models.
+    """
+    models = http.get("/v1/models", params={"agent_backend": agent_backend}).json()
+    for entry in models.get("data", []):
+        if entry.get("id") == f"agent:{agent_backend}":
+            inner = entry.get("aitelier_inner_llms") or []
+            assert inner, f"{agent_backend} advertises no inner models: {entry}"
+            return f"agent:{agent_backend}/{inner[0]}"
+    raise AssertionError(
+        f"/v1/models did not advertise agent:{agent_backend}: {models}")
+
+
+# `aitelier.*` keys the Claude Agent SDK exposes and other backends reject
+# outright (see CLAUDE.md). Sending them to codex/opencode is a 400, so a
+# backend-parameterized test must not hard-code them.
+_CLAUDE_ONLY_OPTS = ("max_turns", "tool_allowlist", "system_prompt")
+
+
+@pytest.fixture
+def agent_opts(agent_backend):
+    """Build an `aitelier.*` block valid for the parameterized backend.
+
+    Returns a callable: `agent_opts(trace_tag=tag)`. Claude gets a default
+    `max_turns=1` to keep runs short; other backends have the claude-only keys
+    stripped and stay bounded by the top-level `timeout` instead.
+    """
+    def _build(**extra) -> dict:
+        opts = dict(extra)
+        if agent_backend == "claude":
+            opts.setdefault("max_turns", 1)
+        else:
+            for key in _CLAUDE_ONLY_OPTS:
+                opts.pop(key, None)
+        return opts
+    return _build
+
+
 @pytest.fixture(scope="session")
 def discovery(http) -> dict:
     """Cached /v1/discovery — used to gate tests on dependency reachability."""

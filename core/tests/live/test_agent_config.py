@@ -18,21 +18,20 @@ from __future__ import annotations
 
 
 def test_agent_workspace_dispatches_under_workspace(
-    http, trace_tag, agent_backend, sa_writable_dir,
+    http, trace_tag, agent_backend, agent_model, agent_opts, sa_writable_dir,
 ):
     """Aitelier records the workspace in the run row. The agent CLI may
     or may not actually `chdir` there (backend-specific); the contract
     aitelier promises is that the path is forwarded + recorded."""
     workdir = sa_writable_dir
     r = http.post("/v1/chat/completions", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "say ack"}],
         "timeout": 240,
-        "aitelier": {
-            "max_turns": 1,
-            "trace_tag": trace_tag,
-            "workspace": workdir,
-        },
+        "aitelier": agent_opts(
+            trace_tag=trace_tag,
+            workspace=workdir,
+        ),
     })
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]
@@ -44,7 +43,7 @@ def test_agent_workspace_dispatches_under_workspace(
 
 
 def test_agent_prepare_commands_runs_setup_before_agent(
-    http, trace_tag, agent_backend, sa_writable_dir,
+    http, trace_tag, agent_backend, agent_model, agent_opts, sa_writable_dir,
 ):
     """`prepare.commands` runs in the sandbox before the agent. Verify by
     having the prep step write a marker file, then artifacts.fetch it back.
@@ -57,20 +56,19 @@ def test_agent_prepare_commands_runs_setup_before_agent(
     # not a shell string. Use `sh -c` so we can keep the test command
     # as one readable redirect.
     r = http.post("/v1/chat/completions", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "ok"}],
         "timeout": 240,
-        "aitelier": {
-            "max_turns": 1,
-            "trace_tag": trace_tag,
-            "prepare": {
+        "aitelier": agent_opts(
+            trace_tag=trace_tag,
+            prepare={
                 "commands": [{
                     "command": "sh",
                     "args": ["-c", f"echo {body!r} > {marker}"],
                 }],
             },
-            "artifacts": {"fetch": [marker]},
-        },
+            artifacts={"fetch": [marker]},
+        ),
     })
     assert r.status_code != 400, r.text
     body_json = r.json()
@@ -93,27 +91,26 @@ def test_agent_prepare_commands_runs_setup_before_agent(
 
 
 def test_agent_prepare_sidecar_starts_and_records(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     """`prepare.sidecars` spawns long-running processes. The contract
     aitelier promises: each sidecar's spawn is recorded in the run row's
     environment + sandbox info, and the run completes without the
     sidecar tripping the prepare layer."""
     r = http.post("/v1/chat/completions", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "ack"}],
         "timeout": 240,
-        "aitelier": {
-            "max_turns": 1,
-            "trace_tag": trace_tag,
-            "prepare": {
+        "aitelier": agent_opts(
+            trace_tag=trace_tag,
+            prepare={
                 # SA's ProcessCreateRequest uses {command, args}, not a
                 # single shell string. `sleep 60` is a no-op long-runner
                 # — the agent won't talk to it, we just verify the
                 # spawn doesn't trip the prepare layer.
                 "sidecars": [{"command": "sleep", "args": ["60"]}],
             },
-        },
+        ),
     })
     assert r.status_code != 400, r.text
     body = r.json()
@@ -126,7 +123,7 @@ def test_agent_prepare_sidecar_starts_and_records(
 
 
 def test_agent_tool_allowlist_is_recorded_on_the_run(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     """Aitelier records the tool_allowlist passed in the request body so
     operators can audit what the agent was permitted to do. The actual
@@ -134,14 +131,13 @@ def test_agent_tool_allowlist_is_recorded_on_the_run(
     boot); we test the recording, not the enforcement."""
     allowlist = ["Read", "Bash"]
     r = http.post("/v1/chat/completions", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "ack"}],
         "timeout": 240,
-        "aitelier": {
-            "max_turns": 1,
-            "trace_tag": trace_tag,
-            "tool_allowlist": allowlist,
-        },
+        "aitelier": agent_opts(
+            trace_tag=trace_tag,
+            tool_allowlist=allowlist,
+        ),
     })
     assert r.status_code == 200, r.text
     run_id = r.json()["aitelier_run_id"]

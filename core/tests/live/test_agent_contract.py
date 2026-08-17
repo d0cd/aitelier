@@ -26,10 +26,11 @@ from pathlib import Path
 # ---------- helpers ----------
 
 
-def _agent_body(agent: str, *, content: str = "Reply with exactly: ack",
-                inner_model: str | None = None,
+def _agent_body(model: str, *, content: str = "Reply with exactly: ack",
                 aitelier_opts: dict | None = None) -> dict:
-    model = f"agent:{agent}" + (f"/{inner_model}" if inner_model else "")
+    """`model` must be a full `agent:<backend>/<inner-llm>` — the `agent_model`
+    fixture resolves one from what the backend advertises. A bare
+    `agent:<backend>` is rejected by the server."""
     body = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
@@ -42,10 +43,12 @@ def _agent_body(agent: str, *, content: str = "Reply with exactly: ack",
 # ---------- /v1/chat/completions agent path (sync) ----------
 
 
-def test_agent_sync_returns_chat_completion(http, trace_tag, agent_backend):
+def test_agent_sync_returns_chat_completion(
+    http, trace_tag, agent_backend, agent_model, agent_opts,
+):
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model,
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     })
     assert r.status_code == 200, r.text
@@ -55,10 +58,10 @@ def test_agent_sync_returns_chat_completion(http, trace_tag, agent_backend):
     assert body["aitelier_run_id"]
 
 
-def test_agent_rejects_openai_tools(http, agent_backend):
+def test_agent_rejects_openai_tools(http, agent_backend, agent_model, agent_opts):
     """The agent path must hard-reject `tools` — silent drops are a footgun."""
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend),
+        **_agent_body(agent_model),
         "tools": [{"type": "function",
                    "function": {"name": "fake", "parameters": {}}}],
     })
@@ -72,14 +75,14 @@ def test_agent_rejects_openai_tools(http, agent_backend):
 
 
 def test_agent_run_persists_agent_id_and_inner_model(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     """The run row records agent_id=<backend> and model=<inner LLM>
     distinctly, not collapsed."""
     inner = "local"
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend, inner_model=inner,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(f"agent:{agent_backend}/{inner}",
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     })
     assert r.status_code == 200, r.text
@@ -96,13 +99,15 @@ def test_agent_run_persists_agent_id_and_inner_model(
 # ---------- /v1/chat/completions agent path (stream) ----------
 
 
-def test_agent_stream_emits_openai_chunks(http, trace_tag, agent_backend):
+def test_agent_stream_emits_openai_chunks(
+    http, trace_tag, agent_backend, agent_model, agent_opts,
+):
     """Agent stream maps ACP deltas to OpenAI chunks. At minimum we should
     see one chunk with assistant role + final chunk with finish_reason."""
     chunks = []
     with http.stream("POST", "/v1/chat/completions", json={
-        **_agent_body(agent_backend, content="Say one word: hello",
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model, content="Say one word: hello",
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
         "stream": True,
     }) as resp:
@@ -126,11 +131,13 @@ def test_agent_stream_emits_openai_chunks(http, trace_tag, agent_backend):
 # ---------- /v1/runs/{id}/events ----------
 
 
-def test_agent_run_events_recorded(http, trace_tag, agent_backend):
+def test_agent_run_events_recorded(
+    http, trace_tag, agent_backend, agent_model, agent_opts,
+):
     """Agent runs emit a `start` event (plus tool_call/tool_result if any)."""
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model,
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     })
     assert r.status_code == 200, r.text
@@ -140,12 +147,14 @@ def test_agent_run_events_recorded(http, trace_tag, agent_backend):
     assert "start" in kinds, kinds
 
 
-def test_agent_run_events_stream_emits_sse(http, trace_tag, agent_backend):
+def test_agent_run_events_stream_emits_sse(
+    http, trace_tag, agent_backend, agent_model, agent_opts,
+):
     """SSE stream of `/v1/runs/{id}/events` — wire format (data: lines,
     optional [DONE] sentinel), prefix matches the snapshot endpoint."""
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model,
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     })
     assert r.status_code == 200, r.text
@@ -177,7 +186,9 @@ def test_agent_run_events_stream_emits_sse(http, trace_tag, agent_backend):
 # ---------- prepare → agent → artifacts loop ----------
 
 
-def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend, sa_writable_dir):
+def test_agent_prepare_files_round_trip(
+    http, trace_tag, agent_backend, agent_model, agent_opts, sa_writable_dir,
+):
     """`aitelier.prepare.files` ships a file into the sandbox and
     `aitelier.artifacts.fetch` reads it back. Exercises SA's actual
     `/v1/fs/file` wire shape (path-as-query-param, not body)."""
@@ -185,7 +196,7 @@ def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend, sa_writa
     content = f"live-test-{trace_tag}"
 
     r = http.post("/v1/chat/completions", json={
-        **_agent_body(agent_backend, content="ok",
+        **_agent_body(agent_model, content="ok",
                       aitelier_opts={
                           "max_turns": 1, "trace_tag": trace_tag,
                           "prepare": {"files": [{"path": fname, "content": content}]},
@@ -226,14 +237,14 @@ def test_agent_prepare_files_round_trip(http, trace_tag, agent_backend, sa_writa
 
 
 def test_agent_idempotency_same_key_returns_cached(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     """Second POST with the same Idempotency-Key + body returns the same
     body byte-for-byte. The work runs exactly once."""
     key = str(uuid.uuid4())
     body = {
-        **_agent_body(agent_backend,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model,
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     }
     r1 = http.post("/v1/chat/completions", headers={"Idempotency-Key": key},
@@ -246,7 +257,9 @@ def test_agent_idempotency_same_key_returns_cached(
     assert r1.json() == r2.json()
 
 
-def test_agent_idempotency_different_body_returns_422(http, agent_backend):
+def test_agent_idempotency_different_body_returns_422(
+    http, agent_backend, agent_model, agent_opts,
+):
     """Reusing a key with a different body is almost always a consumer bug;
     the server should refuse loudly rather than treat as a new request."""
     key = str(uuid.uuid4())
@@ -254,8 +267,8 @@ def test_agent_idempotency_different_body_returns_422(http, agent_backend):
         "/v1/chat/completions",
         headers={"Idempotency-Key": key},
         json={
-            **_agent_body(agent_backend, content="first call",
-                          aitelier_opts={"max_turns": 1}),
+            **_agent_body(agent_model, content="first call",
+                          aitelier_opts=agent_opts()),
             "timeout": 240,
         },
     )
@@ -263,8 +276,8 @@ def test_agent_idempotency_different_body_returns_422(http, agent_backend):
         "/v1/chat/completions",
         headers={"Idempotency-Key": key},
         json={
-            **_agent_body(agent_backend, content="DIFFERENT",
-                          aitelier_opts={"max_turns": 1}),
+            **_agent_body(agent_model, content="DIFFERENT",
+                          aitelier_opts=agent_opts()),
             "timeout": 240,
         },
     )
@@ -274,11 +287,11 @@ def test_agent_idempotency_different_body_returns_422(http, agent_backend):
 
 
 def test_agent_idempotency_distinct_keys_produce_distinct_runs(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     body = {
-        **_agent_body(agent_backend,
-                      aitelier_opts={"max_turns": 1, "trace_tag": trace_tag}),
+        **_agent_body(agent_model,
+                      aitelier_opts=agent_opts(trace_tag=trace_tag)),
         "timeout": 240,
     }
     r1 = http.post("/v1/chat/completions",
@@ -296,15 +309,15 @@ def test_agent_idempotency_distinct_keys_produce_distinct_runs(
 
 
 def test_agent_cancel_active_run_returns_cancelled(
-    http, trace_tag, agent_backend,
+    http, trace_tag, agent_backend, agent_model, agent_opts,
 ):
     """Start an async agent run, observe it active, cancel it, verify the
     cancel acks and the run transitions to a terminal state."""
     r = http.post("/v1/runs", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "a" * 1000}],
         "timeout": 60,
-        "aitelier": {"max_turns": 5, "trace_tag": trace_tag},
+        "aitelier": agent_opts(trace_tag=trace_tag, max_turns=5),
     })
     r.raise_for_status()
     run_id = r.json()["run_id"]

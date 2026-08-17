@@ -92,7 +92,9 @@ def test_schedule_crud_round_trip(http):
     assert d2.status_code == 404
 
 
-def test_schedule_accepts_agent_task_shape(http, agent_backend):
+def test_schedule_accepts_agent_task_shape(
+    http, agent_backend, agent_model, agent_opts,
+):
     """Schedules can carry agent tasks too — same body shape as chat/completions.
     Parameterized over backends since the schedule task body validation
     depends on the backend being recognized."""
@@ -100,9 +102,9 @@ def test_schedule_accepts_agent_task_shape(http, agent_backend):
     created = http.post("/v1/schedules", json={
         "name": name,
         "task": {
-            "model": f"agent:{agent_backend}",
+            "model": agent_model,
             "messages": [{"role": "user", "content": "scheduled work"}],
-            "aitelier": {"max_turns": 1},
+            "aitelier": agent_opts(),
         },
         "at_iso": "2099-01-01T00:00:00Z",  # far future — won't fire during test
     }).json()

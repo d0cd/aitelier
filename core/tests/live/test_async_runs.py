@@ -30,14 +30,14 @@ def _wait_until_in_store(http, run_id, timeout=5.0):
     )
 
 
-def test_async_run_lifecycle(http, agent_backend, trace_tag):
+def test_async_run_lifecycle(http, agent_backend, agent_model, agent_opts, trace_tag):
     """End-to-end async path: POST → row appears → poll until terminal
     → events present → final state recorded."""
     submit = http.post("/v1/runs", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "ack"}],
         "timeout": 240,
-        "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
+        "aitelier": agent_opts(trace_tag=trace_tag),
     })
     submit.raise_for_status()
     accepted = submit.json()
@@ -75,17 +75,17 @@ def test_async_run_rejects_llm_model(http):
 
 
 def test_async_run_idempotency_same_key_returns_same_run_id(
-    http, agent_backend, trace_tag,
+    http, agent_backend, agent_model, agent_opts, trace_tag,
 ):
     """Re-POSTing with the same Idempotency-Key returns the original
     run_id; the work is enqueued exactly once."""
     import uuid as _uuid
     key = str(_uuid.uuid4())
     body = {
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "ack"}],
         "timeout": 240,
-        "aitelier": {"max_turns": 1, "trace_tag": trace_tag},
+        "aitelier": agent_opts(trace_tag=trace_tag),
     }
     r1 = http.post("/v1/runs", headers={"Idempotency-Key": key}, json=body)
     r2 = http.post("/v1/runs", headers={"Idempotency-Key": key}, json=body)

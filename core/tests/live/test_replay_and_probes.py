@@ -13,23 +13,6 @@ from __future__ import annotations
 
 import time
 
-import pytest
-
-
-@pytest.fixture
-def agent_model(http, agent_backend) -> str:
-    """`agent:<backend>` alone is rejected — the inner model must be named so
-    the run records what it actually used. Read it from what the backend
-    advertises rather than pinning a model id that drifts."""
-    models = http.get("/v1/models", params={"agent_backend": agent_backend}).json()
-    for entry in models.get("data", []):
-        if entry.get("id") == f"agent:{agent_backend}":
-            inner = entry.get("aitelier_inner_llms") or []
-            assert inner, f"{agent_backend} advertises no inner models: {entry}"
-            return f"agent:{agent_backend}/{inner[0]}"
-    raise AssertionError(
-        f"/v1/models did not advertise agent:{agent_backend}: {models}")
-
 
 def _wait_until_in_store(http, run_id, timeout=10.0):
     deadline = time.monotonic() + timeout

@@ -103,7 +103,9 @@ def test_correlation_id_auto_generated_when_omitted(http, litellm_models):
 # ---------- Run state transitions ----------
 
 
-def test_failed_run_state_recorded(http, agent_backend, trace_tag):
+def test_failed_run_state_recorded(
+    http, agent_backend, agent_model, agent_opts, trace_tag,
+):
     """Induce a failure path: invalid sub-config the agent rejects. The
     run row should reach `failed` state with error_type populated.
 
@@ -112,7 +114,7 @@ def test_failed_run_state_recorded(http, agent_backend, trace_tag):
     failure we use `max_turns: 0` which forces an empty agent response.
     """
     r = http.post("/v1/chat/completions", json={
-        "model": f"agent:{agent_backend}",
+        "model": agent_model,
         "messages": [{"role": "user", "content": "should not run"}],
         "timeout": 240,
         "aitelier": {"max_turns": 0, "trace_tag": trace_tag},
